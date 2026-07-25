@@ -1,0 +1,2163 @@
+#!/usr/bin/env python3
+"""Interactive dual-city status dashboard for the GL-E5800's built-in screen.
+
+Four main panels reached by swiping left/right: world clock, currency,
+active SIM, and OpenClash. Tapping into a panel opens a sub-screen (city
+picker, currency picker, data-cap picker, or the OpenClash on/off + mode
+control) -- tap the header to go back, or swipe right. Writes RGB565
+frames directly to /dev/fb0.
+
+Usage:
+  dashboard.py            run the live loop, drawing to /dev/fb0
+  dashboard.py --preview  render every screen to PNG files in the given
+                          directory (plus a contact sheet), for visual QA
+  dashboard.py --calibrate  flash solid red/green/blue full-screen for
+                          1s each, to verify the framebuffer colour
+                          channel order on real hardware
+"""
+import json
+import os
+import signal
+import struct
+import subprocess
+import sys
+import threading
+import time
+from datetime import datetime, timedelta
+from pathlib import Path
+
+from PIL import Image, ImageDraw, ImageFont
+
+W, H = 240, 320
+FB_PATH = "/dev/fb0"
+FONT_DIR = "/etc/gl_screen/language/ttf"
+STATE_DIR = Path("/root/dashboard")
+FX_CACHE = STATE_DIR / "fx_cache.json"
+CONFIG_FILE = STATE_DIR / "config.json"
+
+BG = (11, 18, 32)
+FG = (230, 235, 245)
+DIM = (120, 130, 150)
+ACCENT = {
+    "clock": (86, 182, 255),
+    "fx": (255, 190, 90),
+    "sim": (110, 220, 150),
+    "openclash": (200, 140, 255),
+    "weather": (90, 214, 200),
+}
+
+MCC_COUNTRY = {
+    "234": "UK", "235": "UK",
+    "460": "China", "461": "China",
+    "454": "Hong Kong", "466": "Taiwan",
+    "206": "Belgium", "208": "France", "204": "Netherlands",
+    "262": "Germany", "222": "Italy", "214": "Spain", "268": "Portugal",
+    "240": "Sweden", "238": "Denmark", "242": "Norway", "244": "Finland",
+    "250": "Russia", "302": "Canada", "310": "USA", "311": "USA",
+    "440": "Japan", "441": "Japan", "450": "South Korea", "505": "Australia",
+    "228": "Switzerland", "226": "Romania", "231": "Slovakia",
+}
+
+CITIES = [
+    ("Europe/London", "London"),
+    ("Asia/Shanghai", "Shanghai"),
+    ("Asia/Hong_Kong", "Hong Kong"),
+    ("Asia/Tokyo", "Tokyo"),
+    ("Asia/Seoul", "Seoul"),
+    ("Asia/Singapore", "Singapore"),
+    ("Australia/Sydney", "Sydney"),
+    ("Pacific/Auckland", "Auckland"),
+    ("America/New_York", "New York"),
+    ("America/Los_Angeles", "Los Angeles"),
+    ("America/Chicago", "Chicago"),
+    ("America/Toronto", "Toronto"),
+    ("Europe/Paris", "Paris"),
+    ("Europe/Berlin", "Berlin"),
+    ("Asia/Dubai", "Dubai"),
+    ("Europe/Moscow", "Moscow"),
+]
+
+CURRENCIES = ["JPY", "CAD", "AUD", "SGD", "NZD", "GBP", "EUR", "USD", "HKD"]
+CURRENCY_NAMES = {
+    "JPY": "Japanese Yen", "CAD": "Canadian Dollar", "AUD": "Australian Dollar",
+    "SGD": "Singapore Dollar", "NZD": "NZ Dollar", "GBP": "British Pound",
+    "EUR": "Euro", "USD": "US Dollar", "HKD": "Hong Kong Dollar",
+}
+
+DATA_CAP_PRESETS = [None, 500, 1024, 2048, 5120, 10240, 20480]
+
+# id -> (display name, lat, lon) -- same cities as the world clock, plus coords
+WEATHER_CITIES = [
+    ("London", 51.5074, -0.1278),
+    ("Shanghai", 31.2304, 121.4737),
+    ("Hong Kong", 22.3193, 114.1694),
+    ("Tokyo", 35.6762, 139.6503),
+    ("Seoul", 37.5665, 126.9780),
+    ("Singapore", 1.3521, 103.8198),
+    ("Sydney", -33.8688, 151.2093),
+    ("Auckland", -36.8485, 174.7633),
+    ("New York", 40.7128, -74.0060),
+    ("Los Angeles", 34.0522, -118.2437),
+    ("Chicago", 41.8781, -87.6298),
+    ("Toronto", 43.6532, -79.3832),
+    ("Paris", 48.8566, 2.3522),
+    ("Berlin", 52.5200, 13.4050),
+    ("Dubai", 25.2048, 55.2708),
+    ("Moscow", 55.7558, 37.6173),
+]
+
+DEFAULT_CONFIG = {
+    "clock_top": "Europe/London",
+    "clock_bottom": "Asia/Shanghai",
+    "fx_top": "USD",
+    "fx_bottom": "GBP",
+    "data_cap_mb": None,
+    "weather_city": "London",
+}
+
+_fonts = {}
+
+
+def font(name, size):
+    key = (name, size)
+    if key not in _fonts:
+        _fonts[key] = ImageFont.truetype(f"{FONT_DIR}/{name}.ttf", size)
+    return _fonts[key]
+
+
+def run(cmd, timeout=8):
+    try:
+        out = subprocess.run(cmd, capture_output=True, timeout=timeout, text=True)
+        return out.stdout.strip()
+    except Exception:
+        return ""
+
+
+def ubus_call(obj, method, params=None):
+    args = ["ubus", "call", obj, method]
+    if params:
+        args.append(json.dumps(params))
+    out = run(args)
+    try:
+        return json.loads(out)
+    except Exception:
+        return {}
+
+
+def uci_get(key):
+    return run(["uci", "-q", "get", key])
+
+
+def uci_set(key, val):
+    run(["uci", "set", f"{key}={val}"])
+    run(["uci", "commit", key.split(".")[0]])
+
+
+BACKLIGHT_PATH = "/sys/class/backlight/soc:backlight/brightness"
+
+
+def is_screen_asleep():
+    try:
+        with open(BACKLIGHT_PATH) as f:
+            return f.read().strip() == "0"
+    except Exception:
+        return False
+
+
+# ---------- config ----------
+
+def load_config():
+    cfg = dict(DEFAULT_CONFIG)
+    if CONFIG_FILE.exists():
+        try:
+            cfg.update(json.loads(CONFIG_FILE.read_text()))
+        except Exception:
+            pass
+    return cfg
+
+
+def save_config(cfg):
+    STATE_DIR.mkdir(parents=True, exist_ok=True)
+    CONFIG_FILE.write_text(json.dumps(cfg))
+
+
+def city_name(tz_id):
+    for tz, name in CITIES:
+        if tz == tz_id:
+            return name
+    return tz_id.split("/")[-1].replace("_", " ")
+
+
+def cap_label(v):
+    if v is None:
+        return "No Limit"
+    if v >= 1024:
+        return f"{v / 1024:.0f} GB"
+    return f"{v:.0f} MB"
+
+
+# ---------- data sources ----------
+
+def fetch_fx(force=False):
+    STATE_DIR.mkdir(parents=True, exist_ok=True)
+    cached = None
+    if FX_CACHE.exists():
+        try:
+            cached = json.loads(FX_CACHE.read_text())
+        except Exception:
+            cached = None
+    stale = force or cached is None or "rates" not in cached or (time.time() - cached.get("ts", 0)) > 6 * 3600
+    if stale:
+        raw = run(["curl", "-s", "--max-time", "6" if force else "8", "https://open.er-api.com/v6/latest/USD"])
+        try:
+            data = json.loads(raw)
+            cached = {"ts": time.time(), "rates": data["rates"]}
+            FX_CACHE.write_text(json.dumps(cached))
+        except Exception:
+            pass
+    return cached
+
+
+def rate_to_cny(code, fx):
+    if not fx:
+        return None
+    rates = fx.get("rates", {})
+    if code not in rates or "CNY" not in rates:
+        return None
+    if code == "USD":
+        return rates["CNY"]
+    return rates["CNY"] / rates[code]
+
+
+FX_RANGES = ["week", "month", "year"]
+_FX_RANGE_DAYS = {"week": 7, "month": 30, "year": 365}
+
+
+def fetch_fx_history(code, rng):
+    """Daily rate-to-CNY history for the last week/month/year, via Frankfurter
+    (ECB reference rates, free, no key). Cached per (code, range) for 12h --
+    this is historical data, it doesn't need to be fresher than that."""
+    cache_file = STATE_DIR / f"fx_hist_{code}_{rng}.json"
+    cached = None
+    if cache_file.exists():
+        try:
+            cached = json.loads(cache_file.read_text())
+        except Exception:
+            cached = None
+    if cached and time.time() - cached.get("ts", 0) < 12 * 3600:
+        return cached["points"]
+
+    days = _FX_RANGE_DAYS[rng]
+    end = datetime.utcnow().date()
+    start = end - timedelta(days=days)
+    url = f"https://api.frankfurter.app/{start}..{end}?from={code}&to=CNY"
+    raw = run(["curl", "-sL", "--max-time", "6", url])
+    try:
+        data = json.loads(raw)
+        rates = data.get("rates", {})
+        points = [(d, v["CNY"]) for d, v in sorted(rates.items()) if "CNY" in v]
+        if points:
+            STATE_DIR.mkdir(parents=True, exist_ok=True)
+            cache_file.write_text(json.dumps({"ts": time.time(), "points": points}))
+            return points
+    except Exception:
+        pass
+    return cached["points"] if cached else []
+
+
+# WMO weather codes (Open-Meteo) -> (short label, icon key)
+_WMO_MAP = {
+    0: ("Clear", "sun"), 1: ("Mostly clear", "sun"), 2: ("Partly cloudy", "cloud_sun"),
+    3: ("Overcast", "cloud"),
+    45: ("Fog", "fog"), 48: ("Fog", "fog"),
+    51: ("Light drizzle", "rain"), 53: ("Drizzle", "rain"), 55: ("Heavy drizzle", "rain"),
+    56: ("Freezing drizzle", "rain"), 57: ("Freezing drizzle", "rain"),
+    61: ("Light rain", "rain"), 63: ("Rain", "rain"), 65: ("Heavy rain", "rain"),
+    66: ("Freezing rain", "rain"), 67: ("Freezing rain", "rain"),
+    71: ("Light snow", "snow"), 73: ("Snow", "snow"), 75: ("Heavy snow", "snow"),
+    77: ("Snow grains", "snow"),
+    80: ("Rain showers", "rain"), 81: ("Rain showers", "rain"), 82: ("Violent showers", "rain"),
+    85: ("Snow showers", "snow"), 86: ("Snow showers", "snow"),
+    95: ("Thunderstorm", "storm"), 96: ("Thunderstorm", "storm"), 99: ("Thunderstorm", "storm"),
+}
+
+
+def wmo_info(code):
+    return _WMO_MAP.get(code, ("Unknown", "cloud"))
+
+
+def fetch_weather(city_name):
+    entry = next((c for c in WEATHER_CITIES if c[0] == city_name), WEATHER_CITIES[0])
+    _, lat, lon = entry
+    cache_file = STATE_DIR / f"weather_{city_name.replace(' ', '_')}.json"
+    cached = None
+    if cache_file.exists():
+        try:
+            cached = json.loads(cache_file.read_text())
+        except Exception:
+            cached = None
+    if cached and time.time() - cached.get("ts", 0) < 2 * 3600:
+        return cached["days"]
+
+    url = (f"https://api.open-meteo.com/v1/forecast?latitude={lat}&longitude={lon}"
+           "&daily=weather_code,temperature_2m_max,temperature_2m_min,precipitation_probability_max"
+           "&timezone=auto&forecast_days=3")
+    raw = run(["curl", "-s", "--max-time", "6", url])
+    try:
+        data = json.loads(raw)
+        daily = data["daily"]
+        days = []
+        for i in range(len(daily["time"])):
+            days.append({
+                "date": daily["time"][i],
+                "code": daily["weather_code"][i],
+                "tmax": daily["temperature_2m_max"][i],
+                "tmin": daily["temperature_2m_min"][i],
+                "precip": daily.get("precipitation_probability_max", [None] * 3)[i],
+            })
+        if days:
+            STATE_DIR.mkdir(parents=True, exist_ok=True)
+            cache_file.write_text(json.dumps({"ts": time.time(), "days": days}))
+            return days
+    except Exception:
+        pass
+    return cached["days"] if cached else []
+
+
+def get_sim_status(cfg):
+    sims = ubus_call("cellular.sim", "info", {"bus": "cpu"}).get("sims", [])
+    modem = ubus_call("cellular.modem", "status", {"bus": "cpu"})
+    slot = str(modem.get("current_sim_slot", "1"))
+    active = next((s for s in sims if str(s.get("slot")) == slot), None)
+    traffic_mb = None
+    if active:
+        net = ubus_call("cellular.network", "status", {"bus": "cpu", "slot": int(slot)})
+        for n in net.get("networks", []):
+            if str(n.get("slot")) == slot:
+                try:
+                    traffic_mb = int(n["traffic_total"]) / 1024 / 1024
+                except Exception:
+                    pass
+    country = None
+    phone = None
+    if active:
+        country = MCC_COUNTRY.get(active.get("mcc", ""), f"MCC {active.get('mcc', '?')}")
+        phone = active.get("phone_number") or ""
+
+    prio = ubus_call("cellular.modem", "get_slot_priority_config", {"bus": "cpu"}).get("slot_priority", [1, 2])
+    esim_mode = ""
+    try:
+        esim_mode = (STATE_DIR.parent / "esim" / "mode").read_text().strip()
+    except Exception:
+        pass
+    # "sim_choice" reflects the UI's 3-way pick; slot 2 is shared between a
+    # physical SIM2 and the eSIM profile on this hardware (slot_support_esim
+    # == [2]), so we can't always tell them apart -- esim_mode is our best
+    # signal ("remote" observed when the eSIM profile is the active one).
+    if prio and prio[0] == 1:
+        sim_choice = "sim1"
+    elif esim_mode == "remote":
+        sim_choice = "esim"
+    else:
+        sim_choice = "sim2"
+
+    data_iface = ubus_call("network.interface.modem_cpu", "status")
+    data_up = bool(data_iface.get("up"))
+
+    return {
+        "slot": slot, "country": country, "phone": phone, "traffic_mb": traffic_mb,
+        "cap_mb": cfg.get("data_cap_mb"), "sim_choice": sim_choice, "data_up": data_up,
+    }
+
+
+def set_sim_choice(choice):
+    """choice: 'sim1' | 'sim2' | 'esim'. SIM2 and eSIM both live on slot 2 on
+    this hardware -- both just reorder slot priority to prefer slot 2."""
+    target_slot = 1 if choice == "sim1" else 2
+    other = 2 if target_slot == 1 else 1
+    run(["ubus", "call", "cellular.modem", "set_slot_priority_config",
+         json.dumps({"bus": "cpu", "slot_priority": [target_slot, other]})])
+
+
+def set_cellular_data_enabled(enabled):
+    subprocess.Popen(["ifup" if enabled else "ifdown", "modem_cpu"])
+
+
+# ---------- repeater (station/WiFi-extender mode) ----------
+
+def get_repeater_status():
+    st = ubus_call("repeater", "status")
+    if not st or not st.get("running"):
+        return {"connected": False, "ssid": None, "signal": None, "ip": None}
+    connected = st.get("state_s") == "connected"
+    ip = (st.get("ipv4") or {}).get("ip", "").split("/")[0] or None
+    return {
+        "connected": connected,
+        "ssid": st.get("ssid"),
+        "signal": st.get("signal"),
+        "ip": ip,
+    }
+
+
+def repeater_scan():
+    result = ubus_call("repeater", "scan", {"cached": True})
+    survey = result.get("survey", []) if result else []
+    best = {}
+    for ap in survey:
+        ssid = ap.get("ssid")
+        if not ssid:
+            continue
+        sig = ap.get("signal", -999)
+        if ssid not in best or sig > best[ssid]["signal"]:
+            best[ssid] = {
+                "ssid": ssid,
+                "signal": sig,
+                "bssid": ap.get("bssid"),
+                "band": ap.get("band"),
+                "open": not ap.get("caps", {}).get("PRIVACY", True),
+            }
+    return sorted(best.values(), key=lambda a: -a["signal"])
+
+
+def repeater_connect(ssid, bssid, key):
+    params = {"ssid": ssid, "bssid": bssid, "remember": True}
+    if key:
+        params["key"] = key
+    subprocess.Popen(["ubus", "call", "repeater", "connect", json.dumps(params)])
+
+
+def repeater_disconnect():
+    subprocess.Popen(["ubus", "call", "repeater", "disconnect"])
+
+
+# ---------- device settings ----------
+
+def get_wifi_radio_state(device):
+    return uci_get(f"wireless.{device}.disabled") != "1"
+
+
+def set_wifi_radio_state(device, enabled):
+    uci_set(f"wireless.{device}.disabled", "0" if enabled else "1")
+    subprocess.Popen(["/sbin/wifi", "reload"])
+
+
+def get_system_info():
+    uptime_s = run(["cat", "/proc/uptime"]).split()[0]
+    try:
+        uptime_min = int(float(uptime_s) / 60)
+    except Exception:
+        uptime_min = 0
+    lan_ip = uci_get("network.lan.ipaddr") or "192.168.8.1"
+    return {"uptime_min": uptime_min, "lan_ip": lan_ip}
+
+
+def reboot_router():
+    subprocess.Popen(["/sbin/reboot"])
+
+
+def openclash_installed():
+    return os.path.exists("/etc/init.d/openclash")
+
+
+def get_openclash_status():
+    installed = openclash_installed()
+    enabled = installed and uci_get("openclash.config.enable") == "1"
+    mode = (uci_get("openclash.config.proxy_mode") if installed else None) or "rule"
+    return {"installed": installed, "enabled": enabled, "mode": mode}
+
+
+def set_openclash_enabled(enabled):
+    if not openclash_installed():
+        return
+    uci_set("openclash.config.enable", "1" if enabled else "0")
+    subprocess.Popen(["/etc/init.d/openclash", "start" if enabled else "stop"])
+
+
+def set_openclash_mode(mode):
+    if not openclash_installed():
+        return
+    uci_set("openclash.config.proxy_mode", mode)
+    if uci_get("openclash.config.enable") == "1":
+        subprocess.Popen(["/etc/init.d/openclash", "restart"])
+
+
+_COUNTRY_NAME_HINTS = [
+    ("HONGKONG", "Hong Kong"), ("HONG KONG", "Hong Kong"), ("HK", "Hong Kong"),
+    ("TAIWAN", "Taiwan"), ("TW", "Taiwan"),
+    ("SINGAPORE", "Singapore"), ("SG", "Singapore"),
+    ("KOREA", "South Korea"), ("KR", "South Korea"),
+    ("JAPAN", "Japan"), ("TOKYO", "Japan"), ("JP", "Japan"),
+    ("BRITAIN", "UK"), ("LONDON", "UK"), ("UK", "UK"), ("GBR", "UK"),
+    ("GERMANY", "Germany"), ("DE", "Germany"),
+    ("FRANCE", "France"), ("FR", "France"),
+    ("CHINA", "China"), ("CN", "China"),
+    ("CANADA", "Canada"), ("CA", "Canada"),
+    ("AUSTRALIA", "Australia"), ("AU", "Australia"),
+    ("AMERICA", "USA"), ("UNITED STATES", "USA"), ("US", "USA"), ("USA", "USA"),
+]
+
+
+def guess_country_from_name(name):
+    if not name:
+        return None
+    upper = name.upper()
+    for key, country in _COUNTRY_NAME_HINTS:
+        if key in upper:
+            return country
+    return None
+
+
+def _mihomo_api():
+    port = uci_get("openclash.config.cn_port") or "9090"
+    password = uci_get("openclash.config.dashboard_password")
+    headers = ["-H", f"Authorization: Bearer {password}"] if password else []
+    return f"http://127.0.0.1:{port}", headers
+
+
+def get_openclash_traffic_and_node():
+    if not openclash_installed():
+        return {"running": False, "up_mb": None, "down_mb": None, "node_name": None,
+                "node_country": None, "nodes": [], "group": None}
+    base, headers = _mihomo_api()
+    conn_raw = run(["curl", "-s", "--max-time", "2"] + headers + [f"{base}/connections"])
+    try:
+        conn = json.loads(conn_raw)
+        up_mb = conn.get("uploadTotal", 0) / 1024 / 1024
+        down_mb = conn.get("downloadTotal", 0) / 1024 / 1024
+    except Exception:
+        return {"running": False, "up_mb": None, "down_mb": None, "node_name": None,
+                "node_country": None, "nodes": [], "group": None}
+
+    node_name, node_country, nodes, group = None, None, [], None
+    proxies_raw = run(["curl", "-s", "--max-time", "2"] + headers + [f"{base}/proxies"])
+    try:
+        proxies = json.loads(proxies_raw).get("proxies", {})
+        for name, info in proxies.items():
+            if info.get("type") == "Selector":
+                group = name
+                node_name = info.get("now")
+                nodes = info.get("all", [])
+                break
+    except Exception:
+        pass
+    if node_name:
+        node_country = guess_country_from_name(node_name)
+    return {"running": True, "up_mb": up_mb, "down_mb": down_mb, "node_name": node_name,
+            "node_country": node_country, "nodes": nodes, "group": group}
+
+
+def select_openclash_node(group, name):
+    base, headers = _mihomo_api()
+    run(["curl", "-s", "--max-time", "3", "-X", "PUT"] + headers +
+        ["-H", "Content-Type: application/json", "-d", json.dumps({"name": name}),
+         f"{base}/proxies/{group}"])
+
+
+# ---------- flags (simplified, drawn -- fonts don't have colour emoji) ----------
+
+def _flag_stripes(d, x, y, w, h, colors, vertical):
+    n = len(colors)
+    if vertical:
+        seg = w / n
+        for i, c in enumerate(colors):
+            d.rectangle([x + i * seg, y, x + (i + 1) * seg, y + h], fill=c)
+    else:
+        seg = h / n
+        for i, c in enumerate(colors):
+            d.rectangle([x, y + i * seg, x + w, y + (i + 1) * seg], fill=c)
+
+
+def _flag_nordic(d, x, y, w, h, bg, cross):
+    d.rectangle([x, y, x + w, y + h], fill=bg)
+    cx = x + w * 0.35
+    cw = max(2, h * 0.22)
+    d.rectangle([cx - cw / 2, y, cx + cw / 2, y + h], fill=cross)
+    chh = max(2, h * 0.22)
+    d.rectangle([x, y + h / 2 - chh / 2, x + w, y + h / 2 + chh / 2], fill=cross)
+
+
+def _flag_uk(d, x, y, w, h):
+    d.rectangle([x, y, x + w, y + h], fill=(1, 33, 105))
+    d.rectangle([x + w * 0.40, y, x + w * 0.60, y + h], fill=(255, 255, 255))
+    d.rectangle([x, y + h * 0.38, x + w, y + h * 0.62], fill=(255, 255, 255))
+    d.rectangle([x + w * 0.45, y, x + w * 0.55, y + h], fill=(200, 16, 46))
+    d.rectangle([x, y + h * 0.44, x + w, y + h * 0.56], fill=(200, 16, 46))
+
+
+def _flag_china(d, x, y, w, h):
+    d.rectangle([x, y, x + w, y + h], fill=(222, 41, 16))
+    scx, scy, r = x + w * 0.24, y + h * 0.32, h * 0.16
+    d.regular_polygon((scx, scy, r), n_sides=5, fill=(255, 222, 0))
+
+
+def _flag_japan(d, x, y, w, h):
+    d.rectangle([x, y, x + w, y + h], fill=(255, 255, 255))
+    r = h * 0.28
+    d.ellipse([x + w / 2 - r, y + h / 2 - r, x + w / 2 + r, y + h / 2 + r], fill=(188, 0, 45))
+
+
+def _flag_korea(d, x, y, w, h):
+    d.rectangle([x, y, x + w, y + h], fill=(255, 255, 255))
+    r = h * 0.24
+    cx, cy = x + w / 2, y + h / 2
+    d.pieslice([cx - r, cy - r, cx + r, cy + r], start=200, end=20, fill=(205, 46, 53))
+    d.pieslice([cx - r, cy - r, cx + r, cy + r], start=20, end=200, fill=(0, 71, 160))
+
+
+def _flag_usa(d, x, y, w, h):
+    stripes = 5
+    for i in range(stripes):
+        c = (178, 34, 52) if i % 2 == 0 else (255, 255, 255)
+        d.rectangle([x, y + i * h / stripes, x + w, y + (i + 1) * h / stripes], fill=c)
+    d.rectangle([x, y, x + w * 0.4, y + h * 0.55], fill=(60, 59, 110))
+
+
+def _flag_switzerland(d, x, y, w, h):
+    d.rectangle([x, y, x + w, y + h], fill=(213, 43, 30))
+    cw, chh = w * 0.18, h * 0.18
+    d.rectangle([x + w / 2 - cw / 2, y + h * 0.2, x + w / 2 + cw / 2, y + h * 0.8], fill=(255, 255, 255))
+    d.rectangle([x + w * 0.2, y + h / 2 - chh / 2, x + w * 0.8, y + h / 2 + chh / 2], fill=(255, 255, 255))
+
+
+def _flag_australia(d, x, y, w, h):
+    d.rectangle([x, y, x + w, y + h], fill=(0, 39, 118))
+    for dxr, dyr in [(0.75, 0.25), (0.85, 0.5), (0.75, 0.75), (0.6, 0.85), (0.65, 0.35)]:
+        px, py = x + w * dxr, y + h * dyr
+        d.ellipse([px - 1.5, py - 1.5, px + 1.5, py + 1.5], fill=(255, 255, 255))
+    d.rectangle([x, y, x + w * 0.35, y + h * 0.35], fill=(255, 255, 255))
+    d.rectangle([x + w * 0.05, y + h * 0.05, x + w * 0.30, y + h * 0.30], fill=(0, 39, 118))
+
+
+def _flag_hongkong(d, x, y, w, h):
+    d.rectangle([x, y, x + w, y + h], fill=(222, 41, 16))
+    r = h * 0.18
+    cx, cy = x + w / 2, y + h / 2
+    d.ellipse([cx - r, cy - r, cx + r, cy + r], fill=(255, 255, 255))
+
+
+def _flag_taiwan(d, x, y, w, h):
+    d.rectangle([x, y, x + w, y + h], fill=(222, 41, 16))
+    d.rectangle([x, y, x + w * 0.5, y + h * 0.5], fill=(0, 0, 149))
+    r = h * 0.09
+    cx, cy = x + w * 0.25, y + h * 0.25
+    d.ellipse([cx - r, cy - r, cx + r, cy + r], fill=(255, 255, 255))
+
+
+FLAG_DRAW = {
+    "UK": _flag_uk,
+    "China": _flag_china,
+    "Japan": _flag_japan,
+    "South Korea": _flag_korea,
+    "USA": _flag_usa,
+    "Switzerland": _flag_switzerland,
+    "Australia": _flag_australia,
+    "Hong Kong": _flag_hongkong,
+    "Taiwan": _flag_taiwan,
+    "Sweden": lambda d, x, y, w, h: _flag_nordic(d, x, y, w, h, (0, 106, 167), (254, 205, 27)),
+    "Denmark": lambda d, x, y, w, h: _flag_nordic(d, x, y, w, h, (198, 12, 48), (255, 255, 255)),
+    "Norway": lambda d, x, y, w, h: _flag_nordic(d, x, y, w, h, (186, 12, 47), (255, 255, 255)),
+    "Finland": lambda d, x, y, w, h: _flag_nordic(d, x, y, w, h, (255, 255, 255), (0, 53, 128)),
+    "France": lambda d, x, y, w, h: _flag_stripes(d, x, y, w, h, [(0, 35, 149), (255, 255, 255), (237, 41, 28)], True),
+    "Belgium": lambda d, x, y, w, h: _flag_stripes(d, x, y, w, h, [(0, 0, 0), (253, 200, 47), (237, 41, 28)], True),
+    "Germany": lambda d, x, y, w, h: _flag_stripes(d, x, y, w, h, [(0, 0, 0), (221, 0, 0), (255, 206, 0)], False),
+    "Netherlands": lambda d, x, y, w, h: _flag_stripes(d, x, y, w, h, [(174, 28, 40), (255, 255, 255), (33, 70, 139)], False),
+    "Italy": lambda d, x, y, w, h: _flag_stripes(d, x, y, w, h, [(0, 146, 70), (255, 255, 255), (206, 43, 55)], True),
+    "Spain": lambda d, x, y, w, h: _flag_stripes(d, x, y, w, h, [(170, 21, 27), (241, 191, 0), (170, 21, 27)], False),
+    "Portugal": lambda d, x, y, w, h: _flag_stripes(d, x, y, w, h, [(0, 102, 0), (255, 0, 0)], True),
+    "Russia": lambda d, x, y, w, h: _flag_stripes(d, x, y, w, h, [(255, 255, 255), (0, 57, 166), (213, 43, 30)], False),
+    "Romania": lambda d, x, y, w, h: _flag_stripes(d, x, y, w, h, [(0, 43, 127), (252, 209, 22), (206, 43, 55)], True),
+    "Slovakia": lambda d, x, y, w, h: _flag_stripes(d, x, y, w, h, [(255, 255, 255), (0, 101, 189), (238, 28, 37)], False),
+    "Canada": lambda d, x, y, w, h: _flag_stripes(d, x, y, w, h, [(255, 0, 0), (255, 255, 255), (255, 0, 0)], True),
+}
+
+
+def draw_flag(d, x, y, w, h, country):
+    fn = FLAG_DRAW.get(country)
+    if fn:
+        fn(d, x, y, w, h)
+    else:
+        d.rectangle([x, y, x + w, y + h], fill=(70, 75, 90))
+        initials = (country[:2] if country else "??").upper()
+        f = font("default_bold", int(h * 0.5))
+        bbox = d.textbbox((0, 0), initials, font=f)
+        tw, th = bbox[2] - bbox[0], bbox[3] - bbox[1]
+        d.text((x + (w - tw) / 2, y + (h - th) / 2 - bbox[1]), initials, font=f, fill=(230, 230, 230))
+    d.rectangle([x, y, x + w, y + h], outline=(0, 0, 0), width=1)
+
+
+# ---------- weather icons (simple geometric, no image assets needed) ----------
+
+_SUN = (255, 196, 66)
+_CLOUD = (150, 160, 178)
+_RAIN = (108, 168, 235)
+_SNOW = (225, 232, 240)
+_STORM = (210, 170, 60)
+_FOG = (130, 138, 152)
+
+
+def _icon_sun(d, cx, cy, r):
+    d.ellipse([cx - r, cy - r, cx + r, cy + r], fill=_SUN)
+    for i in range(8):
+        import math
+        ang = i * math.pi / 4
+        x0, y0 = cx + math.cos(ang) * r * 1.35, cy + math.sin(ang) * r * 1.35
+        x1, y1 = cx + math.cos(ang) * r * 1.7, cy + math.sin(ang) * r * 1.7
+        d.line([x0, y0, x1, y1], fill=_SUN, width=2)
+
+
+def _icon_cloud(d, cx, cy, r, color=_CLOUD):
+    d.ellipse([cx - r * 1.1, cy - r * 0.2, cx - r * 0.1, cy + r * 0.8], fill=color)
+    d.ellipse([cx - r * 0.3, cy - r * 0.7, cx + r * 0.9, cy + r * 0.5], fill=color)
+    d.ellipse([cx + r * 0.2, cy - r * 0.1, cx + r * 1.3, cy + r * 0.8], fill=color)
+    d.rectangle([cx - r * 0.9, cy + r * 0.1, cx + r * 0.9, cy + r * 0.8], fill=color)
+
+
+def _icon_cloud_sun(d, cx, cy, r):
+    _icon_sun(d, cx - r * 0.35, cy - r * 0.35, r * 0.55)
+    _icon_cloud(d, cx + r * 0.15, cy + r * 0.15, r * 0.85)
+
+
+def _icon_rain(d, cx, cy, r):
+    _icon_cloud(d, cx, cy - r * 0.25, r * 0.9)
+    for dx in (-0.5, 0, 0.5):
+        x0 = cx + dx * r
+        d.line([x0, cy + r * 0.7, x0 - 2, cy + r * 1.3], fill=_RAIN, width=2)
+
+
+def _icon_snow(d, cx, cy, r):
+    _icon_cloud(d, cx, cy - r * 0.25, r * 0.9, color=_SNOW)
+    for dx in (-0.5, 0, 0.5):
+        x, y = cx + dx * r, cy + r * 1.0
+        for ang in range(0, 180, 60):
+            import math
+            rad = math.radians(ang)
+            d.line([x - 4 * math.cos(rad), y - 4 * math.sin(rad),
+                    x + 4 * math.cos(rad), y + 4 * math.sin(rad)], fill=_SNOW, width=1)
+
+
+def _icon_fog(d, cx, cy, r):
+    for i, dy in enumerate([-0.3, 0.1, 0.5]):
+        d.line([cx - r, cy + dy * r, cx + r, cy + dy * r], fill=_FOG, width=3)
+
+
+def _icon_storm(d, cx, cy, r):
+    _icon_cloud(d, cx, cy - r * 0.3, r * 0.9)
+    d.polygon([(cx - 2, cy + r * 0.5), (cx + 6, cy + r * 0.5), (cx - 2, cy + r * 1.2),
+               (cx + 2, cy + r * 0.9), (cx - 6, cy + r * 0.9)], fill=_STORM)
+
+
+_ICON_DRAW = {
+    "sun": _icon_sun, "cloud": _icon_cloud, "cloud_sun": _icon_cloud_sun,
+    "rain": _icon_rain, "snow": _icon_snow, "fog": _icon_fog, "storm": _icon_storm,
+}
+
+
+def draw_weather_icon(d, cx, cy, r, icon_key):
+    _ICON_DRAW.get(icon_key, _icon_cloud)(d, cx, cy, r)
+
+
+def draw_analog_clock(d, cx, cy, r, dt, accent):
+    import math
+    d.ellipse([cx - r, cy - r, cx + r, cy + r], outline=FG, width=2)
+    for h in range(12):
+        ang = math.radians(h * 30 - 90)
+        outer = r - 3
+        inner = r - 9 if h % 3 == 0 else r - 6
+        x0, y0 = cx + math.cos(ang) * inner, cy + math.sin(ang) * inner
+        x1, y1 = cx + math.cos(ang) * outer, cy + math.sin(ang) * outer
+        d.line([x0, y0, x1, y1], fill=DIM, width=2 if h % 3 == 0 else 1)
+
+    hour_ang = math.radians((dt.hour % 12 + dt.minute / 60) * 30 - 90)
+    min_ang = math.radians((dt.minute + dt.second / 60) * 6 - 90)
+    sec_ang = math.radians(dt.second * 6 - 90)
+
+    hl = r * 0.5
+    d.line([cx, cy, cx + math.cos(hour_ang) * hl, cy + math.sin(hour_ang) * hl], fill=FG, width=4)
+    ml = r * 0.75
+    d.line([cx, cy, cx + math.cos(min_ang) * ml, cy + math.sin(min_ang) * ml], fill=FG, width=3)
+    sl = r * 0.85
+    d.line([cx, cy, cx + math.cos(sec_ang) * sl, cy + math.sin(sec_ang) * sl], fill=accent, width=1)
+    d.ellipse([cx - 4, cy - 4, cx + 4, cy + 4], fill=accent)
+
+
+def _icon_wifi_signal(d, cx, cy, r, color):
+    import math
+    d.ellipse([cx - 2, cy + r * 0.55 - 2, cx + 2, cy + r * 0.55 + 2], fill=color)
+    for frac in (0.45, 0.72, 1.0):
+        rr = r * frac
+        bbox = [cx - rr, cy - rr * 0.4, cx + rr, cy + rr * 1.6]
+        d.arc(bbox, start=222, end=318, fill=color, width=3)
+
+
+def _icon_settings_gear(d, cx, cy, r, color):
+    for y_frac, handle_frac in ((-0.55, 0.28), (0, 0.68), (0.55, 0.42)):
+        y = cy + r * y_frac
+        d.line([cx - r, y, cx + r, y], fill=(80, 86, 100), width=2)
+        hx = cx - r + 2 * r * handle_frac
+        d.ellipse([hx - 5, y - 5, hx + 5, y + 5], fill=color)
+
+
+def _icon_lock(d, cx, cy, r, color):
+    d.arc([cx - r * 0.6, cy - r * 1.3, cx + r * 0.6, cy - r * 0.1], start=180, end=360, fill=color, width=2)
+    d.rounded_rectangle([cx - r, cy - r * 0.2, cx + r, cy + r], radius=2, fill=color)
+
+
+# ---------- widgets ----------
+
+def new_canvas():
+    img = Image.new("RGB", (W, H), BG)
+    return img, ImageDraw.Draw(img)
+
+
+def draw_page_dots(d, active_idx, count=5):
+    total_w = count * 16
+    x0 = (W - total_w) // 2
+    y = H - 18
+    for i in range(count):
+        x = x0 + i * 16
+        r = 4 if i == active_idx else 3
+        color = FG if i == active_idx else DIM
+        d.ellipse([x - r, y - r, x + r, y + r], fill=color)
+
+
+def draw_header(d, label, accent):
+    d.rectangle([0, 0, W, 34], fill=accent)
+    d.text((14, 8), label, font=font("default_bold", 18), fill=BG)
+
+
+def draw_back_header(d, label, accent):
+    d.rectangle([0, 0, W, 34], fill=accent)
+    d.text((12, 5), "‹", font=font("default_bold", 24), fill=BG)
+    d.text((32, 8), label, font=font("default_bold", 16), fill=BG)
+
+
+def draw_toggle(d, x, y, on, accent, w=52, h=28):
+    r = h / 2
+    color = accent if on else (60, 65, 80)
+    d.rounded_rectangle([x, y, x + w, y + h], radius=r, fill=color)
+    knob_r = h / 2 - 3
+    kx = x + w - r if on else x + r
+    ky = y + h / 2
+    d.ellipse([kx - knob_r, ky - knob_r, kx + knob_r, ky + knob_r], fill=(255, 255, 255))
+
+
+def draw_segmented(d, x, y, w, h, labels, selected_idx, accent, fsize=14):
+    d.rounded_rectangle([x, y, x + w, y + h], radius=h / 2, outline=accent, width=2)
+    seg_w = w / len(labels)
+    hx0 = x + selected_idx * seg_w
+    d.rounded_rectangle([hx0 + 2, y + 2, hx0 + seg_w - 2, y + h - 2], radius=(h - 4) / 2, fill=accent)
+    f = font("default_medium", fsize)
+    for i, label in enumerate(labels):
+        bbox = d.textbbox((0, 0), label, font=f)
+        tw, th = bbox[2] - bbox[0], bbox[3] - bbox[1]
+        tx = x + i * seg_w + (seg_w - tw) / 2
+        ty = y + (h - th) / 2 - bbox[1]
+        color = BG if i == selected_idx else FG
+        d.text((tx, ty), label, font=f, fill=color)
+
+
+def centered_text(d, cx, y, text, f, fill):
+    bbox = d.textbbox((0, 0), text, font=f)
+    tw = bbox[2] - bbox[0]
+    d.text((cx - tw / 2, y), text, font=f, fill=fill)
+
+
+def truncate_to_width(d, text, f, max_w):
+    if d.textbbox((0, 0), text, font=f)[2] <= max_w:
+        return text
+    while len(text) > 1:
+        text = text[:-1]
+        candidate = text + "…"
+        if d.textbbox((0, 0), candidate, font=f)[2] <= max_w:
+            return candidate
+    return text[:1] + "…"
+
+
+def draw_tile(d, x0, y0, x1, y1, icon_fn, label, subtitle, accent):
+    d.rounded_rectangle([x0, y0, x1, y1], radius=10, fill=(22, 28, 40), outline=(42, 48, 60), width=1)
+    cx = (x0 + x1) / 2
+    icon_fn(d, cx, y0 + 32, 20, accent)
+    centered_text(d, cx, y0 + 58, label, font("default_bold", 14), FG)
+    if subtitle:
+        f = font("default_medium", 11)
+        text = truncate_to_width(d, subtitle, f, (x1 - x0) - 12)
+        centered_text(d, cx, y0 + 78, text, f, DIM)
+
+
+def draw_sparkline(d, x, y, w, h, points, color):
+    """points: list of (label, value), oldest first. Thin line + a faint fill
+    under it, a highlighted end dot on the latest value, min/max as direct
+    labels in muted ink (not the series colour) rather than a dense axis."""
+    if not points or len(points) < 2:
+        centered_text(d, x + w / 2, y + h / 2 - 6, "not enough data yet", font("default_medium", 11), DIM)
+        return
+    vals = [v for _, v in points]
+    vmin, vmax = min(vals), max(vals)
+    span = vmax - vmin
+    if span < 1e-9:
+        span = max(abs(vmax) * 0.001, 1e-6)
+    pad_top, pad_bot = 14, 14
+
+    def px(i):
+        return x + i * (w / (len(points) - 1))
+
+    def py(v):
+        return y + pad_top + (1 - (v - vmin) / span) * (h - pad_top - pad_bot)
+
+    d.line([x, y + h - pad_bot, x + w, y + h - pad_bot], fill=(38, 42, 52), width=1)
+
+    poly = [(px(i), py(v)) for i, (_, v) in enumerate(points)]
+    fill_color = tuple(int(c * 0.16 + bg * 0.84) for c, bg in zip(color, BG))
+    d.polygon(poly + [(px(len(points) - 1), y + h), (px(0), y + h)], fill=fill_color)
+    d.line(poly, fill=color, width=2, joint="curve")
+
+    ex, ey = poly[-1]
+    d.ellipse([ex - 3, ey - 3, ex + 3, ey + 3], fill=color)
+
+    f = font("default_medium", 10)
+    d.text((x, y), f"{vmax:.3f}", font=f, fill=DIM)
+    bbox = d.textbbox((0, 0), f"{vmin:.3f}", font=f)
+    d.text((x, y + h - (bbox[3] - bbox[1]) - 2), f"{vmin:.3f}", font=f, fill=DIM)
+
+
+# ---------- layout constants (shared by drawing and hit-testing) ----------
+
+CLOCK_LEFT_ZONE = (0, 34, W // 2, 142)
+CLOCK_RIGHT_ZONE = (W // 2, 34, W, 142)
+REPEATER_TILE = (8, 150, 116, 244)
+MORE_TILE = (124, 150, 232, 244)
+
+FX_TOP_ZONE = (34, 122)
+FX_BOTTOM_ZONE = (128, 216)
+FX_RANGE_RECT = (16, 224, 224, 246)
+FX_STATUS_Y = 252
+FX_BUTTON = (50, 268, 190, 288)
+
+SIM_CHOICE_RECT = (16, 86, 156, 110)
+SIM_DATA_TOGGLE_RECT = (172, 88, 216, 108)
+SIM_DATA_ZONE = (160, 296)
+
+OC_TOGGLE_RECT = (172, 38, 218, 60)
+OC_MODE_SEG_RECT = (16, 100, 224, 128)
+OC_NODE_ZONE = (146, 192)
+
+WEATHER_CITY_ZONE = (34, 66)
+
+PICKER_TOP, PICKER_BOTTOM = 38, 316
+
+PANEL_NAMES = ["clock", "sim", "weather", "fx", "openclash"]
+
+
+# ---------- main panels ----------
+
+def panel_clock(cfg, rep):
+    from zoneinfo import ZoneInfo
+    img, d = new_canvas()
+    draw_header(d, "HOME", ACCENT["clock"])
+    tz_l, tz_r = cfg["clock_top"], cfg["clock_bottom"]
+    dt_l = datetime.now(ZoneInfo(tz_l))
+    dt_r = datetime.now(ZoneInfo(tz_r))
+
+    draw_analog_clock(d, W / 4, 72, 30, dt_l, ACCENT["clock"])
+    draw_analog_clock(d, W * 3 / 4, 72, 30, dt_r, ACCENT["clock"])
+    centered_text(d, W / 4, 106, f"{city_name(tz_l)}  ›", font("default_medium", 12), DIM)
+    centered_text(d, W * 3 / 4, 106, f"{city_name(tz_r)}  ›", font("default_medium", 12), DIM)
+    centered_text(d, W / 2, 122, dt_l.strftime("%a %d %b"), font("default_medium", 12), DIM)
+
+    d.line([16, 142, W - 16, 142], fill=(34, 38, 48))
+
+    rep_sub = rep["ssid"] if rep["connected"] else "Not connected"
+    draw_tile(d, 8, 150, 116, 244,
+              lambda dd, cx, cy, r, ac: _icon_wifi_signal(dd, cx, cy, r, ac),
+              "Repeater", rep_sub, ACCENT["clock"])
+    draw_tile(d, 124, 150, 232, 244,
+              lambda dd, cx, cy, r, ac: _icon_settings_gear(dd, cx, cy, r, ac),
+              "More", "Settings", ACCENT["clock"])
+
+    draw_page_dots(d, 0)
+    return img
+
+
+FX_RANGE_LABELS = {"week": "Week", "month": "Month", "year": "Year"}
+
+
+def panel_fx(cfg, fx, fx_range):
+    img, d = new_canvas()
+    draw_header(d, "CURRENCY", ACCENT["fx"])
+    top_code, bot_code = cfg["fx_top"], cfg["fx_bottom"]
+    top_rate = rate_to_cny(top_code, fx)
+    bot_rate = rate_to_cny(bot_code, fx)
+
+    d.text((16, 40), f"1 {top_code} = ", font=font("default_medium", 15), fill=DIM)
+    lbl_w = d.textbbox((0, 0), f"1 {top_code} = ", font=font("default_medium", 15))[2]
+    d.text((16 + lbl_w, 38), f"{top_rate:.3f} CNY" if top_rate else "—", font=font("default_bold", 17), fill=FG)
+    d.text((W - 26, 40), "›", font=font("default_medium", 15), fill=DIM)
+    top_hist = fetch_fx_history(top_code, fx_range)
+    draw_sparkline(d, 16, 62, W - 32, 56, top_hist, ACCENT["fx"])
+
+    d.line([16, 126, W - 16, 126], fill=DIM)
+
+    d.text((16, 132), f"1 {bot_code} = ", font=font("default_medium", 15), fill=DIM)
+    lbl_w = d.textbbox((0, 0), f"1 {bot_code} = ", font=font("default_medium", 15))[2]
+    d.text((16 + lbl_w, 130), f"{bot_rate:.3f} CNY" if bot_rate else "—", font=font("default_bold", 17), fill=FG)
+    d.text((W - 26, 132), "›", font=font("default_medium", 15), fill=DIM)
+    bot_hist = fetch_fx_history(bot_code, fx_range)
+    draw_sparkline(d, 16, 154, W - 32, 56, bot_hist, ACCENT["fx"])
+
+    rx0, ry0, rx1, ry1 = FX_RANGE_RECT
+    sel_idx = FX_RANGES.index(fx_range)
+    draw_segmented(d, rx0, ry0, rx1 - rx0, ry1 - ry0,
+                   [FX_RANGE_LABELS[r] for r in FX_RANGES], sel_idx, ACCENT["fx"], fsize=13)
+
+    if fx:
+        age_min = int((time.time() - fx["ts"]) / 60)
+        age_txt = "updated just now" if age_min <= 0 else f"updated {age_min} min ago"
+    else:
+        age_txt = "no rate yet"
+    centered_text(d, W / 2, FX_STATUS_Y, age_txt, font("default_medium", 12), DIM)
+
+    bx0, by0, bx1, by1 = FX_BUTTON
+    d.rounded_rectangle([bx0, by0, bx1, by1], radius=(by1 - by0) / 2, outline=ACCENT["fx"], width=2)
+    centered_text(d, (bx0 + bx1) / 2, by0 + 4, "Update Now", font("default_medium", 12), ACCENT["fx"])
+    draw_page_dots(d, 3)
+    return img
+
+
+SIM_CHOICE_LABELS = ["SIM1", "SIM2", "eSIM"]
+SIM_CHOICE_KEYS = ["sim1", "sim2", "esim"]
+
+
+def panel_sim(cfg, sim):
+    img, d = new_canvas()
+    draw_header(d, "ACTIVE SIM", ACCENT["sim"])
+    country = sim["country"] or "unknown"
+    d.text((16, 44), f"Slot {sim['slot']}", font=font("default_medium", 14), fill=DIM)
+    draw_flag(d, 16, 60, 26, 18, country)
+    d.text((50, 57), country, font=font("default_bold", 20), fill=FG)
+
+    cx0, cy0, cx1, cy1 = SIM_CHOICE_RECT
+    sel_idx = SIM_CHOICE_KEYS.index(sim["sim_choice"])
+    draw_segmented(d, cx0, cy0, cx1 - cx0, cy1 - cy0, SIM_CHOICE_LABELS, sel_idx, ACCENT["sim"], fsize=11)
+
+    tx0, ty0, tx1, ty1 = SIM_DATA_TOGGLE_RECT
+    draw_toggle(d, tx0, ty0, sim["data_up"], ACCENT["sim"], w=tx1 - tx0, h=ty1 - ty0)
+
+    d.text((16, 114), sim["phone"] or "—", font=font("default_mono_medium", 16), fill=DIM)
+
+    d.line([16, 140, W - 16, 140], fill=DIM)
+
+    d.text((16, 152), "Data used  ›", font=font("default_medium", 14), fill=DIM)
+    used, cap = sim["traffic_mb"], sim["cap_mb"]
+    d.text((16, 170), f"{used:.1f} MB" if used is not None else "n/a", font=font("default_mono_medium", 28), fill=FG)
+
+    bx0, by0, bx1, by1 = 16, 214, W - 16, 230
+    d.rounded_rectangle([bx0, by0, bx1, by1], radius=8, outline=DIM, width=1)
+    if used is not None and cap:
+        pct = max(0, min(100, used / cap * 100))
+        bar_w = int((bx1 - bx0 - 4) * pct / 100)
+        if bar_w > 0:
+            d.rounded_rectangle([bx0 + 2, by0 + 2, bx0 + 2 + bar_w, by1 - 2], radius=6, fill=ACCENT["sim"])
+        caption = f"{pct:.0f}% of {cap_label(cap)} used"
+    elif cap is None:
+        caption = "no limit set · tap to set"
+    else:
+        caption = "tap to set a limit"
+    centered_text(d, W / 2, 238, caption, font("default_medium", 12), DIM)
+    draw_page_dots(d, 1)
+    return img
+
+
+def panel_openclash(oc, traf):
+    img, d = new_canvas()
+    draw_header(d, "OPENCLASH", ACCENT["openclash"])
+
+    if not oc["installed"]:
+        centered_text(d, W / 2, 130, "OpenClash isn't installed", font("default_medium", 14), DIM)
+        centered_text(d, W / 2, 150, "on this device", font("default_medium", 14), DIM)
+        draw_page_dots(d, 4)
+        return img
+
+    d.text((16, 44), "Enabled", font=font("default_medium", 16), fill=FG)
+    tx0, ty0, tx1, ty1 = OC_TOGGLE_RECT
+    draw_toggle(d, tx0, ty0, oc["enabled"], ACCENT["openclash"], w=tx1 - tx0, h=ty1 - ty0)
+
+    d.line([16, 72, W - 16, 72], fill=(40, 44, 54))
+
+    d.text((16, 80), "Mode", font=font("default_medium", 14), fill=DIM)
+    sx0, sy0, sx1, sy1 = OC_MODE_SEG_RECT
+    sel_idx = 0 if oc["mode"] == "global" else 1
+    draw_segmented(d, sx0, sy0, sx1 - sx0, sy1 - sy0, ["Global", "Rule"], sel_idx, ACCENT["openclash"])
+
+    d.line([16, 138, W - 16, 138], fill=(40, 44, 54))
+
+    d.text((16, 146), "Node  ›", font=font("default_medium", 14), fill=DIM)
+    if not traf["running"]:
+        d.text((16, 166), "not running", font=font("default_medium", 15), fill=DIM)
+    elif traf["node_name"]:
+        if traf["node_country"]:
+            draw_flag(d, 16, 164, 24, 16, traf["node_country"])
+            d.text((48, 161), traf["node_country"], font=font("default_bold", 17), fill=FG)
+        else:
+            name = traf["node_name"]
+            short = name if len(name) <= 16 else name[:15] + "…"
+            d.text((16, 164), short, font=font("default_medium", 15), fill=FG)
+    else:
+        d.text((16, 166), "no subscription yet", font=font("default_medium", 13), fill=DIM)
+
+    d.line([16, 192, W - 16, 192], fill=(40, 44, 54))
+
+    d.text((16, 200), "Traffic (session)", font=font("default_medium", 14), fill=DIM)
+    if traf["running"] and traf["up_mb"] is not None:
+        stats = f"↑ {traf['up_mb']:.1f} MB   ↓ {traf['down_mb']:.1f} MB"
+        d.text((16, 220), stats, font=font("default_mono_medium", 15), fill=FG)
+    else:
+        d.text((16, 220), "—", font=font("default_mono_medium", 15), fill=DIM)
+
+    centered_text(d, W / 2, 266, "luci: 192.168.8.1:8080", font("default_medium", 11), DIM)
+    draw_page_dots(d, 4)
+    return img
+
+
+def panel_weather(cfg, days):
+    img, d = new_canvas()
+    draw_header(d, "WEATHER", ACCENT["weather"])
+    d.text((16, 44), f"{cfg['weather_city']}  ›", font=font("default_medium", 16), fill=FG)
+
+    if not days:
+        centered_text(d, W / 2, 150, "no data yet", font("default_medium", 14), DIM)
+        draw_page_dots(d, 2)
+        return img
+
+    day_labels = ["Today", "Tomorrow"]
+    for i in range(2, len(days)):
+        try:
+            wd = datetime.strptime(days[i]["date"], "%Y-%m-%d").strftime("%a")
+        except Exception:
+            wd = "Day " + str(i + 1)
+        day_labels.append(wd)
+
+    col_w = (W - 32) / 3
+    for i, day in enumerate(days[:3]):
+        cx = 16 + col_w * i + col_w / 2
+        label, icon_key = wmo_info(day["code"])
+        d.text((cx - col_w / 2 + 4, 76), day_labels[i], font=font("default_medium", 13), fill=DIM)
+        draw_weather_icon(d, cx, 128, 22, icon_key)
+        centered_text(d, cx, 168, f"{round(day['tmax'])}°", font("default_bold", 18), FG)
+        centered_text(d, cx, 190, f"{round(day['tmin'])}°", font("default_medium", 14), DIM)
+        if day.get("precip") is not None:
+            centered_text(d, cx, 210, f"{day['precip']:.0f}%", font("default_medium", 11), ACCENT["weather"])
+
+    d.line([16, 236, W - 16, 236], fill=(40, 44, 54))
+    today_label, _ = wmo_info(days[0]["code"])
+    centered_text(d, W / 2, 246, today_label, font("default_medium", 14), FG)
+    draw_page_dots(d, 2)
+    return img
+
+
+def panel_weather_picker(cfg):
+    items = [(name, name) for name, _, _ in WEATHER_CITIES]
+    return panel_picker("Weather City", ACCENT["weather"], items, cfg["weather_city"])
+
+
+# ---------- confirm dialog (generic, reused for reboot / disconnect) ----------
+
+CONFIRM_YES_RECT = (30, 190, 210, 226)
+CONFIRM_NO_RECT = (30, 236, 210, 272)
+
+
+def panel_confirm(title, message, accent, yes_label="Yes", danger=False):
+    img, d = new_canvas()
+    draw_back_header(d, title, accent)
+    centered_text(d, W / 2, 110, message, font("default_medium", 15), FG)
+
+    yx0, yy0, yx1, yy1 = CONFIRM_YES_RECT
+    yes_color = (200, 80, 80) if danger else accent
+    d.rounded_rectangle([yx0, yy0, yx1, yy1], radius=8, fill=yes_color)
+    centered_text(d, (yx0 + yx1) / 2, yy0 + 9, yes_label, font("default_bold", 14), BG)
+
+    nx0, ny0, nx1, ny1 = CONFIRM_NO_RECT
+    d.rounded_rectangle([nx0, ny0, nx1, ny1], radius=8, outline=DIM, width=2)
+    centered_text(d, (nx0 + nx1) / 2, ny0 + 9, "Cancel", font("default_medium", 14), DIM)
+    return img
+
+
+def hit_confirm(x, y):
+    yx0, yy0, yx1, yy1 = CONFIRM_YES_RECT
+    if yx0 <= x <= yx1 and yy0 <= y <= yy1:
+        return "yes"
+    nx0, ny0, nx1, ny1 = CONFIRM_NO_RECT
+    if nx0 <= x <= nx1 and ny0 <= y <= ny1:
+        return "no"
+    return None
+
+
+# ---------- More / settings ----------
+
+MORE_WIFI24_TOGGLE = (176, 101, 224, 127)
+MORE_WIFI5_TOGGLE = (176, 138, 224, 164)
+MORE_REBOOT_RECT = (16, 196, W - 16, 232)
+
+
+def panel_more(sysinfo, wifi24, wifi5):
+    img, d = new_canvas()
+    draw_back_header(d, "More", ACCENT["clock"])
+
+    d.text((16, 44), "System", font=font("default_medium", 13), fill=DIM)
+    up_h, up_m = divmod(sysinfo["uptime_min"], 60)
+    d.text((16, 62), f"Up {up_h}h {up_m}m  ·  {sysinfo['lan_ip']}", font=font("default_medium", 13), fill=FG)
+
+    d.line([16, 92, W - 16, 92], fill=(40, 44, 54))
+
+    d.text((16, 108), "2.4GHz WiFi", font=font("default_medium", 15), fill=FG)
+    tx0, ty0, tx1, ty1 = MORE_WIFI24_TOGGLE
+    draw_toggle(d, tx0, ty0, wifi24, ACCENT["clock"], w=tx1 - tx0, h=ty1 - ty0)
+
+    d.text((16, 145), "5GHz WiFi", font=font("default_medium", 15), fill=FG)
+    tx0, ty0, tx1, ty1 = MORE_WIFI5_TOGGLE
+    draw_toggle(d, tx0, ty0, wifi5, ACCENT["clock"], w=tx1 - tx0, h=ty1 - ty0)
+
+    d.line([16, 182, W - 16, 182], fill=(40, 44, 54))
+
+    rx0, ry0, rx1, ry1 = MORE_REBOOT_RECT
+    d.rounded_rectangle([rx0, ry0, rx1, ry1], radius=8, outline=(200, 80, 80), width=2)
+    centered_text(d, (rx0 + rx1) / 2, ry0 + 10, "Reboot Router", font("default_bold", 14), (220, 100, 100))
+
+    centered_text(d, W / 2, 280, "luci: 192.168.8.1:8080", font("default_medium", 11), DIM)
+    return img
+
+
+def hit_more(x, y):
+    tx0, ty0, tx1, ty1 = MORE_WIFI24_TOGGLE
+    if tx0 - 10 <= x <= tx1 + 10 and ty0 - 8 <= y <= ty1 + 8:
+        return "wifi24"
+    tx0, ty0, tx1, ty1 = MORE_WIFI5_TOGGLE
+    if tx0 - 10 <= x <= tx1 + 10 and ty0 - 8 <= y <= ty1 + 8:
+        return "wifi5"
+    rx0, ry0, rx1, ry1 = MORE_REBOOT_RECT
+    if rx0 <= x <= rx1 and ry0 <= y <= ry1:
+        return "reboot"
+    return None
+
+
+# ---------- Repeater ----------
+
+REPEATER_LIST_TOP = 110
+REPEATER_ROW_H = 34
+REPEATER_DISCONNECT_ZONE = (34, 108)
+
+
+def panel_repeater(rep, networks):
+    img, d = new_canvas()
+    draw_back_header(d, "Repeater", ACCENT["clock"])
+
+    if rep["connected"]:
+        d.text((16, 44), "Connected", font=font("default_medium", 13), fill=ACCENT["clock"])
+        d.text((16, 62), rep["ssid"], font=font("default_bold", 17), fill=FG)
+        sub = f"{rep['ip'] or '—'}  ·  {rep['signal']} dBm" if rep["signal"] is not None else (rep["ip"] or "")
+        d.text((16, 84), sub, font=font("default_medium", 12), fill=DIM)
+        centered_text(d, W - 46, 50, "Disconnect", font("default_medium", 11), (220, 120, 120))
+    else:
+        d.text((16, 44), "Not connected", font=font("default_medium", 15), fill=DIM)
+        d.text((16, 64), "Tap a network below to connect", font=font("default_medium", 11), fill=DIM)
+
+    d.line([16, REPEATER_LIST_TOP - 4, W - 16, REPEATER_LIST_TOP - 4], fill=(40, 44, 54))
+
+    if not networks:
+        centered_text(d, W / 2, 160, "Scanning…", font("default_medium", 13), DIM)
+    else:
+        max_rows = int((316 - REPEATER_LIST_TOP) / REPEATER_ROW_H)
+        for i, ap in enumerate(networks[:max_rows]):
+            y0 = REPEATER_LIST_TOP + i * REPEATER_ROW_H
+            label = truncate_to_width(d, ap["ssid"], font("default_medium", 14), 150)
+            d.text((20, y0 + 8), label, font=font("default_medium", 14), fill=FG)
+            if ap["open"]:
+                d.text((W - 46, y0 + 9), "open", font=font("default_medium", 11), fill=DIM)
+            else:
+                _icon_lock(d, W - 28, y0 + REPEATER_ROW_H / 2, 7, DIM)
+            if i > 0:
+                d.line([16, y0, W - 16, y0], fill=(26, 30, 40))
+    return img
+
+
+def hit_repeater(x, y, rep, n_networks):
+    if rep["connected"] and REPEATER_DISCONNECT_ZONE[0] <= y < REPEATER_DISCONNECT_ZONE[1]:
+        return ("disconnect", None)
+    if y >= REPEATER_LIST_TOP:
+        idx = int((y - REPEATER_LIST_TOP) / REPEATER_ROW_H)
+        max_rows = int((316 - REPEATER_LIST_TOP) / REPEATER_ROW_H)
+        if 0 <= idx < min(n_networks, max_rows):
+            return ("select", idx)
+    return (None, None)
+
+
+# ---------- on-screen keyboard ----------
+
+KB_ROW_Y0 = 76
+KB_ROW_H = 32
+KB_KEY_H = 28
+KB_CAPS_RECT = (8, 176, 46, 208)
+KB_LAYER_TOGGLE_RECT = (50, 176, 96, 208)
+KB_SPACE_RECT = (100, 176, 188, 208)
+KB_BACKSPACE_RECT = (192, 176, 232, 208)
+KB_CANCEL_RECT = (16, 214, 116, 250)
+KB_CONNECT_RECT = (124, 214, 224, 250)
+
+KB_LETTER_ROWS = ["qwertyuiop", "asdfghjkl", "zxcvbnm"]
+KB_SYMBOL_ROWS = ["1234567890", "-_/:;()&@\"", ".,?!'~#$%^"]
+
+
+def kb_rows(layer, caps):
+    src = KB_LETTER_ROWS if layer == "letters" else KB_SYMBOL_ROWS
+    rows = [r.upper() for r in src] if (layer == "letters" and caps) else list(src)
+    return [list(r) for r in rows]
+
+
+def layout_row(labels, y, key_w=23, key_h=KB_KEY_H, gap=1):
+    total_w = len(labels) * key_w + (len(labels) - 1) * gap
+    x0 = (W - total_w) / 2
+    rects = []
+    x = x0
+    for lbl in labels:
+        rects.append((lbl, x, y, x + key_w, y + key_h))
+        x += key_w + gap
+    return rects
+
+
+def panel_keyboard(title, text, layer, caps, accent, connect_label="Connect"):
+    img, d = new_canvas()
+    draw_back_header(d, title, accent)
+
+    d.rounded_rectangle([16, 38, W - 16, 68], radius=6, outline=(50, 55, 68), width=1)
+    shown = text if len(text) <= 20 else "…" + text[-19:]
+    d.text((22, 45), shown if shown else " ", font=font("default_mono_medium", 15), fill=FG)
+
+    y = KB_ROW_Y0
+    for row in kb_rows(layer, caps):
+        for lbl, x0, y0, x1, y1 in layout_row(row, y):
+            d.rounded_rectangle([x0, y0, x1, y1], radius=4, fill=(28, 32, 42))
+            centered_text(d, (x0 + x1) / 2, y0 + (y1 - y0) / 2 - 7, lbl, font("default_medium", 13), FG)
+        y += KB_ROW_H
+
+    cx0, cy0, cx1, cy1 = KB_CAPS_RECT
+    d.rounded_rectangle([cx0, cy0, cx1, cy1], radius=6, fill=(28, 32, 42))
+    centered_text(d, (cx0 + cx1) / 2, cy0 + 9, "CAP", font("default_medium", 12), accent if caps else FG)
+
+    lx0, ly0, lx1, ly1 = KB_LAYER_TOGGLE_RECT
+    d.rounded_rectangle([lx0, ly0, lx1, ly1], radius=6, fill=(28, 32, 42))
+    centered_text(d, (lx0 + lx1) / 2, ly0 + 9, "ABC" if layer == "symbols" else "123", font("default_medium", 12), accent)
+
+    sx0, sy0, sx1, sy1 = KB_SPACE_RECT
+    d.rounded_rectangle([sx0, sy0, sx1, sy1], radius=6, fill=(28, 32, 42))
+    centered_text(d, (sx0 + sx1) / 2, sy0 + 9, "Space", font("default_medium", 13), FG)
+
+    bx0, by0, bx1, by1 = KB_BACKSPACE_RECT
+    d.rounded_rectangle([bx0, by0, bx1, by1], radius=6, fill=(28, 32, 42))
+    centered_text(d, (bx0 + bx1) / 2, by0 + 9, "DEL", font("default_medium", 12), FG)
+
+    ax0, ay0, ax1, ay1 = KB_CANCEL_RECT
+    d.rounded_rectangle([ax0, ay0, ax1, ay1], radius=8, outline=DIM, width=2)
+    centered_text(d, (ax0 + ax1) / 2, ay0 + 10, "Cancel", font("default_medium", 14), DIM)
+
+    gx0, gy0, gx1, gy1 = KB_CONNECT_RECT
+    d.rounded_rectangle([gx0, gy0, gx1, gy1], radius=8, fill=accent)
+    centered_text(d, (gx0 + gx1) / 2, gy0 + 10, connect_label, font("default_bold", 14), BG)
+    return img
+
+
+def hit_keyboard(x, y, layer, caps):
+    ky = KB_ROW_Y0
+    for row in kb_rows(layer, caps):
+        for lbl, x0, y0, x1, y1 in layout_row(row, ky):
+            if x0 <= x <= x1 and y0 <= y <= y1:
+                return ("char", lbl)
+        ky += KB_ROW_H
+
+    cx0, cy0, cx1, cy1 = KB_CAPS_RECT
+    if cx0 <= x <= cx1 and cy0 <= y <= cy1:
+        return ("caps", None)
+    lx0, ly0, lx1, ly1 = KB_LAYER_TOGGLE_RECT
+    if lx0 <= x <= lx1 and ly0 <= y <= ly1:
+        return ("layer_toggle", None)
+    sx0, sy0, sx1, sy1 = KB_SPACE_RECT
+    if sx0 <= x <= sx1 and sy0 <= y <= sy1:
+        return ("char", " ")
+    bx0, by0, bx1, by1 = KB_BACKSPACE_RECT
+    if bx0 <= x <= bx1 and by0 <= y <= by1:
+        return ("backspace", None)
+    ax0, ay0, ax1, ay1 = KB_CANCEL_RECT
+    if ax0 <= x <= ax1 and ay0 <= y <= ay1:
+        return ("cancel", None)
+    gx0, gy0, gx1, gy1 = KB_CONNECT_RECT
+    if gx0 <= x <= gx1 and gy0 <= y <= gy1:
+        return ("connect", None)
+    return (None, None)
+
+
+# ---------- sub-screens ----------
+
+def panel_picker(title, accent, items, selected):
+    img, d = new_canvas()
+    draw_back_header(d, title, accent)
+    n = len(items)
+    row_h = (PICKER_BOTTOM - PICKER_TOP) / n
+    fsize = 13 if row_h < 22 else 15
+    f = font("default_medium", fsize)
+    for i, (key, label) in enumerate(items):
+        y0 = PICKER_TOP + i * row_h
+        sel = key == selected
+        if sel:
+            d.rectangle([0, y0, W, y0 + row_h], fill=(28, 40, 56))
+        bbox = d.textbbox((0, 0), label, font=f)
+        th = bbox[3] - bbox[1]
+        color = accent if sel else FG
+        d.text((20, y0 + (row_h - th) / 2 - bbox[1]), label, font=f, fill=color)
+        if sel:
+            d.text((W - 30, y0 + (row_h - th) / 2 - bbox[1]), "✓", font=f, fill=accent)
+        if i > 0:
+            d.line([0, y0, W, y0], fill=(28, 32, 42))
+    return img
+
+
+def panel_city_picker(slot, cfg):
+    selected = cfg["clock_top"] if slot == "top" else cfg["clock_bottom"]
+    items = list(CITIES)
+    label = "Top" if slot == "top" else "Bottom"
+    return panel_picker(f"{label} City", ACCENT["clock"], items, selected)
+
+
+def panel_currency_picker(slot, cfg):
+    selected = cfg["fx_top"] if slot == "top" else cfg["fx_bottom"]
+    items = [(c, f"{c} · {CURRENCY_NAMES[c]}") for c in CURRENCIES]
+    label = "Top" if slot == "top" else "Bottom"
+    return panel_picker(f"{label} Currency", ACCENT["fx"], items, selected)
+
+
+def panel_datacap_picker(cfg):
+    selected = cfg.get("data_cap_mb")
+    items = [(v, cap_label(v)) for v in DATA_CAP_PRESETS]
+    return panel_picker("Data Cap", ACCENT["sim"], items, selected)
+
+
+def panel_node_picker(traf):
+    if not traf["running"]:
+        img, d = new_canvas()
+        draw_back_header(d, "Node", ACCENT["openclash"])
+        centered_text(d, W / 2, 140, "OpenClash isn't running", font("default_medium", 14), DIM)
+        return img
+    if not traf["nodes"]:
+        img, d = new_canvas()
+        draw_back_header(d, "Node", ACCENT["openclash"])
+        centered_text(d, W / 2, 130, "No subscription configured", font("default_medium", 13), DIM)
+        centered_text(d, W / 2, 154, "add one in LuCI first", font("default_medium", 13), DIM)
+        return img
+    items = [(n, n) for n in traf["nodes"]]
+    return panel_picker("Node", ACCENT["openclash"], items, traf["node_name"])
+
+
+def render_sub(view, cfg, oc, traf):
+    if view == "city_top":
+        return panel_city_picker("top", cfg)
+    if view == "city_bottom":
+        return panel_city_picker("bottom", cfg)
+    if view == "fx_top":
+        return panel_currency_picker("top", cfg)
+    if view == "fx_bottom":
+        return panel_currency_picker("bottom", cfg)
+    if view == "datacap":
+        return panel_datacap_picker(cfg)
+    if view == "oc_nodes":
+        return panel_node_picker(traf)
+    if view == "weather_city":
+        return panel_weather_picker(cfg)
+
+
+# ---------- hit-testing ----------
+
+def hit_main_clock(x, y):
+    rx0, ry0, rx1, ry1 = REPEATER_TILE
+    if rx0 <= x <= rx1 and ry0 <= y <= ry1:
+        return "repeater"
+    mx0, my0, mx1, my1 = MORE_TILE
+    if mx0 <= x <= mx1 and my0 <= y <= my1:
+        return "more"
+    lx0, ly0, lx1, ly1 = CLOCK_LEFT_ZONE
+    if lx0 <= x < lx1 and ly0 <= y < ly1:
+        return "city_left"
+    rx0, ry0, rx1, ry1 = CLOCK_RIGHT_ZONE
+    if rx0 <= x < rx1 and ry0 <= y < ry1:
+        return "city_right"
+    return None
+
+
+def hit_main_fx(x, y):
+    bx0, by0, bx1, by1 = FX_BUTTON
+    if bx0 <= x <= bx1 and by0 <= y <= by1:
+        return "update"
+    rx0, ry0, rx1, ry1 = FX_RANGE_RECT
+    if rx0 <= x <= rx1 and ry0 <= y <= ry1:
+        seg_w = (rx1 - rx0) / len(FX_RANGES)
+        idx = min(len(FX_RANGES) - 1, max(0, int((x - rx0) / seg_w)))
+        return f"range:{FX_RANGES[idx]}"
+    if FX_TOP_ZONE[0] <= y < FX_TOP_ZONE[1]:
+        return "top"
+    if FX_BOTTOM_ZONE[0] <= y < FX_BOTTOM_ZONE[1]:
+        return "bottom"
+    return None
+
+
+def hit_main_sim(x, y):
+    cx0, cy0, cx1, cy1 = SIM_CHOICE_RECT
+    if cx0 - 6 <= x <= cx1 + 6 and cy0 - 6 <= y <= cy1 + 6:
+        seg_w = (cx1 - cx0) / len(SIM_CHOICE_KEYS)
+        idx = min(len(SIM_CHOICE_KEYS) - 1, max(0, int((x - cx0) / seg_w)))
+        return f"choice:{SIM_CHOICE_KEYS[idx]}"
+    tx0, ty0, tx1, ty1 = SIM_DATA_TOGGLE_RECT
+    if tx0 - 8 <= x <= tx1 + 8 and ty0 - 8 <= y <= ty1 + 8:
+        return "data_toggle"
+    if SIM_DATA_ZONE[0] <= y < SIM_DATA_ZONE[1]:
+        return "data_cap"
+    return None
+
+
+def hit_main_openclash(x, y):
+    tx0, ty0, tx1, ty1 = OC_TOGGLE_RECT
+    if tx0 - 10 <= x <= tx1 + 10 and ty0 - 8 <= y <= ty1 + 8:
+        return "toggle"
+    sx0, sy0, sx1, sy1 = OC_MODE_SEG_RECT
+    if sx0 <= x <= sx1 and sy0 <= y <= sy1:
+        return "mode_global" if x < (sx0 + sx1) / 2 else "mode_rule"
+    if OC_NODE_ZONE[0] <= y < OC_NODE_ZONE[1]:
+        return "node"
+    return None
+
+
+def hit_main_weather(y):
+    if WEATHER_CITY_ZONE[0] <= y < WEATHER_CITY_ZONE[1]:
+        return "city"
+    return None
+
+
+def hit_picker(y, n_items):
+    if not (PICKER_TOP <= y < PICKER_BOTTOM):
+        return None
+    row_h = (PICKER_BOTTOM - PICKER_TOP) / n_items
+    idx = int((y - PICKER_TOP) / row_h)
+    return idx if 0 <= idx < n_items else None
+
+
+def hit_back(y):
+    return y < 34
+
+
+def to_rgb565_bytes(img):
+    import numpy as np
+    arr = np.asarray(img.convert("RGB"), dtype=np.uint32)
+    r = (arr[:, :, 0] >> 3) << 11
+    g = (arr[:, :, 1] >> 2) << 5
+    b = (arr[:, :, 2] >> 3)
+    packed = (r | g | b).astype("<u2")
+    return packed.tobytes()
+
+
+def write_frame(img):
+    data = to_rgb565_bytes(img)
+    with open(FB_PATH, "r+b") as fb:
+        fb.write(data)
+
+
+# ---------- modes ----------
+
+def mode_preview(outdir):
+    os.makedirs(outdir, exist_ok=True)
+    cfg = load_config()
+    fx = fetch_fx()
+    sim = get_sim_status(cfg)
+    oc = get_openclash_status()
+    traf = get_openclash_traffic_and_node()
+    wx = fetch_weather(cfg["weather_city"])
+    rep = get_repeater_status()
+    rep_networks = repeater_scan()
+    sysinfo = get_system_info()
+    wifi24 = get_wifi_radio_state("wifi0")
+    wifi5 = get_wifi_radio_state("wifi1")
+    screens = [
+        ("clock", panel_clock(cfg, rep)),
+        ("fx", panel_fx(cfg, fx, "month")),
+        ("sim", panel_sim(cfg, sim)),
+        ("openclash", panel_openclash(oc, traf)),
+        ("weather", panel_weather(cfg, wx)),
+        ("city_top", panel_city_picker("top", cfg)),
+        ("city_bottom", panel_city_picker("bottom", cfg)),
+        ("fx_top", panel_currency_picker("top", cfg)),
+        ("fx_bottom", panel_currency_picker("bottom", cfg)),
+        ("datacap", panel_datacap_picker(cfg)),
+        ("oc_nodes", panel_node_picker(traf)),
+        ("weather_city", panel_weather_picker(cfg)),
+        ("more", panel_more(sysinfo, wifi24, wifi5)),
+        ("repeater", panel_repeater(rep, rep_networks)),
+        ("confirm", panel_confirm("Reboot", "Reboot the router now?", ACCENT["clock"], yes_label="Reboot", danger=True)),
+        ("keyboard", panel_keyboard("Wi-Fi Password", "myPass", "letters", True, ACCENT["clock"])),
+    ]
+    cols, pad = 5, 10
+    rows = (len(screens) + cols - 1) // cols
+    sheet = Image.new("RGB", (cols * (W + pad) + pad, rows * (H + pad) + pad), (30, 30, 30))
+    for i, (name, img) in enumerate(screens):
+        img.save(os.path.join(outdir, f"panel_{name}.png"))
+        r, c = divmod(i, cols)
+        sheet.paste(img, (pad + c * (W + pad), pad + r * (H + pad)))
+    sheet.save(os.path.join(outdir, "contact_sheet.png"))
+    print(f"wrote {len(screens)} preview PNGs to {outdir}")
+
+
+def mode_calibrate():
+    for name, color in [("RED", (255, 0, 0)), ("GREEN", (0, 255, 0)), ("BLUE", (0, 0, 255))]:
+        img = Image.new("RGB", (W, H), color)
+        write_frame(img)
+        print(f"showing {name}")
+        time.sleep(2)
+
+
+_stop = False
+
+
+def _on_term(signum, frame):
+    global _stop
+    _stop = True
+
+
+# ---------- touch input ----------
+# chsc_cap_touch on /dev/input/event0, Multitouch protocol B, confirmed by
+# live capture on 2026-07-25: ABS_MT_POSITION_X=53, ABS_MT_POSITION_Y=54,
+# ABS_MT_TRACKING_ID=57 (-1 on lift), coordinates in raw screen pixels.
+TOUCH_DEV = "/dev/input/event0"
+_EVENT_FMT = "qqHHi"
+_EVENT_SIZE = struct.calcsize(_EVENT_FMT)
+EV_ABS = 3
+ABS_MT_POSITION_X = 53
+ABS_MT_POSITION_Y = 54
+ABS_MT_TRACKING_ID = 57
+
+TAP_JITTER_PX = 10
+
+
+class TouchState:
+    """Shared between the reader thread and the render loop."""
+
+    def __init__(self):
+        self.lock = threading.Lock()
+        self.active = False
+        self.dx = 0
+        self.dy = 0
+        self.down_x = 0
+        self.down_y = 0
+        self.release_pending = False
+        self.release_dx = 0
+        self.release_dy = 0
+
+
+touch_state = TouchState()
+
+
+def _touch_reader():
+    import os as _os
+    start_x = start_y = None
+    down = False
+    try:
+        with open(TOUCH_DEV, "rb") as f:
+            fd = f.fileno()
+            _os.set_blocking(fd, False)
+            while not _stop:
+                try:
+                    data = f.read(_EVENT_SIZE)
+                except (BlockingIOError, TypeError):
+                    data = None
+                if not data or len(data) < _EVENT_SIZE:
+                    time.sleep(0.008)
+                    continue
+                _, _, typ, code, val = struct.unpack(_EVENT_FMT, data)
+                if typ != EV_ABS:
+                    continue
+                if code == ABS_MT_TRACKING_ID:
+                    if val == -1 and down:
+                        with touch_state.lock:
+                            touch_state.active = False
+                            touch_state.release_pending = True
+                            touch_state.release_dx = touch_state.dx
+                            touch_state.release_dy = touch_state.dy
+                        down = False
+                        start_x = start_y = None
+                    else:
+                        down = True
+                        start_x = start_y = None
+                        with touch_state.lock:
+                            touch_state.active = True
+                            touch_state.dx = 0
+                            touch_state.dy = 0
+                elif code == ABS_MT_POSITION_X and down:
+                    if start_x is None:
+                        start_x = val
+                        with touch_state.lock:
+                            touch_state.down_x = val
+                    with touch_state.lock:
+                        touch_state.dx = val - start_x
+                elif code == ABS_MT_POSITION_Y and down:
+                    if start_y is None:
+                        start_y = val
+                        with touch_state.lock:
+                            touch_state.down_y = val
+                    with touch_state.lock:
+                        touch_state.dy = val - start_y
+    except Exception as e:
+        print(f"touch reader stopped: {e}", file=sys.stderr)
+
+
+def ease_out_cubic(t):
+    return 1 - (1 - t) ** 3
+
+
+def composite(cur_img, other_img, dx, other_on_right):
+    canvas = Image.new("RGB", (W, H), BG)
+    canvas.paste(cur_img, (dx, 0))
+    if other_on_right:
+        canvas.paste(other_img, (dx + W, 0))
+    else:
+        canvas.paste(other_img, (dx - W, 0))
+    return canvas
+
+
+ANIM_SECONDS = 0.22
+
+
+def mode_live():
+    signal.signal(signal.SIGTERM, _on_term)
+    signal.signal(signal.SIGINT, _on_term)
+
+    reader = threading.Thread(target=_touch_reader, daemon=True)
+    reader.start()
+
+    cfg = load_config()
+    fx = fetch_fx()
+    fx_range = "week"
+    sim = get_sim_status(cfg)
+    oc = get_openclash_status()
+    traf = get_openclash_traffic_and_node()
+    wx = fetch_weather(cfg["weather_city"])
+    rep = get_repeater_status()
+    last_fx_check = last_sim_check = last_oc_check = last_traf_check = last_wx_check = last_rep_check = time.time()
+
+    def render_main(idx):
+        name = PANEL_NAMES[idx]
+        if name == "clock":
+            return panel_clock(cfg, rep)
+        elif name == "fx":
+            return panel_fx(cfg, fx, fx_range)
+        elif name == "sim":
+            return panel_sim(cfg, sim)
+        elif name == "openclash":
+            return panel_openclash(oc, traf)
+        else:
+            return panel_weather(cfg, wx)
+
+    panel_idx = 0
+    view = "main"
+    cur_img = render_main(panel_idx)
+    write_frame(cur_img)
+    last_draw = time.time()
+
+    state = "idle"  # idle | dragging | animating  (main-carousel only)
+    neighbor_img = None
+    neighbor_on_right = True
+    anim_from_dx = anim_target_dx = anim_t0 = 0
+    anim_next_idx = panel_idx
+    sub_dirty = True
+
+    # state for the newer sub-screens (More, Repeater, Confirm, Keyboard)
+    sysinfo = {"uptime_min": 0, "lan_ip": "192.168.8.1"}
+    wifi24 = wifi5 = True
+    rep_networks = []
+    scan_state = {"result": None, "running": False}
+
+    def start_repeater_scan():
+        if scan_state["running"]:
+            return
+        scan_state["running"] = True
+
+        def _worker():
+            scan_state["result"] = repeater_scan()
+            scan_state["running"] = False
+
+        threading.Thread(target=_worker, daemon=True).start()
+    confirm_title = confirm_message = confirm_yes_label = confirm_action = confirm_return_view = ""
+    confirm_danger = False
+    kb_text = ""
+    kb_layer = "letters"
+    kb_caps = False
+    kb_target_ssid = kb_target_bssid = None
+
+    while not _stop:
+        now = time.time()
+
+        if is_screen_asleep():
+            with touch_state.lock:
+                touch_state.release_pending = False
+            time.sleep(0.1)
+            continue
+
+        if view == "main":
+            if state == "idle":
+                if now - last_fx_check > 300:
+                    fx = fetch_fx()
+                    last_fx_check = now
+                if now - last_sim_check > 30:
+                    sim = get_sim_status(cfg)
+                    last_sim_check = now
+                if now - last_oc_check > 30:
+                    oc = get_openclash_status()
+                    last_oc_check = now
+                if now - last_traf_check > 20:
+                    traf = get_openclash_traffic_and_node()
+                    last_traf_check = now
+                if now - last_wx_check > 1800:
+                    wx = fetch_weather(cfg["weather_city"])
+                    last_wx_check = now
+                if now - last_rep_check > 30:
+                    rep = get_repeater_status()
+                    last_rep_check = now
+                if now - last_draw >= 1:
+                    cur_img = render_main(panel_idx)
+                    write_frame(cur_img)
+                    last_draw = now
+
+                with touch_state.lock:
+                    active = touch_state.active
+                    touch_state.release_pending = False
+                if active:
+                    state = "dragging"
+
+            elif state == "dragging":
+                with touch_state.lock:
+                    active = touch_state.active
+                    dx, dy = touch_state.dx, touch_state.dy
+                    down_x, down_y = touch_state.down_x, touch_state.down_y
+                    released = touch_state.release_pending
+                    release_dx, release_dy = touch_state.release_dx, touch_state.release_dy
+                    touch_state.release_pending = False
+
+                if neighbor_img is None or (neighbor_on_right and dx > TAP_JITTER_PX) or \
+                   (not neighbor_on_right and dx < -TAP_JITTER_PX):
+                    if dx < 0:
+                        neighbor_on_right = True
+                        neighbor_img = render_main((panel_idx + 1) % len(PANEL_NAMES))
+                    elif dx > 0:
+                        neighbor_on_right = False
+                        neighbor_img = render_main((panel_idx - 1) % len(PANEL_NAMES))
+
+                if neighbor_img is not None:
+                    dx_clamped = max(-W, min(W, dx))
+                    write_frame(composite(cur_img, neighbor_img, dx_clamped, neighbor_on_right))
+
+                if released or not active:
+                    final_dx = release_dx if released else dx
+                    final_dy = release_dy if released else dy
+                    is_tap = abs(final_dx) <= TAP_JITTER_PX and abs(final_dy) <= TAP_JITTER_PX
+
+                    if is_tap:
+                        name = PANEL_NAMES[panel_idx]
+                        zone = None
+                        if name == "clock":
+                            zone = hit_main_clock(down_x, down_y)
+                        elif name == "fx":
+                            zone = hit_main_fx(down_x, down_y)
+                        elif name == "sim":
+                            zone = hit_main_sim(down_x, down_y)
+                        elif name == "openclash":
+                            zone = hit_main_openclash(down_x, down_y)
+                        elif name == "weather":
+                            zone = hit_main_weather(down_y)
+
+                        new_view = None
+                        if name == "clock" and zone == "city_left":
+                            new_view = "city_top"
+                        elif name == "clock" and zone == "city_right":
+                            new_view = "city_bottom"
+                        elif name == "clock" and zone == "repeater":
+                            new_view = "repeater"
+                            rep = get_repeater_status()
+                            start_repeater_scan()
+                        elif name == "clock" and zone == "more":
+                            new_view = "more"
+                            sysinfo = get_system_info()
+                            wifi24 = get_wifi_radio_state("wifi0")
+                            wifi5 = get_wifi_radio_state("wifi1")
+                        elif name == "fx" and zone == "top":
+                            new_view = "fx_top"
+                        elif name == "fx" and zone == "bottom":
+                            new_view = "fx_bottom"
+                        elif name == "fx" and zone == "update":
+                            flash = cur_img.copy()
+                            fd = ImageDraw.Draw(flash)
+                            fd.rectangle([0, FX_STATUS_Y - 4, W, FX_BUTTON[3] + 4], fill=BG)
+                            centered_text(fd, W / 2, FX_STATUS_Y, "Updating…", font("default_medium", 13), ACCENT["fx"])
+                            write_frame(flash)
+                            fx = fetch_fx(force=True)
+                            last_fx_check = now
+                        elif name == "fx" and zone and zone.startswith("range:"):
+                            new_range = zone.split(":", 1)[1]
+                            if new_range != fx_range:
+                                fx_range = new_range
+                        elif name == "sim" and zone and zone.startswith("choice:"):
+                            choice = zone.split(":", 1)[1]
+                            if choice != sim["sim_choice"]:
+                                set_sim_choice(choice)
+                                sim = get_sim_status(cfg)
+                        elif name == "sim" and zone == "data_toggle":
+                            set_cellular_data_enabled(not sim["data_up"])
+                            sim = get_sim_status(cfg)
+                        elif name == "sim" and zone == "data_cap":
+                            new_view = "datacap"
+                        elif name == "openclash" and zone == "toggle":
+                            set_openclash_enabled(not oc["enabled"])
+                            oc = get_openclash_status()
+                        elif name == "openclash" and zone == "mode_global" and oc["mode"] != "global":
+                            set_openclash_mode("global")
+                            oc = get_openclash_status()
+                        elif name == "openclash" and zone == "mode_rule" and oc["mode"] != "rule":
+                            set_openclash_mode("rule")
+                            oc = get_openclash_status()
+                        elif name == "openclash" and zone == "node":
+                            new_view = "oc_nodes"
+                        elif name == "weather" and zone == "city":
+                            new_view = "weather_city"
+
+                        neighbor_img = None
+                        state = "idle"
+                        if new_view:
+                            view = new_view
+                            sub_dirty = True
+                        else:
+                            cur_img = render_main(panel_idx)
+                            write_frame(cur_img)
+                            last_draw = now
+                    else:
+                        if abs(final_dx) > W * 0.3:
+                            anim_target_dx = -W if final_dx < 0 else W
+                            anim_next_idx = (panel_idx + (1 if final_dx < 0 else -1)) % len(PANEL_NAMES)
+                        else:
+                            anim_target_dx = 0
+                            anim_next_idx = panel_idx
+                        anim_from_dx = max(-W, min(W, final_dx))
+                        anim_t0 = now
+                        state = "animating"
+
+            elif state == "animating":
+                t = (now - anim_t0) / ANIM_SECONDS
+                if t >= 1:
+                    if anim_next_idx != panel_idx:
+                        panel_idx = anim_next_idx
+                    cur_img = render_main(panel_idx)
+                    write_frame(cur_img)
+                    last_draw = now
+                    neighbor_img = None
+                    state = "idle"
+                else:
+                    eased = ease_out_cubic(t)
+                    dx_now = int(anim_from_dx + (anim_target_dx - anim_from_dx) * eased)
+                    if neighbor_img is not None:
+                        write_frame(composite(cur_img, neighbor_img, dx_now, neighbor_on_right))
+
+        else:  # sub-screen
+            if view == "repeater" and scan_state["result"] is not None:
+                rep_networks = scan_state["result"]
+                scan_state["result"] = None
+                sub_dirty = True
+
+            if sub_dirty:
+                if view == "more":
+                    img = panel_more(sysinfo, wifi24, wifi5)
+                elif view == "repeater":
+                    img = panel_repeater(rep, rep_networks)
+                elif view == "confirm":
+                    img = panel_confirm(confirm_title, confirm_message, ACCENT["clock"],
+                                        yes_label=confirm_yes_label, danger=confirm_danger)
+                elif view == "keyboard_wifi":
+                    img = panel_keyboard("Wi-Fi Password", kb_text, kb_layer, kb_caps,
+                                         ACCENT["clock"], connect_label="Connect")
+                else:
+                    img = render_sub(view, cfg, oc, traf)
+                write_frame(img)
+                sub_dirty = False
+
+            with touch_state.lock:
+                dx, dy = touch_state.dx, touch_state.dy
+                down_x, down_y = touch_state.down_x, touch_state.down_y
+                released = touch_state.release_pending
+                release_dx, release_dy = touch_state.release_dx, touch_state.release_dy
+                touch_state.release_pending = False
+
+            if released:
+                final_dx, final_dy = release_dx, release_dy
+                is_tap = abs(final_dx) <= TAP_JITTER_PX and abs(final_dy) <= TAP_JITTER_PX
+
+                if view == "confirm" and (is_tap and (hit_back(down_y) or hit_confirm(down_x, down_y) == "no")):
+                    view = confirm_return_view
+                    sub_dirty = True
+                elif view == "confirm" and is_tap and hit_confirm(down_x, down_y) == "yes":
+                    if confirm_action == "reboot":
+                        reboot_router()
+                        view = "more"
+                    elif confirm_action == "repeater_disconnect":
+                        repeater_disconnect()
+                        time.sleep(0.3)
+                        rep = get_repeater_status()
+                        start_repeater_scan()
+                        view = "repeater"
+                    sub_dirty = True
+
+                elif view == "keyboard_wifi" and is_tap and (hit_back(down_y) or hit_keyboard(down_x, down_y, kb_layer, kb_caps)[0] == "cancel"):
+                    view = "repeater"
+                    kb_text = ""
+                    sub_dirty = True
+                elif view == "keyboard_wifi" and is_tap:
+                    action, val = hit_keyboard(down_x, down_y, kb_layer, kb_caps)
+                    if action == "char":
+                        kb_text += val
+                        sub_dirty = True
+                    elif action == "backspace":
+                        kb_text = kb_text[:-1]
+                        sub_dirty = True
+                    elif action == "caps":
+                        kb_caps = not kb_caps
+                        sub_dirty = True
+                    elif action == "layer_toggle":
+                        kb_layer = "symbols" if kb_layer == "letters" else "letters"
+                        sub_dirty = True
+                    elif action == "connect":
+                        repeater_connect(kb_target_ssid, kb_target_bssid, kb_text)
+                        kb_text = ""
+                        time.sleep(0.5)
+                        rep = get_repeater_status()
+                        start_repeater_scan()
+                        view = "repeater"
+                        sub_dirty = True
+
+                elif is_tap and hit_back(down_y):
+                    view = "main"
+                    cur_img = render_main(panel_idx)
+                    write_frame(cur_img)
+                    last_draw = now
+                elif is_tap and view == "more":
+                    action = hit_more(down_x, down_y)
+                    if action == "wifi24":
+                        wifi24 = not wifi24
+                        set_wifi_radio_state("wifi0", wifi24)
+                        sub_dirty = True
+                    elif action == "wifi5":
+                        wifi5 = not wifi5
+                        set_wifi_radio_state("wifi1", wifi5)
+                        sub_dirty = True
+                    elif action == "reboot":
+                        confirm_title = "Reboot"
+                        confirm_message = "Reboot the router now?"
+                        confirm_yes_label = "Reboot"
+                        confirm_danger = True
+                        confirm_action = "reboot"
+                        confirm_return_view = "more"
+                        view = "confirm"
+                        sub_dirty = True
+                elif is_tap and view == "repeater":
+                    action, val = hit_repeater(down_x, down_y, rep, len(rep_networks))
+                    if action == "disconnect":
+                        confirm_title = "Repeater"
+                        confirm_message = f"Disconnect from {rep['ssid']}?"
+                        confirm_yes_label = "Disconnect"
+                        confirm_danger = True
+                        confirm_action = "repeater_disconnect"
+                        confirm_return_view = "repeater"
+                        view = "confirm"
+                        sub_dirty = True
+                    elif action == "select":
+                        ap = rep_networks[val]
+                        if ap["open"]:
+                            repeater_connect(ap["ssid"], ap["bssid"], "")
+                            time.sleep(0.5)
+                            rep = get_repeater_status()
+                            start_repeater_scan()
+                            sub_dirty = True
+                        else:
+                            kb_target_ssid = ap["ssid"]
+                            kb_target_bssid = ap["bssid"]
+                            kb_text = ""
+                            kb_layer = "letters"
+                            kb_caps = False
+                            view = "keyboard_wifi"
+                            sub_dirty = True
+                elif is_tap and view in ("city_top", "city_bottom"):
+                    idx = hit_picker(down_y, len(CITIES))
+                    if idx is not None:
+                        cfg["clock_top" if view == "city_top" else "clock_bottom"] = CITIES[idx][0]
+                        save_config(cfg)
+                        view = "main"
+                        cur_img = render_main(panel_idx)
+                        write_frame(cur_img)
+                        last_draw = now
+                elif is_tap and view in ("fx_top", "fx_bottom"):
+                    idx = hit_picker(down_y, len(CURRENCIES))
+                    if idx is not None:
+                        cfg["fx_top" if view == "fx_top" else "fx_bottom"] = CURRENCIES[idx]
+                        save_config(cfg)
+                        view = "main"
+                        cur_img = render_main(panel_idx)
+                        write_frame(cur_img)
+                        last_draw = now
+                elif is_tap and view == "datacap":
+                    idx = hit_picker(down_y, len(DATA_CAP_PRESETS))
+                    if idx is not None:
+                        cfg["data_cap_mb"] = DATA_CAP_PRESETS[idx]
+                        save_config(cfg)
+                        sim = get_sim_status(cfg)
+                        view = "main"
+                        cur_img = render_main(panel_idx)
+                        write_frame(cur_img)
+                        last_draw = now
+                elif is_tap and view == "oc_nodes":
+                    idx = hit_picker(down_y, len(traf["nodes"])) if traf["nodes"] else None
+                    if idx is not None:
+                        chosen = traf["nodes"][idx]
+                        select_openclash_node(traf["group"], chosen)
+                        traf = get_openclash_traffic_and_node()
+                        last_traf_check = now
+                        view = "main"
+                        cur_img = render_main(panel_idx)
+                        write_frame(cur_img)
+                        last_draw = now
+                elif is_tap and view == "weather_city":
+                    idx = hit_picker(down_y, len(WEATHER_CITIES))
+                    if idx is not None:
+                        cfg["weather_city"] = WEATHER_CITIES[idx][0]
+                        save_config(cfg)
+                        wx = fetch_weather(cfg["weather_city"])
+                        last_wx_check = now
+                        view = "main"
+                        cur_img = render_main(panel_idx)
+                        write_frame(cur_img)
+                        last_draw = now
+                elif not is_tap and final_dx > W * 0.3:
+                    view = "main"
+                    cur_img = render_main(panel_idx)
+                    write_frame(cur_img)
+                    last_draw = now
+
+        time.sleep(0.012)
+
+    sys.exit(0)
+
+
+if __name__ == "__main__":
+    if "--preview" in sys.argv:
+        idx = sys.argv.index("--preview")
+        outdir = sys.argv[idx + 1] if len(sys.argv) > idx + 1 else "/tmp/dash_preview"
+        mode_preview(outdir)
+    elif "--calibrate" in sys.argv:
+        mode_calibrate()
+    else:
+        mode_live()
