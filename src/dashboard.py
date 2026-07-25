@@ -44,6 +44,7 @@ ACCENT = {
     "sim": (110, 220, 150),
     "openclash": (200, 140, 255),
     "weather": (90, 214, 200),
+    "monitor": (235, 120, 160),
 }
 
 MCC_COUNTRY = {
@@ -77,9 +78,9 @@ CITIES = [
     ("Europe/Moscow", "Moscow"),
 ]
 
-CURRENCIES = ["JPY", "CAD", "AUD", "SGD", "NZD", "GBP", "EUR", "USD", "HKD"]
+CURRENCIES = ["CNY", "JPY", "CAD", "AUD", "SGD", "NZD", "GBP", "EUR", "USD", "HKD"]
 CURRENCY_NAMES = {
-    "JPY": "Japanese Yen", "CAD": "Canadian Dollar", "AUD": "Australian Dollar",
+    "CNY": "Chinese Yuan", "JPY": "Japanese Yen", "CAD": "Canadian Dollar", "AUD": "Australian Dollar",
     "SGD": "Singapore Dollar", "NZD": "NZ Dollar", "GBP": "British Pound",
     "EUR": "Euro", "USD": "US Dollar", "HKD": "Hong Kong Dollar",
 }
@@ -104,15 +105,48 @@ WEATHER_CITIES = [
     ("Berlin", 52.5200, 13.4050),
     ("Dubai", 25.2048, 55.2708),
     ("Moscow", 55.7558, 37.6173),
+    # Jiangsu / Zhejiang / Shanghai region
+    ("Hangzhou", 30.2741, 120.1551),
+    ("Suzhou", 31.2989, 120.5853),
+    ("Nanjing", 32.0603, 118.7969),
+    ("Ningbo", 29.8683, 121.5440),
+    # UK, down to Exeter-tier cities
+    ("Edinburgh", 55.9533, -3.1883),
+    ("Glasgow", 55.8642, -4.2518),
+    ("Manchester", 53.4808, -2.2426),
+    ("Liverpool", 53.4084, -2.9916),
+    ("Leeds", 53.8008, -1.5491),
+    ("Sheffield", 53.3811, -1.4701),
+    ("Birmingham", 52.4862, -1.8904),
+    ("Bristol", 51.4545, -2.5879),
+    ("Newcastle", 54.9783, -1.6178),
+    ("Nottingham", 52.9548, -1.1581),
+    ("Leicester", 52.6369, -1.1398),
+    ("Cardiff", 51.4816, -3.1791),
+    ("Belfast", 54.5973, -5.9301),
+    ("Southampton", 50.9097, -1.4044),
+    ("Portsmouth", 50.8198, -1.0880),
+    ("Cambridge", 52.2053, 0.1218),
+    ("Oxford", 51.7520, -1.2577),
+    ("York", 53.9600, -1.0873),
+    ("Aberdeen", 57.1497, -2.0943),
+    ("Coventry", 52.4068, -1.5197),
+    ("Plymouth", 50.3755, -4.1427),
+    ("Norwich", 52.6309, 1.2974),
+    ("Bath", 51.3811, -2.3590),
+    ("Exeter", 50.7184, -3.5339),
 ]
 
 DEFAULT_CONFIG = {
     "clock_top": "Europe/London",
     "clock_bottom": "Asia/Shanghai",
-    "fx_top": "USD",
-    "fx_bottom": "GBP",
+    "fx_top_from": "USD",
+    "fx_top_to": "CNY",
+    "fx_bottom_from": "GBP",
+    "fx_bottom_to": "CNY",
     "data_cap_mb": None,
     "weather_city": "London",
+    "clock_style": "analog",
 }
 
 _fonts = {}
@@ -218,26 +252,42 @@ def fetch_fx(force=False):
     return cached
 
 
-def rate_to_cny(code, fx):
+def _rate_vs_usd(code, rates):
+    """fx["rates"] is base=USD. The API may or may not include "USD": 1.0
+    itself in that dict -- treat USD as 1.0 regardless."""
+    if code == "USD":
+        return 1.0
+    return rates.get(code)
+
+
+def rate_between(from_code, to_code, fx):
     if not fx:
         return None
+    if from_code == to_code:
+        return 1.0
     rates = fx.get("rates", {})
-    if code not in rates or "CNY" not in rates:
+    rf = _rate_vs_usd(from_code, rates)
+    rt = _rate_vs_usd(to_code, rates)
+    if rf is None or rt is None:
         return None
-    if code == "USD":
-        return rates["CNY"]
-    return rates["CNY"] / rates[code]
+    return rt / rf
 
 
 FX_RANGES = ["week", "month", "year"]
 _FX_RANGE_DAYS = {"week": 7, "month": 30, "year": 365}
 
 
-def fetch_fx_history(code, rng):
-    """Daily rate-to-CNY history for the last week/month/year, via Frankfurter
-    (ECB reference rates, free, no key). Cached per (code, range) for 12h --
-    this is historical data, it doesn't need to be fresher than that."""
-    cache_file = STATE_DIR / f"fx_hist_{code}_{rng}.json"
+def fetch_fx_history(from_code, to_code, rng):
+    """Daily from_code->to_code history for the last week/month/year, via
+    Frankfurter (ECB reference rates, free, no key). Cached per
+    (from,to,range) for 12h -- this is historical data, it doesn't need to
+    be fresher than that."""
+    if from_code == to_code:
+        days = _FX_RANGE_DAYS[rng]
+        end = datetime.utcnow().date()
+        return [((end - timedelta(days=i)).isoformat(), 1.0) for i in range(days, -1, -1)]
+
+    cache_file = STATE_DIR / f"fx_hist_{from_code}_{to_code}_{rng}.json"
     cached = None
     if cache_file.exists():
         try:
@@ -250,12 +300,12 @@ def fetch_fx_history(code, rng):
     days = _FX_RANGE_DAYS[rng]
     end = datetime.utcnow().date()
     start = end - timedelta(days=days)
-    url = f"https://api.frankfurter.app/{start}..{end}?from={code}&to=CNY"
+    url = f"https://api.frankfurter.app/{start}..{end}?from={from_code}&to={to_code}"
     raw = run(["curl", "-sL", "--max-time", "6", url])
     try:
         data = json.loads(raw)
         rates = data.get("rates", {})
-        points = [(d, v["CNY"]) for d, v in sorted(rates.items()) if "CNY" in v]
+        points = [(d, v[to_code]) for d, v in sorted(rates.items()) if to_code in v]
         if points:
             STATE_DIR.mkdir(parents=True, exist_ok=True)
             cache_file.write_text(json.dumps({"ts": time.time(), "points": points}))
@@ -453,6 +503,138 @@ def get_system_info():
 
 def reboot_router():
     subprocess.Popen(["/sbin/reboot"])
+
+
+# ---------- system monitor (bandwidth + CPU/RAM/temp) ----------
+
+def get_wan_iface():
+    """Pick the interface holding the lowest-metric default route. This
+    device dual-WANs (repeater WiFi uplink, usually wlan4, vs. the cellular
+    modem rmnet_data0 as failover) so the active WAN interface isn't fixed --
+    br-lan is just the local LAN bridge and stays near-zero unless another
+    device is actively using this router's own AP, which made the old
+    hardcoded br-lan reading look permanently decorative."""
+    best_iface, best_metric = None, None
+    try:
+        with open("/proc/net/route") as f:
+            next(f)
+            for line in f:
+                parts = line.split()
+                if len(parts) < 7 or parts[1] != "00000000":
+                    continue
+                metric = int(parts[6])
+                if best_metric is None or metric < best_metric:
+                    best_iface, best_metric = parts[0], metric
+    except Exception:
+        pass
+    return best_iface
+
+
+def sample_bandwidth(prev):
+    """prev: (iface, ts, rx_bytes, tx_bytes) or None. Returns (new_sample, down_mbps, up_mbps).
+    Rates are None until there's a previous sample on the *same* interface to
+    diff against -- if the active WAN interface changed (failover) between
+    calls, this resets rather than diffing two different interfaces' counters."""
+    iface = get_wan_iface()
+    if iface is None:
+        return prev, None, None
+    try:
+        with open(f"/sys/class/net/{iface}/statistics/rx_bytes") as f:
+            rx = int(f.read().strip())
+        with open(f"/sys/class/net/{iface}/statistics/tx_bytes") as f:
+            tx = int(f.read().strip())
+    except Exception:
+        return prev, None, None
+    now = time.time()
+    if prev is None or prev[0] != iface:
+        return (iface, now, rx, tx), None, None
+    _, pts, prx, ptx = prev
+    dt = now - pts
+    if dt <= 0:
+        return (iface, now, rx, tx), None, None
+    down_mbps = max(0.0, (rx - prx) * 8 / dt / 1_000_000)
+    up_mbps = max(0.0, (tx - ptx) * 8 / dt / 1_000_000)
+    return (iface, now, rx, tx), down_mbps, up_mbps
+
+
+def sample_cpu(prev):
+    """prev: (idle, total) or None, from /proc/stat's aggregate 'cpu' line.
+    Returns (new_sample, cpu_pct). cpu_pct is None until there's a previous
+    sample (needs a delta, not just a point-in-time read)."""
+    try:
+        with open("/proc/stat") as f:
+            fields = [int(x) for x in f.readline().split()[1:]]
+        idle = fields[3] + fields[4]
+        total = sum(fields)
+    except Exception:
+        return prev, None
+    if prev is None:
+        return (idle, total), None
+    pidle, ptotal = prev
+    dtotal = total - ptotal
+    if dtotal <= 0:
+        return (idle, total), None
+    pct = max(0.0, min(100.0, 100 * (1 - (idle - pidle) / dtotal)))
+    return (idle, total), pct
+
+
+def get_ram_stats():
+    try:
+        info = {}
+        with open("/proc/meminfo") as f:
+            for line in f:
+                k, v = line.split(":", 1)
+                info[k] = int(v.strip().split()[0])
+        total_kb = info.get("MemTotal", 0)
+        avail_kb = info.get("MemAvailable", 0)
+        if not total_kb:
+            return None, None, None
+        used_kb = total_kb - avail_kb
+        return 100 * used_kb / total_kb, used_kb / 1024 / 1024, total_kb / 1024 / 1024
+    except Exception:
+        return None, None, None
+
+
+_TEMP_ZONE_PATH = None
+_TEMP_ZONE_PREFERRED = ["cpuss-0", "aoss-0", "sys-therm-1"]
+
+
+def get_temp_c():
+    """thermal_zone0 on this hardware ('sdr0') is an unpowered sensor that
+    always reports the sentinel -273000 (absolute zero); pick a real sensor
+    by name instead of assuming zone index 0, and cache the path found."""
+    global _TEMP_ZONE_PATH
+    if _TEMP_ZONE_PATH is None:
+        base = "/sys/class/thermal"
+        candidates = {}
+        try:
+            for name in os.listdir(base):
+                if not name.startswith("thermal_zone"):
+                    continue
+                try:
+                    with open(f"{base}/{name}/type") as f:
+                        ztype = f.read().strip()
+                    with open(f"{base}/{name}/temp") as f:
+                        raw = int(f.read().strip())
+                except Exception:
+                    continue
+                if -50000 < raw < 150000:
+                    candidates[ztype] = f"{base}/{name}/temp"
+        except Exception:
+            pass
+        for name in _TEMP_ZONE_PREFERRED:
+            if name in candidates:
+                _TEMP_ZONE_PATH = candidates[name]
+                break
+        else:
+            _TEMP_ZONE_PATH = next(iter(candidates.values()), False)
+    if not _TEMP_ZONE_PATH:
+        return None
+    try:
+        with open(_TEMP_ZONE_PATH) as f:
+            return int(f.read().strip()) / 1000
+    except Exception:
+        return None
 
 
 def openclash_installed():
@@ -780,6 +962,13 @@ def draw_analog_clock(d, cx, cy, r, dt, accent):
     d.ellipse([cx - 4, cy - 4, cx + 4, cy + 4], fill=accent)
 
 
+def draw_digital_clock(d, cx, cy, dt, accent):
+    f_time = font("default_mono_medium", 30)
+    centered_text(d, cx, cy - 20, dt.strftime("%H:%M"), f_time, FG)
+    f_sec = font("default_medium", 13)
+    centered_text(d, cx, cy + 14, dt.strftime(":%S"), f_sec, accent)
+
+
 def _icon_wifi_signal(d, cx, cy, r, color):
     import math
     d.ellipse([cx - 2, cy + r * 0.55 - 2, cx + 2, cy + r * 0.55 + 2], fill=color)
@@ -809,7 +998,7 @@ def new_canvas():
     return img, ImageDraw.Draw(img)
 
 
-def draw_page_dots(d, active_idx, count=5):
+def draw_page_dots(d, active_idx, count=6):
     total_w = count * 16
     x0 = (W - total_w) // 2
     y = H - 18
@@ -945,7 +1134,7 @@ WEATHER_CITY_ZONE = (34, 66)
 
 PICKER_TOP, PICKER_BOTTOM = 38, 316
 
-PANEL_NAMES = ["clock", "sim", "weather", "fx", "openclash"]
+PANEL_NAMES = ["clock", "sim", "weather", "monitor", "fx", "openclash"]
 
 
 # ---------- main panels ----------
@@ -958,8 +1147,12 @@ def panel_clock(cfg, rep):
     dt_l = datetime.now(ZoneInfo(tz_l))
     dt_r = datetime.now(ZoneInfo(tz_r))
 
-    draw_analog_clock(d, W / 4, 72, 30, dt_l, ACCENT["clock"])
-    draw_analog_clock(d, W * 3 / 4, 72, 30, dt_r, ACCENT["clock"])
+    if cfg.get("clock_style") == "digital":
+        draw_digital_clock(d, W / 4, 72, dt_l, ACCENT["clock"])
+        draw_digital_clock(d, W * 3 / 4, 72, dt_r, ACCENT["clock"])
+    else:
+        draw_analog_clock(d, W / 4, 72, 30, dt_l, ACCENT["clock"])
+        draw_analog_clock(d, W * 3 / 4, 72, 30, dt_r, ACCENT["clock"])
     centered_text(d, W / 4, 106, f"{city_name(tz_l)}  ›", font("default_medium", 12), DIM)
     centered_text(d, W * 3 / 4, 106, f"{city_name(tz_r)}  ›", font("default_medium", 12), DIM)
     centered_text(d, W / 2, 122, dt_l.strftime("%a %d %b"), font("default_medium", 12), DIM)
@@ -981,27 +1174,37 @@ def panel_clock(cfg, rep):
 FX_RANGE_LABELS = {"week": "Week", "month": "Month", "year": "Year"}
 
 
+def draw_fx_row(d, y_label, y_value, from_code, rate, to_code):
+    """'1 {from} ›  =  {rate} {to} ›' -- from and to are each their
+    own tap target (left half of the row vs right half, see hit_main_fx)."""
+    f_label = font("default_medium", 15)
+    f_value = font("default_bold", 17)
+    x = 16
+    seg = f"1 {from_code} ›  =  "
+    d.text((x, y_label), seg, font=f_label, fill=DIM)
+    x += d.textbbox((0, 0), seg, font=f_label)[2]
+    val = f"{rate:.3f}" if rate is not None else "—"
+    d.text((x, y_value), val, font=f_value, fill=FG)
+    x += d.textbbox((0, 0), val, font=f_value)[2]
+    d.text((x, y_label), f" {to_code} ›", font=f_label, fill=DIM)
+
+
 def panel_fx(cfg, fx, fx_range):
     img, d = new_canvas()
     draw_header(d, "CURRENCY", ACCENT["fx"])
-    top_code, bot_code = cfg["fx_top"], cfg["fx_bottom"]
-    top_rate = rate_to_cny(top_code, fx)
-    bot_rate = rate_to_cny(bot_code, fx)
+    top_from, top_to = cfg["fx_top_from"], cfg["fx_top_to"]
+    bot_from, bot_to = cfg["fx_bottom_from"], cfg["fx_bottom_to"]
+    top_rate = rate_between(top_from, top_to, fx)
+    bot_rate = rate_between(bot_from, bot_to, fx)
 
-    d.text((16, 40), f"1 {top_code} = ", font=font("default_medium", 15), fill=DIM)
-    lbl_w = d.textbbox((0, 0), f"1 {top_code} = ", font=font("default_medium", 15))[2]
-    d.text((16 + lbl_w, 38), f"{top_rate:.3f} CNY" if top_rate else "—", font=font("default_bold", 17), fill=FG)
-    d.text((W - 26, 40), "›", font=font("default_medium", 15), fill=DIM)
-    top_hist = fetch_fx_history(top_code, fx_range)
+    draw_fx_row(d, 40, 38, top_from, top_rate, top_to)
+    top_hist = fetch_fx_history(top_from, top_to, fx_range)
     draw_sparkline(d, 16, 62, W - 32, 56, top_hist, ACCENT["fx"])
 
     d.line([16, 126, W - 16, 126], fill=DIM)
 
-    d.text((16, 132), f"1 {bot_code} = ", font=font("default_medium", 15), fill=DIM)
-    lbl_w = d.textbbox((0, 0), f"1 {bot_code} = ", font=font("default_medium", 15))[2]
-    d.text((16 + lbl_w, 130), f"{bot_rate:.3f} CNY" if bot_rate else "—", font=font("default_bold", 17), fill=FG)
-    d.text((W - 26, 132), "›", font=font("default_medium", 15), fill=DIM)
-    bot_hist = fetch_fx_history(bot_code, fx_range)
+    draw_fx_row(d, 132, 130, bot_from, bot_rate, bot_to)
+    bot_hist = fetch_fx_history(bot_from, bot_to, fx_range)
     draw_sparkline(d, 16, 154, W - 32, 56, bot_hist, ACCENT["fx"])
 
     rx0, ry0, rx1, ry1 = FX_RANGE_RECT
@@ -1019,7 +1222,7 @@ def panel_fx(cfg, fx, fx_range):
     bx0, by0, bx1, by1 = FX_BUTTON
     d.rounded_rectangle([bx0, by0, bx1, by1], radius=(by1 - by0) / 2, outline=ACCENT["fx"], width=2)
     centered_text(d, (bx0 + bx1) / 2, by0 + 4, "Update Now", font("default_medium", 12), ACCENT["fx"])
-    draw_page_dots(d, 3)
+    draw_page_dots(d, 4)
     return img
 
 
@@ -1074,7 +1277,7 @@ def panel_openclash(oc, traf):
     if not oc["installed"]:
         centered_text(d, W / 2, 130, "OpenClash isn't installed", font("default_medium", 14), DIM)
         centered_text(d, W / 2, 150, "on this device", font("default_medium", 14), DIM)
-        draw_page_dots(d, 4)
+        draw_page_dots(d, 5)
         return img
 
     d.text((16, 44), "Enabled", font=font("default_medium", 16), fill=FG)
@@ -1114,7 +1317,57 @@ def panel_openclash(oc, traf):
         d.text((16, 220), "—", font=font("default_mono_medium", 15), fill=DIM)
 
     centered_text(d, W / 2, 266, "luci: 192.168.8.1:8080", font("default_medium", 11), DIM)
-    draw_page_dots(d, 4)
+    draw_page_dots(d, 5)
+    return img
+
+
+MONITOR_CPU_BAR = (16, 144, W - 16, 158)
+MONITOR_RAM_BAR = (16, 200, W - 16, 214)
+
+
+def panel_monitor(net_down, net_up, net_iface, cpu_pct, ram_pct, ram_used_gb, ram_total_gb, temp_c, uptime_min):
+    img, d = new_canvas()
+    draw_header(d, "MONITOR", ACCENT["monitor"])
+
+    bw_label = f"Bandwidth · {net_iface}" if net_iface else "Bandwidth"
+    d.text((16, 44), bw_label, font=font("default_medium", 13), fill=DIM)
+    d.text((16, 62), "Down", font=font("default_medium", 12), fill=DIM)
+    down_txt = f"↓ {net_down:.1f} Mbps" if net_down is not None else "—"
+    d.text((16, 78), down_txt, font=font("default_bold", 19), fill=FG)
+    d.text((W / 2 + 8, 62), "Up", font=font("default_medium", 12), fill=DIM)
+    up_txt = f"↑ {net_up:.1f} Mbps" if net_up is not None else "—"
+    d.text((W / 2 + 8, 78), up_txt, font=font("default_bold", 19), fill=FG)
+
+    d.line([16, 116, W - 16, 116], fill=(40, 44, 54))
+
+    d.text((16, 124), "CPU", font=font("default_medium", 14), fill=FG)
+    cpu_txt = f"{cpu_pct:.0f}%" if cpu_pct is not None else "—"
+    centered_text(d, W - 30, 124, cpu_txt, font("default_medium", 13), DIM)
+    bx0, by0, bx1, by1 = MONITOR_CPU_BAR
+    d.rounded_rectangle([bx0, by0, bx1, by1], radius=6, outline=DIM, width=1)
+    if cpu_pct is not None:
+        bw = int((bx1 - bx0 - 4) * cpu_pct / 100)
+        if bw > 0:
+            d.rounded_rectangle([bx0 + 2, by0 + 2, bx0 + 2 + bw, by1 - 2], radius=4, fill=ACCENT["monitor"])
+
+    d.text((16, 180), "RAM", font=font("default_medium", 14), fill=FG)
+    ram_txt = f"{ram_used_gb:.1f} / {ram_total_gb:.1f} GB" if ram_pct is not None else "—"
+    centered_text(d, W - 60, 180, ram_txt, font("default_medium", 12), DIM)
+    bx0, by0, bx1, by1 = MONITOR_RAM_BAR
+    d.rounded_rectangle([bx0, by0, bx1, by1], radius=6, outline=DIM, width=1)
+    if ram_pct is not None:
+        bw = int((bx1 - bx0 - 4) * ram_pct / 100)
+        if bw > 0:
+            d.rounded_rectangle([bx0 + 2, by0 + 2, bx0 + 2 + bw, by1 - 2], radius=4, fill=ACCENT["monitor"])
+
+    d.line([16, 230, W - 16, 230], fill=(40, 44, 54))
+
+    temp_txt = f"{temp_c:.0f}°C" if temp_c is not None else "—"
+    d.text((16, 240), f"Temp     {temp_txt}", font=font("default_medium", 15), fill=FG)
+    up_h, up_m = divmod(uptime_min, 60)
+    d.text((16, 264), f"Uptime   {up_h}h {up_m}m", font=font("default_medium", 15), fill=FG)
+
+    draw_page_dots(d, 3)
     return img
 
 
@@ -1154,9 +1407,9 @@ def panel_weather(cfg, days):
     return img
 
 
-def panel_weather_picker(cfg):
+def panel_weather_picker(cfg, scroll_px=0):
     items = [(name, name) for name, _, _ in WEATHER_CITIES]
-    return panel_picker("Weather City", ACCENT["weather"], items, cfg["weather_city"])
+    return panel_scroll_picker("Weather City", ACCENT["weather"], items, cfg["weather_city"], scroll_px)
 
 
 # ---------- confirm dialog (generic, reused for reboot / disconnect) ----------
@@ -1195,10 +1448,11 @@ def hit_confirm(x, y):
 
 MORE_WIFI24_TOGGLE = (176, 101, 224, 127)
 MORE_WIFI5_TOGGLE = (176, 138, 224, 164)
-MORE_REBOOT_RECT = (16, 196, W - 16, 232)
+MORE_CLOCK_STYLE_SEG = (16, 218, 224, 244)
+MORE_REBOOT_RECT = (16, 270, W - 16, 306)
 
 
-def panel_more(sysinfo, wifi24, wifi5):
+def panel_more(sysinfo, wifi24, wifi5, clock_style):
     img, d = new_canvas()
     draw_back_header(d, "More", ACCENT["clock"])
 
@@ -1218,11 +1472,17 @@ def panel_more(sysinfo, wifi24, wifi5):
 
     d.line([16, 182, W - 16, 182], fill=(40, 44, 54))
 
+    d.text((16, 192), "Clock Style", font=font("default_medium", 15), fill=FG)
+    sx0, sy0, sx1, sy1 = MORE_CLOCK_STYLE_SEG
+    sel_idx = 0 if clock_style == "analog" else 1
+    draw_segmented(d, sx0, sy0, sx1 - sx0, sy1 - sy0, ["Analog", "Digital"], sel_idx, ACCENT["clock"])
+
+    d.line([16, 258, W - 16, 258], fill=(40, 44, 54))
+
     rx0, ry0, rx1, ry1 = MORE_REBOOT_RECT
     d.rounded_rectangle([rx0, ry0, rx1, ry1], radius=8, outline=(200, 80, 80), width=2)
     centered_text(d, (rx0 + rx1) / 2, ry0 + 10, "Reboot Router", font("default_bold", 14), (220, 100, 100))
 
-    centered_text(d, W / 2, 280, "luci: 192.168.8.1:8080", font("default_medium", 11), DIM)
     return img
 
 
@@ -1233,6 +1493,9 @@ def hit_more(x, y):
     tx0, ty0, tx1, ty1 = MORE_WIFI5_TOGGLE
     if tx0 - 10 <= x <= tx1 + 10 and ty0 - 8 <= y <= ty1 + 8:
         return "wifi5"
+    sx0, sy0, sx1, sy1 = MORE_CLOCK_STYLE_SEG
+    if sx0 <= x <= sx1 and sy0 <= y <= sy1:
+        return "clock_analog" if x < (sx0 + sx1) / 2 else "clock_digital"
     rx0, ry0, rx1, ry1 = MORE_REBOOT_RECT
     if rx0 <= x <= rx1 and ry0 <= y <= ry1:
         return "reboot"
@@ -1418,18 +1681,73 @@ def panel_picker(title, accent, items, selected):
     return img
 
 
-def panel_city_picker(slot, cfg):
+SCROLL_ROW_H = 32
+SCROLL_FONT_SIZE = 15
+
+
+def panel_scroll_picker(title, accent, items, selected, scroll_px):
+    """Like panel_picker but with a fixed, larger row height and a vertical
+    scroll offset -- for lists too long to shrink-to-fit on one screen."""
+    img, d = new_canvas()
+    draw_back_header(d, title, accent)
+
+    list_h = PICKER_BOTTOM - PICKER_TOP
+    list_img = Image.new("RGB", (W, list_h), BG)
+    ld = ImageDraw.Draw(list_img)
+    f = font("default_medium", SCROLL_FONT_SIZE)
+    for i, (key, label) in enumerate(items):
+        y0 = i * SCROLL_ROW_H - scroll_px
+        if y0 + SCROLL_ROW_H < 0 or y0 > list_h:
+            continue
+        sel = key == selected
+        if sel:
+            ld.rectangle([0, y0, W, y0 + SCROLL_ROW_H], fill=(28, 40, 56))
+        bbox = ld.textbbox((0, 0), label, font=f)
+        th = bbox[3] - bbox[1]
+        color = accent if sel else FG
+        ld.text((20, y0 + (SCROLL_ROW_H - th) / 2 - bbox[1]), label, font=f, fill=color)
+        if sel:
+            ld.text((W - 30, y0 + (SCROLL_ROW_H - th) / 2 - bbox[1]), "✓", font=f, fill=accent)
+        if i > 0:
+            ld.line([0, y0, W, y0], fill=(28, 32, 42))
+    img.paste(list_img, (0, PICKER_TOP))
+
+    content_h = len(items) * SCROLL_ROW_H
+    max_scroll = max(0, content_h - list_h)
+    if max_scroll > 0:
+        thumb_h = max(20, list_h * list_h / content_h)
+        thumb_y = PICKER_TOP + (scroll_px / max_scroll) * (list_h - thumb_h)
+        # plain rectangle, not rounded -- too thin (4px) for PIL's corner math,
+        # which raises ValueError on some Pillow builds at this aspect ratio
+        d.rectangle([W - 6, thumb_y, W - 2, thumb_y + thumb_h], fill=(70, 76, 90))
+    return img
+
+
+def scroll_picker_max(n_items):
+    return max(0, n_items * SCROLL_ROW_H - (PICKER_BOTTOM - PICKER_TOP))
+
+
+def hit_scroll_picker(y, n_items, scroll_px):
+    if not (PICKER_TOP <= y < PICKER_BOTTOM):
+        return None
+    idx = int((y - PICKER_TOP + scroll_px) / SCROLL_ROW_H)
+    return idx if 0 <= idx < n_items else None
+
+
+def panel_city_picker(slot, cfg, scroll_px=0):
     selected = cfg["clock_top"] if slot == "top" else cfg["clock_bottom"]
     items = list(CITIES)
     label = "Top" if slot == "top" else "Bottom"
-    return panel_picker(f"{label} City", ACCENT["clock"], items, selected)
+    return panel_scroll_picker(f"{label} City", ACCENT["clock"], items, selected, scroll_px)
 
 
-def panel_currency_picker(slot, cfg):
-    selected = cfg["fx_top"] if slot == "top" else cfg["fx_bottom"]
+def panel_currency_picker(row, side, cfg, scroll_px=0):
+    cfg_key = f"fx_{row}_{side}"
+    selected = cfg[cfg_key]
     items = [(c, f"{c} · {CURRENCY_NAMES[c]}") for c in CURRENCIES]
-    label = "Top" if slot == "top" else "Bottom"
-    return panel_picker(f"{label} Currency", ACCENT["fx"], items, selected)
+    row_label = "Top" if row == "top" else "Bottom"
+    side_label = "From" if side == "from" else "To"
+    return panel_scroll_picker(f"{row_label} — {side_label}", ACCENT["fx"], items, selected, scroll_px)
 
 
 def panel_datacap_picker(cfg):
@@ -1459,10 +1777,6 @@ def render_sub(view, cfg, oc, traf):
         return panel_city_picker("top", cfg)
     if view == "city_bottom":
         return panel_city_picker("bottom", cfg)
-    if view == "fx_top":
-        return panel_currency_picker("top", cfg)
-    if view == "fx_bottom":
-        return panel_currency_picker("bottom", cfg)
     if view == "datacap":
         return panel_datacap_picker(cfg)
     if view == "oc_nodes":
@@ -1499,9 +1813,9 @@ def hit_main_fx(x, y):
         idx = min(len(FX_RANGES) - 1, max(0, int((x - rx0) / seg_w)))
         return f"range:{FX_RANGES[idx]}"
     if FX_TOP_ZONE[0] <= y < FX_TOP_ZONE[1]:
-        return "top"
+        return "top_from" if x < W / 2 else "top_to"
     if FX_BOTTOM_ZONE[0] <= y < FX_BOTTOM_ZONE[1]:
-        return "bottom"
+        return "bottom_from" if x < W / 2 else "bottom_to"
     return None
 
 
@@ -1580,20 +1894,33 @@ def mode_preview(outdir):
     sysinfo = get_system_info()
     wifi24 = get_wifi_radio_state("wifi0")
     wifi5 = get_wifi_radio_state("wifi1")
+    net_sample, _, _ = sample_bandwidth(None)
+    cpu_sample, _ = sample_cpu(None)
+    time.sleep(1)
+    net_sample, net_down, net_up = sample_bandwidth(net_sample)
+    net_iface = net_sample[0] if net_sample else None
+    _, cpu_pct = sample_cpu(cpu_sample)
+    ram_pct, ram_used_gb, ram_total_gb = get_ram_stats()
+    temp_c = get_temp_c()
+    cfg_digital = dict(cfg, clock_style="digital")
     screens = [
         ("clock", panel_clock(cfg, rep)),
-        ("fx", panel_fx(cfg, fx, "month")),
+        ("clock_digital", panel_clock(cfg_digital, rep)),
         ("sim", panel_sim(cfg, sim)),
-        ("openclash", panel_openclash(oc, traf)),
         ("weather", panel_weather(cfg, wx)),
+        ("monitor", panel_monitor(net_down, net_up, net_iface, cpu_pct, ram_pct, ram_used_gb, ram_total_gb, temp_c, sysinfo["uptime_min"])),
+        ("fx", panel_fx(cfg, fx, "month")),
+        ("openclash", panel_openclash(oc, traf)),
         ("city_top", panel_city_picker("top", cfg)),
         ("city_bottom", panel_city_picker("bottom", cfg)),
-        ("fx_top", panel_currency_picker("top", cfg)),
-        ("fx_bottom", panel_currency_picker("bottom", cfg)),
+        ("fx_top_from", panel_currency_picker("top", "from", cfg)),
+        ("fx_top_to", panel_currency_picker("top", "to", cfg)),
+        ("fx_bottom_from", panel_currency_picker("bottom", "from", cfg)),
+        ("fx_bottom_to", panel_currency_picker("bottom", "to", cfg)),
         ("datacap", panel_datacap_picker(cfg)),
         ("oc_nodes", panel_node_picker(traf)),
         ("weather_city", panel_weather_picker(cfg)),
-        ("more", panel_more(sysinfo, wifi24, wifi5)),
+        ("more", panel_more(sysinfo, wifi24, wifi5, cfg["clock_style"])),
         ("repeater", panel_repeater(rep, rep_networks)),
         ("confirm", panel_confirm("Reboot", "Reboot the router now?", ACCENT["clock"], yes_label="Reboot", danger=True)),
         ("keyboard", panel_keyboard("Wi-Fi Password", "myPass", "letters", True, ACCENT["clock"])),
@@ -1745,6 +2072,13 @@ def mode_live():
     rep = get_repeater_status()
     last_fx_check = last_sim_check = last_oc_check = last_traf_check = last_wx_check = last_rep_check = time.time()
 
+    net_sample, net_down, net_up = None, None, None
+    cpu_sample, cpu_pct = None, None
+    ram_pct, ram_used_gb, ram_total_gb = get_ram_stats()
+    temp_c = get_temp_c()
+    mon_uptime_min = get_system_info()["uptime_min"]
+    last_mon_check = time.time()
+
     def render_main(idx):
         name = PANEL_NAMES[idx]
         if name == "clock":
@@ -1755,8 +2089,11 @@ def mode_live():
             return panel_sim(cfg, sim)
         elif name == "openclash":
             return panel_openclash(oc, traf)
-        else:
+        elif name == "weather":
             return panel_weather(cfg, wx)
+        else:
+            net_iface = net_sample[0] if net_sample else None
+            return panel_monitor(net_down, net_up, net_iface, cpu_pct, ram_pct, ram_used_gb, ram_total_gb, temp_c, mon_uptime_min)
 
     panel_idx = 0
     view = "main"
@@ -1787,12 +2124,57 @@ def mode_live():
             scan_state["running"] = False
 
         threading.Thread(target=_worker, daemon=True).start()
+
+    def handle_scroll_picker(now, items, render_fn, on_select):
+        """Shared drag-to-scroll / tap-to-select logic for any scrollable
+        picker sub-screen (weather city, top/bottom currency, ...). `items`
+        is a list of (key, label); `render_fn(scroll_px)` renders the
+        screen; `on_select(key)` applies the choice. Handles going back to
+        main on a header tap. Caller still owns sleep+continue."""
+        nonlocal view, sub_dirty, cur_img, last_draw, picker_scroll_base
+        max_scroll = scroll_picker_max(len(items))
+        with touch_state.lock:
+            active = touch_state.active
+            dy, dx = touch_state.dy, touch_state.dx
+            down_x, down_y = touch_state.down_x, touch_state.down_y
+            released = touch_state.release_pending
+            release_dx, release_dy = touch_state.release_dx, touch_state.release_dy
+            touch_state.release_pending = False
+
+        if active and (abs(dy) > TAP_JITTER_PX or abs(dx) > TAP_JITTER_PX):
+            live_scroll = min(max_scroll, max(0, picker_scroll_base - dy))
+            write_frame(render_fn(live_scroll))
+        elif released:
+            final_dx, final_dy = release_dx, release_dy
+            is_tap = abs(final_dx) <= TAP_JITTER_PX and abs(final_dy) <= TAP_JITTER_PX
+            if is_tap and hit_back(down_y):
+                view = "main"
+                cur_img = render_main(panel_idx)
+                write_frame(cur_img)
+                last_draw = now
+            elif is_tap:
+                idx = hit_scroll_picker(down_y, len(items), picker_scroll_base)
+                if idx is not None:
+                    on_select(items[idx][0])
+                    view = "main"
+                    cur_img = render_main(panel_idx)
+                    write_frame(cur_img)
+                    last_draw = now
+            else:
+                picker_scroll_base = min(max_scroll, max(0, picker_scroll_base - final_dy))
+                write_frame(render_fn(picker_scroll_base))
+        elif sub_dirty:
+            write_frame(render_fn(picker_scroll_base))
+            sub_dirty = False
+
     confirm_title = confirm_message = confirm_yes_label = confirm_action = confirm_return_view = ""
     confirm_danger = False
     kb_text = ""
     kb_layer = "letters"
     kb_caps = False
     kb_target_ssid = kb_target_bssid = None
+    picker_scroll_base = 0.0
+    fx_edit_side = "from"
 
     while not _stop:
         now = time.time()
@@ -1823,6 +2205,13 @@ def mode_live():
                 if now - last_rep_check > 30:
                     rep = get_repeater_status()
                     last_rep_check = now
+                if now - last_mon_check > 2:
+                    net_sample, net_down, net_up = sample_bandwidth(net_sample)
+                    cpu_sample, cpu_pct = sample_cpu(cpu_sample)
+                    ram_pct, ram_used_gb, ram_total_gb = get_ram_stats()
+                    temp_c = get_temp_c()
+                    mon_uptime_min = get_system_info()["uptime_min"]
+                    last_mon_check = now
                 if now - last_draw >= 1:
                     cur_img = render_main(panel_idx)
                     write_frame(cur_img)
@@ -1878,8 +2267,10 @@ def mode_live():
                         new_view = None
                         if name == "clock" and zone == "city_left":
                             new_view = "city_top"
+                            picker_scroll_base = 0
                         elif name == "clock" and zone == "city_right":
                             new_view = "city_bottom"
+                            picker_scroll_base = 0
                         elif name == "clock" and zone == "repeater":
                             new_view = "repeater"
                             rep = get_repeater_status()
@@ -1889,10 +2280,18 @@ def mode_live():
                             sysinfo = get_system_info()
                             wifi24 = get_wifi_radio_state("wifi0")
                             wifi5 = get_wifi_radio_state("wifi1")
-                        elif name == "fx" and zone == "top":
-                            new_view = "fx_top"
-                        elif name == "fx" and zone == "bottom":
-                            new_view = "fx_bottom"
+                        elif name == "fx" and zone == "top_from":
+                            new_view, fx_edit_side = "fx_top", "from"
+                            picker_scroll_base = 0
+                        elif name == "fx" and zone == "top_to":
+                            new_view, fx_edit_side = "fx_top", "to"
+                            picker_scroll_base = 0
+                        elif name == "fx" and zone == "bottom_from":
+                            new_view, fx_edit_side = "fx_bottom", "from"
+                            picker_scroll_base = 0
+                        elif name == "fx" and zone == "bottom_to":
+                            new_view, fx_edit_side = "fx_bottom", "to"
+                            picker_scroll_base = 0
                         elif name == "fx" and zone == "update":
                             flash = cur_img.copy()
                             fd = ImageDraw.Draw(flash)
@@ -1928,6 +2327,7 @@ def mode_live():
                             new_view = "oc_nodes"
                         elif name == "weather" and zone == "city":
                             new_view = "weather_city"
+                            picker_scroll_base = 0
 
                         neighbor_img = None
                         state = "idle"
@@ -1966,6 +2366,45 @@ def mode_live():
                         write_frame(composite(cur_img, neighbor_img, dx_now, neighbor_on_right))
 
         else:  # sub-screen
+            if view == "weather_city":
+                def _select_weather_city(key):
+                    nonlocal wx, last_wx_check
+                    cfg["weather_city"] = key
+                    save_config(cfg)
+                    wx = fetch_weather(key)
+                    last_wx_check = now
+
+                items = [(name, name) for name, _, _ in WEATHER_CITIES]
+                handle_scroll_picker(now, items, lambda s: panel_weather_picker(cfg, s), _select_weather_city)
+                time.sleep(0.012)
+                continue
+
+            if view in ("city_top", "city_bottom"):
+                slot = "top" if view == "city_top" else "bottom"
+                cfg_key = "clock_top" if view == "city_top" else "clock_bottom"
+
+                def _select_city(key, cfg_key=cfg_key):
+                    cfg[cfg_key] = key
+                    save_config(cfg)
+
+                items = list(CITIES)
+                handle_scroll_picker(now, items, lambda s: panel_city_picker(slot, cfg, s), _select_city)
+                time.sleep(0.012)
+                continue
+
+            if view in ("fx_top", "fx_bottom"):
+                slot = "top" if view == "fx_top" else "bottom"
+                cfg_key = f"fx_{slot}_{fx_edit_side}"
+
+                def _select_currency(key, cfg_key=cfg_key):
+                    cfg[cfg_key] = key
+                    save_config(cfg)
+
+                items = [(c, f"{c} · {CURRENCY_NAMES[c]}") for c in CURRENCIES]
+                handle_scroll_picker(now, items, lambda s: panel_currency_picker(slot, fx_edit_side, cfg, s), _select_currency)
+                time.sleep(0.012)
+                continue
+
             if view == "repeater" and scan_state["result"] is not None:
                 rep_networks = scan_state["result"]
                 scan_state["result"] = None
@@ -1973,7 +2412,7 @@ def mode_live():
 
             if sub_dirty:
                 if view == "more":
-                    img = panel_more(sysinfo, wifi24, wifi5)
+                    img = panel_more(sysinfo, wifi24, wifi5, cfg["clock_style"])
                 elif view == "repeater":
                     img = panel_repeater(rep, rep_networks)
                 elif view == "confirm":
@@ -2055,6 +2494,14 @@ def mode_live():
                         wifi5 = not wifi5
                         set_wifi_radio_state("wifi1", wifi5)
                         sub_dirty = True
+                    elif action == "clock_analog" and cfg["clock_style"] != "analog":
+                        cfg["clock_style"] = "analog"
+                        save_config(cfg)
+                        sub_dirty = True
+                    elif action == "clock_digital" and cfg["clock_style"] != "digital":
+                        cfg["clock_style"] = "digital"
+                        save_config(cfg)
+                        sub_dirty = True
                     elif action == "reboot":
                         confirm_title = "Reboot"
                         confirm_message = "Reboot the router now?"
@@ -2091,24 +2538,6 @@ def mode_live():
                             kb_caps = False
                             view = "keyboard_wifi"
                             sub_dirty = True
-                elif is_tap and view in ("city_top", "city_bottom"):
-                    idx = hit_picker(down_y, len(CITIES))
-                    if idx is not None:
-                        cfg["clock_top" if view == "city_top" else "clock_bottom"] = CITIES[idx][0]
-                        save_config(cfg)
-                        view = "main"
-                        cur_img = render_main(panel_idx)
-                        write_frame(cur_img)
-                        last_draw = now
-                elif is_tap and view in ("fx_top", "fx_bottom"):
-                    idx = hit_picker(down_y, len(CURRENCIES))
-                    if idx is not None:
-                        cfg["fx_top" if view == "fx_top" else "fx_bottom"] = CURRENCIES[idx]
-                        save_config(cfg)
-                        view = "main"
-                        cur_img = render_main(panel_idx)
-                        write_frame(cur_img)
-                        last_draw = now
                 elif is_tap and view == "datacap":
                     idx = hit_picker(down_y, len(DATA_CAP_PRESETS))
                     if idx is not None:
@@ -2126,17 +2555,6 @@ def mode_live():
                         select_openclash_node(traf["group"], chosen)
                         traf = get_openclash_traffic_and_node()
                         last_traf_check = now
-                        view = "main"
-                        cur_img = render_main(panel_idx)
-                        write_frame(cur_img)
-                        last_draw = now
-                elif is_tap and view == "weather_city":
-                    idx = hit_picker(down_y, len(WEATHER_CITIES))
-                    if idx is not None:
-                        cfg["weather_city"] = WEATHER_CITIES[idx][0]
-                        save_config(cfg)
-                        wx = fetch_weather(cfg["weather_city"])
-                        last_wx_check = now
                         view = "main"
                         cur_img = render_main(panel_idx)
                         write_frame(cur_img)

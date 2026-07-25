@@ -9,7 +9,8 @@ DIR="$(cd "$(dirname "$0")" && pwd)"
 echo "==> Installing dependencies on root@$ROUTER"
 ssh "root@$ROUTER" '
     opkg update
-    opkg install python3 python3-numpy zoneinfo-europe zoneinfo-asia
+    opkg install python3 python3-numpy
+    opkg install zoneinfo-europe zoneinfo-asia zoneinfo-america zoneinfo-australia-nz zoneinfo-pacific
     opkg install --nodeps python3-pillow
     opkg install libtiff6
     mkdir -p /root/dashboard

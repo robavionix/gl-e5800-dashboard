@@ -1,7 +1,7 @@
 # GL-E5800 Touch Dashboard
 
 A custom, fully interactive replacement for the stock `gl_screen` UI on the
-GL.iNet GL-E5800's built-in 240x320 touchscreen. Swipe between five panels,
+GL.iNet GL-E5800's built-in 240x320 touchscreen. Swipe between six panels,
 tap into any of them for detail or control, and manage the router without
 ever opening the web UI.
 
@@ -9,7 +9,7 @@ ever opening the web UI.
 
 No image assets, no external UI framework — every icon, chart, and widget
 is drawn at runtime with Pillow directly onto the framebuffer (`/dev/fb0`,
-RGB565). Pure Python, ~2000 lines, one file.
+RGB565). Pure Python, one file.
 
 ## Panels
 
@@ -17,23 +17,35 @@ RGB565). Pure Python, ~2000 lines, one file.
 |---|---|---|
 | ![Home](screenshots/panel_clock.png) | ![SIM](screenshots/panel_sim.png) | ![Weather](screenshots/panel_weather.png) |
 
-| Currency | OpenClash |
-|---|---|
-| ![Currency](screenshots/panel_fx.png) | ![OpenClash](screenshots/panel_openclash.png) |
+| Monitor | Currency | OpenClash |
+|---|---|---|
+| ![Monitor](screenshots/panel_monitor.png) | ![Currency](screenshots/panel_fx.png) | ![OpenClash](screenshots/panel_openclash.png) |
 
-**Home** — two small analog clocks (independently pickable cities/timezones),
-today's date, and two tiles: **Repeater** and **More**, so you never need
-the stock GL.iNet home page.
+**Home** — two small clocks (independently pickable cities/timezones,
+switchable between analog and digital from More), today's date, and two
+tiles: **Repeater** and **More**, so you never need the stock GL.iNet home
+page.
+
+| Analog | Digital |
+|---|---|
+| ![Analog clock](screenshots/panel_clock.png) | ![Digital clock](screenshots/panel_clock_digital.png) |
 
 **Active SIM** — country flag, full number, a SIM1 / SIM2 / eSIM switch, a
 cellular data on/off toggle, and a data-usage bar against a cap you set.
 
 **Weather** — 3-day forecast (hand-drawn icons: sun/cloud/rain/snow/fog/storm)
-for a city you pick from a curated list.
+for a city you pick from a scrollable list of 40+ cities.
 
-**Currency** — live rate for two currencies of your choice against CNY, each
-with a real historical line chart (week/month/year, pulled from
-[Frankfurter](https://frankfurter.dev), ECB reference rates).
+**Monitor** — bandwidth (down/up Mbps on whichever interface currently holds
+the default route, so it keeps tracking the right link through a WAN
+failover), CPU%, RAM used/total, SoC temperature, and uptime. Read-only,
+refreshes every 2 seconds.
+
+**Currency** — two rows, each `1 {from} = {rate} {to}`, with `from` and
+`to` independently pickable from a 10-currency list (not fixed to any one
+target currency), plus a real historical line chart per row (week/month/
+year, pulled from [Frankfurter](https://frankfurter.dev), ECB reference
+rates).
 
 **OpenClash** — on/off, Global/Rule mode, current node (flag + guessed
 country from the node name) with a tap-to-switch node list, and session
@@ -48,15 +60,15 @@ installed" instead of breaking if OpenClash isn't on the device.
 open networks directly or opens the on-screen keyboard for a password.
 Uses the same `ubus` `repeater` object the stock GL.iNet UI uses.
 
-**More** (from the Home tile) — 2.4GHz/5GHz radio toggles, uptime/LAN IP,
-and a confirm-gated reboot.
+**More** (from the Home tile) — 2.4GHz/5GHz radio toggles, an Analog/Digital
+clock-style switch, uptime/LAN IP, and a confirm-gated reboot.
 
 **On-screen keyboard** — built because this screen has no physical or
 pop-up keyboard. Two layers (letters/symbols), persistent caps toggle.
 
 ## Interaction
 
-- **Swipe** left/right between the 5 main panels — real finger-tracking with
+- **Swipe** left/right between the 6 main panels — real finger-tracking with
   an eased iOS-style snap/cancel animation, not a hard cut.
 - **Tap** into a panel for detail screens (pick a city, pick a currency, set
   a data cap, configure OpenClash's node, etc). Tap the header or swipe
@@ -96,7 +108,13 @@ SSH into the router as root, then:
 ```sh
 # 1. Dependencies (from GL.iNet's own opkg feed)
 opkg update
-opkg install python3 python3-numpy zoneinfo-europe zoneinfo-asia
+opkg install python3 python3-numpy
+# All 5 zoneinfo packages -- the Clock city picker includes cities from
+# every region (e.g. Auckland, Toronto), and this firmware splits its
+# timezone database into separate per-region opkg packages. Installing
+# only zoneinfo-europe/asia will crash-loop the dashboard the moment
+# someone picks a city outside those two regions.
+opkg install zoneinfo-europe zoneinfo-asia zoneinfo-america zoneinfo-australia-nz zoneinfo-pacific
 # python3-pillow conflicts with a file gl-sdk4-screen-large already owns
 # (a bundled libfreetype) -- --nodeps works because that file is already
 # on disk, just owned by the other package.
@@ -145,9 +163,14 @@ There's no settings UI for these — edit directly:
 - **Cities offered for Clock/Weather pickers**: `CITIES` / `WEATHER_CITIES`
   lists near the top of `dashboard.py` (need an IANA timezone name and, for
   weather, lat/lon — no geocoding, no free-text search, since there's no
-  keyboard for it outside the WiFi-password flow).
+  keyboard for it outside the WiFi-password flow). Make sure the matching
+  `zoneinfo-*` opkg package is installed for any region you add cities from.
 - **Currencies offered**: `CURRENCIES` list.
 - **Data cap presets**: `DATA_CAP_PRESETS`.
+- **Monitor's tracked interface**: auto-detected (`get_wan_iface()` follows
+  whichever interface holds the lowest-metric default route) rather than a
+  fixed name, so it keeps working across a repeater-WiFi/cellular failover
+  without editing anything.
 - User's actual picks (which city/currency/cap) persist at
   `/root/dashboard/config.json`, separate from the source.
 
@@ -171,6 +194,15 @@ There's no settings UI for these — edit directly:
   Anything beyond plain ASCII + those three marks is drawn as a small PIL
   icon rather than assumed to render as text — see `_icon_lock`,
   `_icon_wifi_signal`, `draw_analog_clock` for the pattern if you add UI.
+- **Monitor's bandwidth reading only reflects traffic that actually passes
+  through this router.** A client connected directly to some *other*
+  router's WiFi (bypassing this one entirely) will correctly show as 0 —
+  there's no way to see traffic that never touches this device.
+- `thermal_zone0` on this SoC (`sdr0`) is an unpowered sensor that always
+  reports a `-273000` millidegree sentinel — `get_temp_c()` scans
+  `/sys/class/thermal/thermal_zone*/type` for a known-good sensor name
+  instead of assuming zone 0 is real. If you're porting this to another
+  board, don't assume zone numbering means anything either — check `type`.
 
 ## Adapting to another model
 
