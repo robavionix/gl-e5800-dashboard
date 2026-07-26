@@ -525,6 +525,7 @@ def get_repeater_status():
         "ssid": st.get("ssid"),
         "signal": st.get("signal"),
         "ip": ip,
+        "band": st.get("band") if connected else None,
     }
 
 
@@ -585,13 +586,87 @@ def repeater_disconnect():
 
 # ---------- device settings ----------
 
-def get_wifi_radio_state(device):
-    return uci_get(f"wireless.{device}.disabled") != "1"
+def get_wifi_radio_state(iface):
+    """iface: the AP-mode wifi-iface section name ('wifi2g'/'wifi5g' on
+    this device -- the actual "GL-E5800" SSID), NOT the underlying radio
+    device name ('wifi0'/'wifi1'). The radio device's own 'disabled' flag
+    only gates whether the physical radio hardware is powered on at all
+    (needed regardless, e.g. for this router's repeater-client uplink) --
+    completely separate from whether the AP interface actually broadcasts
+    its SSID. Confirmed live: wifi0/wifi1 (radio) read disabled=0 while
+    wifi2g/wifi5g (the real AP) read disabled=1 -- toggling the
+    radio-level flag never touched the setting that actually determines
+    whether the WiFi network is visible, which is why the toggle could
+    show "on" while the network was genuinely off the whole time."""
+    return uci_get(f"wireless.{iface}.disabled") != "1"
 
 
-def set_wifi_radio_state(device, enabled):
-    uci_set(f"wireless.{device}.disabled", "0" if enabled else "1")
-    subprocess.Popen(["/sbin/wifi", "reload"])
+_wifi_reload_state = {"running": False, "pending": False}
+_wifi_reload_lock = threading.Lock()
+
+
+def _wifi_reload_worker():
+    while True:
+        with _wifi_reload_lock:
+            _wifi_reload_state["pending"] = False
+        subprocess.run(["/sbin/wifi", "reload"])
+        with _wifi_reload_lock:
+            if not _wifi_reload_state["pending"]:
+                _wifi_reload_state["running"] = False
+                return
+
+
+def request_wifi_reload():
+    """`/sbin/wifi reload` serializes on its own file lock and takes ~8-10s
+    per call -- firing one per toggle tap (the old behavior) let calls pile
+    up faster than they drained, and a backlog of them was found stuck
+    mid-queue after a round of testing, leaving the AP UCI state and the
+    actual broadcasting hostapd state out of sync. This coalesces any
+    reloads requested while one is already in flight into a single trailing
+    reload instead of stacking a new subprocess per request."""
+    with _wifi_reload_lock:
+        if _wifi_reload_state["running"]:
+            _wifi_reload_state["pending"] = True
+            return
+        _wifi_reload_state["running"] = True
+    threading.Thread(target=_wifi_reload_worker, daemon=True).start()
+
+
+def set_wifi_radio_state(iface, enabled):
+    uci_set(f"wireless.{iface}.disabled", "0" if enabled else "1")
+    request_wifi_reload()
+
+
+def get_wifi_band_state():
+    """5G and 6G share a single antenna path on this hardware and can only
+    have one active at a time -- returns "5g"/"6g" for whichever AP
+    interface is currently enabled, or "off" if neither is."""
+    if get_wifi_radio_state("wifi5g"):
+        return "5g"
+    if get_wifi_radio_state("wifi6g"):
+        return "6g"
+    return "off"
+
+
+def set_wifi_band_state(band):
+    uci_set("wireless.wifi5g.disabled", "0" if band == "5g" else "1")
+    uci_set("wireless.wifi6g.disabled", "0" if band == "6g" else "1")
+    request_wifi_reload()
+
+
+def get_wifi56_conflict_idx(rep):
+    """Index into ["5G", "Off", "6G"] that must stay disabled because the
+    repeater's upstream AP is already using the shared 5G/6G antenna path
+    (2.4G/5G upstream conflicts with local 6G; 6G upstream conflicts with
+    local 5G). None if there's no repeater conflict (not connected)."""
+    if not rep.get("connected"):
+        return None
+    band = (rep.get("band") or "").lower()
+    if band.startswith("6"):
+        return 0
+    if band:
+        return 2
+    return None
 
 
 def get_system_info():
@@ -606,6 +681,10 @@ def get_system_info():
 
 def reboot_router():
     subprocess.Popen(["/sbin/reboot"])
+
+
+def shutdown_router():
+    subprocess.Popen(["/sbin/poweroff"])
 
 
 def switch_to_stock_ui():
@@ -1720,13 +1799,14 @@ def hit_confirm(x, y):
 # ---------- More / settings ----------
 
 MORE_WIFI24_TOGGLE = (176, 37, 224, 63)
-MORE_WIFI5_TOGGLE = (176, 74, 224, 100)
-MORE_CLOCK_STYLE_SEG = (16, 154, 224, 180)
-MORE_RETURN_STOCK_RECT = (16, 206, W - 16, 242)
-MORE_REBOOT_RECT = (16, 252, W - 16, 288)
+MORE_WIFI56_SEG = (16, 104, 224, 128)
+MORE_CLOCK_STYLE_SEG = (16, 184, 224, 208)
+MORE_RETURN_STOCK_RECT = (16, 232, W - 16, 266)
+MORE_REBOOT_RECT = (16, 272, 116, 306)
+MORE_SHUTDOWN_RECT = (124, 272, W - 16, 306)
 
 
-def panel_more(wifi24, wifi5, clock_style):
+def panel_more(wifi24, wifi_band, clock_style, wifi56_disabled_idx=None):
     img, d = new_canvas()
     draw_back_header(d, "More", ACCENT["clock"])
 
@@ -1734,18 +1814,29 @@ def panel_more(wifi24, wifi5, clock_style):
     tx0, ty0, tx1, ty1 = MORE_WIFI24_TOGGLE
     draw_toggle(d, tx0, ty0, wifi24, ACCENT["clock"], w=tx1 - tx0, h=ty1 - ty0)
 
-    d.text((16, 81), "5GHz WiFi", font=font("default_medium", 15), fill=FG)
-    tx0, ty0, tx1, ty1 = MORE_WIFI5_TOGGLE
-    draw_toggle(d, tx0, ty0, wifi5, ACCENT["clock"], w=tx1 - tx0, h=ty1 - ty0)
+    d.text((16, 81), "5GHz/6GHz", font=font("default_medium", 15), fill=FG)
+    sx0, sy0, sx1, sy1 = MORE_WIFI56_SEG
+    band_idx = {"5g": 0, "off": 1, "6g": 2}[wifi_band]
+    draw_segmented(d, sx0, sy0, sx1 - sx0, sy1 - sy0, ["5G", "Off", "6G"], band_idx, ACCENT["clock"])
+    if wifi56_disabled_idx is not None and wifi56_disabled_idx != band_idx:
+        seg_w = (sx1 - sx0) / 3
+        label = ["5G", "Off", "6G"][wifi56_disabled_idx]
+        f = font("default_medium", 14)
+        bbox = d.textbbox((0, 0), label, font=f)
+        tw, th = bbox[2] - bbox[0], bbox[3] - bbox[1]
+        tx = sx0 + wifi56_disabled_idx * seg_w + (seg_w - tw) / 2
+        ty = sy0 + ((sy1 - sy0) - th) / 2 - bbox[1]
+        d.text((tx, ty), label, font=f, fill=(60, 64, 74))
+        centered_text(d, (sx0 + sx1) / 2, sy1 + 6, "Matches repeater band", font("default_medium", 10), DIM)
 
-    d.line([16, 118, W - 16, 118], fill=(40, 44, 54))
+    d.line([16, 150, W - 16, 150], fill=(40, 44, 54))
 
-    d.text((16, 128), "Clock Style", font=font("default_medium", 15), fill=FG)
+    d.text((16, 160), "Clock Style", font=font("default_medium", 15), fill=FG)
     sx0, sy0, sx1, sy1 = MORE_CLOCK_STYLE_SEG
     sel_idx = 0 if clock_style == "analog" else 1
     draw_segmented(d, sx0, sy0, sx1 - sx0, sy1 - sy0, ["Analog", "Digital"], sel_idx, ACCENT["clock"])
 
-    d.line([16, 194, W - 16, 194], fill=(40, 44, 54))
+    d.line([16, 222, W - 16, 222], fill=(40, 44, 54))
 
     rx0, ry0, rx1, ry1 = MORE_RETURN_STOCK_RECT
     d.rounded_rectangle([rx0, ry0, rx1, ry1], radius=8, outline=ACCENT["clock"], width=2)
@@ -1753,18 +1844,26 @@ def panel_more(wifi24, wifi5, clock_style):
 
     rx0, ry0, rx1, ry1 = MORE_REBOOT_RECT
     d.rounded_rectangle([rx0, ry0, rx1, ry1], radius=8, outline=(200, 80, 80), width=2)
-    centered_text(d, (rx0 + rx1) / 2, ry0 + 10, "Reboot Router", font("default_bold", 14), (220, 100, 100))
+    centered_text(d, (rx0 + rx1) / 2, ry0 + 10, "Reboot", font("default_bold", 14), (220, 100, 100))
+
+    rx0, ry0, rx1, ry1 = MORE_SHUTDOWN_RECT
+    d.rounded_rectangle([rx0, ry0, rx1, ry1], radius=8, outline=(200, 80, 80), width=2)
+    centered_text(d, (rx0 + rx1) / 2, ry0 + 10, "Shutdown", font("default_bold", 14), (220, 100, 100))
 
     return img
 
 
-def hit_more(x, y):
+def hit_more(x, y, wifi56_disabled_idx=None):
     tx0, ty0, tx1, ty1 = MORE_WIFI24_TOGGLE
     if tx0 - 10 <= x <= tx1 + 10 and ty0 - 8 <= y <= ty1 + 8:
         return "wifi24"
-    tx0, ty0, tx1, ty1 = MORE_WIFI5_TOGGLE
-    if tx0 - 10 <= x <= tx1 + 10 and ty0 - 8 <= y <= ty1 + 8:
-        return "wifi5"
+    sx0, sy0, sx1, sy1 = MORE_WIFI56_SEG
+    if sx0 <= x <= sx1 and sy0 <= y <= sy1:
+        seg_w = (sx1 - sx0) / 3
+        idx = min(2, max(0, int((x - sx0) // seg_w)))
+        if idx == wifi56_disabled_idx:
+            return None
+        return ["wifi_5g", "wifi_off", "wifi_6g"][idx]
     sx0, sy0, sx1, sy1 = MORE_CLOCK_STYLE_SEG
     if sx0 <= x <= sx1 and sy0 <= y <= sy1:
         return "clock_analog" if x < (sx0 + sx1) / 2 else "clock_digital"
@@ -1774,6 +1873,9 @@ def hit_more(x, y):
     rx0, ry0, rx1, ry1 = MORE_REBOOT_RECT
     if rx0 <= x <= rx1 and ry0 <= y <= ry1:
         return "reboot"
+    rx0, ry0, rx1, ry1 = MORE_SHUTDOWN_RECT
+    if rx0 <= x <= rx1 and ry0 <= y <= ry1:
+        return "shutdown"
     return None
 
 
@@ -2202,8 +2304,8 @@ def mode_preview(outdir):
     rep = get_repeater_status()
     rep_networks = repeater_scan()
     sysinfo = get_system_info()
-    wifi24 = get_wifi_radio_state("wifi0")
-    wifi5 = get_wifi_radio_state("wifi1")
+    wifi24 = get_wifi_radio_state("wifi2g")
+    wifi_band = get_wifi_band_state()
     net_sample, _, _ = sample_bandwidth(None)
     cpu_sample, _ = sample_cpu(None)
     time.sleep(1)
@@ -2233,7 +2335,7 @@ def mode_preview(outdir):
         ("datacap", panel_datacap_picker(cfg)),
         ("oc_nodes", panel_node_picker(traf)),
         ("weather_city", panel_weather_picker(cfg)),
-        ("more", panel_more(wifi24, wifi5, cfg["clock_style"])),
+        ("more", panel_more(wifi24, wifi_band, cfg["clock_style"], get_wifi56_conflict_idx(rep))),
         ("repeater", panel_repeater(rep, rep_networks)),
         ("confirm", panel_confirm("Reboot", "Reboot the router now?", ACCENT["clock"], yes_label="Reboot", danger=True)),
         ("keyboard", panel_keyboard("Wi-Fi Password", "myPass", "letters", True, ACCENT["clock"])),
@@ -2428,7 +2530,8 @@ def mode_live():
 
     # state for the newer sub-screens (More, Repeater, Confirm, Keyboard)
     sysinfo = {"uptime_min": 0, "lan_ip": "192.168.8.1"}
-    wifi24 = wifi5 = True
+    wifi24 = True
+    wifi_band = "5g"
     rep_networks = []
     scan_state = {"result": None, "running": False}
 
@@ -2682,8 +2785,9 @@ def mode_live():
                             start_repeater_scan()
                         elif name == "clock" and zone == "more":
                             new_view = "more"
-                            wifi24 = get_wifi_radio_state("wifi0")
-                            wifi5 = get_wifi_radio_state("wifi1")
+                            wifi24 = get_wifi_radio_state("wifi2g")
+                            wifi_band = get_wifi_band_state()
+                            rep = get_repeater_status()
                         elif name == "fx" and zone == "top_from":
                             new_view, fx_edit_side = "fx_top", "from"
                             picker_scroll_base = 0
@@ -2852,7 +2956,7 @@ def mode_live():
 
             if sub_dirty:
                 if view == "more":
-                    img = panel_more(wifi24, wifi5, cfg["clock_style"])
+                    img = panel_more(wifi24, wifi_band, cfg["clock_style"], get_wifi56_conflict_idx(rep))
                 elif view == "confirm":
                     img = panel_confirm(confirm_title, confirm_message, ACCENT["clock"],
                                         yes_label=confirm_yes_label, danger=confirm_danger)
@@ -2881,6 +2985,9 @@ def mode_live():
                 elif view == "confirm" and is_tap and hit_confirm(down_x, down_y) == "yes":
                     if confirm_action == "reboot":
                         reboot_router()
+                        view = "more"
+                    elif confirm_action == "shutdown":
+                        shutdown_router()
                         view = "more"
                     elif confirm_action == "repeater_disconnect":
                         repeater_disconnect()
@@ -2923,14 +3030,22 @@ def mode_live():
                     write_frame(cur_img)
                     last_draw = now
                 elif is_tap and view == "more":
-                    action = hit_more(down_x, down_y)
+                    action = hit_more(down_x, down_y, get_wifi56_conflict_idx(rep))
                     if action == "wifi24":
                         wifi24 = not wifi24
-                        set_wifi_radio_state("wifi0", wifi24)
+                        set_wifi_radio_state("wifi2g", wifi24)
                         sub_dirty = True
-                    elif action == "wifi5":
-                        wifi5 = not wifi5
-                        set_wifi_radio_state("wifi1", wifi5)
+                    elif action == "wifi_5g" and wifi_band != "5g":
+                        wifi_band = "5g"
+                        set_wifi_band_state(wifi_band)
+                        sub_dirty = True
+                    elif action == "wifi_off" and wifi_band != "off":
+                        wifi_band = "off"
+                        set_wifi_band_state(wifi_band)
+                        sub_dirty = True
+                    elif action == "wifi_6g" and wifi_band != "6g":
+                        wifi_band = "6g"
+                        set_wifi_band_state(wifi_band)
                         sub_dirty = True
                     elif action == "clock_analog" and cfg["clock_style"] != "analog":
                         cfg["clock_style"] = "analog"
@@ -2948,6 +3063,15 @@ def mode_live():
                         confirm_yes_label = "Reboot"
                         confirm_danger = True
                         confirm_action = "reboot"
+                        confirm_return_view = "more"
+                        view = "confirm"
+                        sub_dirty = True
+                    elif action == "shutdown":
+                        confirm_title = "Shutdown"
+                        confirm_message = "Shut down the router now?"
+                        confirm_yes_label = "Shutdown"
+                        confirm_danger = True
+                        confirm_action = "shutdown"
                         confirm_return_view = "more"
                         view = "confirm"
                         sub_dirty = True

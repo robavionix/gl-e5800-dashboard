@@ -85,10 +85,16 @@ doesn't ask for the password again — `remember: true` on connect already
 persists credentials to `/etc/config/repeater`; the UI checks there first
 before falling back to the keyboard.
 
-**More** (from the Home tile) — 2.4GHz/5GHz radio toggles, an Analog/Digital
+**More** (from the Home tile) — a 2.4GHz toggle and a 5GHz/6GHz three-way
+switch (5G / Off / 6G — this hardware shares one antenna path between the
+5G and 6G radios, so only one can be active). If the repeater is
+connected, whichever band conflicts with its upstream AP's band is grayed
+out and untappable, with a "Matches repeater band" note, instead of
+letting you pick a combination that can't work. Also: an Analog/Digital
 clock-style switch, a **Return to Stock UI** button (switches back
 immediately, no confirm dialog — same effect as the power-button hold
-gesture, just more discoverable/reliable), and a confirm-gated reboot.
+gesture, just more discoverable/reliable), and confirm-gated **Reboot**
+and **Shutdown** buttons side by side.
 
 **On-screen keyboard** — built because this screen has no physical or
 pop-up keyboard. Two layers (letters/symbols), persistent caps toggle.
@@ -239,6 +245,19 @@ There's no settings UI for these — edit directly:
 
 ## Known limitations
 
+- **`/sbin/wifi reload` takes ~8-10s and serializes on its own file lock**
+  (`/data/vendor/wifi/wifilock`) — firing one per toggle tap let calls pile
+  up faster than they drained during testing, leaving a backlog where the
+  UCI config and the actual broadcasting radio state fell out of sync.
+  `request_wifi_reload()` coalesces any reload requested while one is
+  already in flight into a single trailing reload rather than stacking a
+  new subprocess per request. The 2.4GHz toggle and the 5G/Off/6G switch in
+  More both go through this helper — any new control that touches
+  `wireless.*` should too.
+- **5GHz and 6GHz share one antenna path** on this hardware, so the 5G/6G
+  control in More is a three-way switch (5G / Off / 6G), never both at
+  once — and gets a segment grayed out whenever it would conflict with
+  the repeater's own upstream band (`get_wifi56_conflict_idx`).
 - **SIM2 vs eSIM**: this hardware shares one physical slot (slot 2) between
   a physical nano-SIM and the eSIM profile. There's no confirmed-safe
   documented `ubus` call to distinguish "activate eSIM profile" from
