@@ -30,8 +30,18 @@ page.
 |---|---|
 | ![Analog clock](screenshots/panel_clock.png) | ![Digital clock](screenshots/panel_clock_digital.png) |
 
-**Active SIM** — country flag, full number, a SIM1 / SIM2 / eSIM switch, a
-cellular data on/off toggle, and a data-usage bar against a cap you set.
+**Active SIM** — country flag, full number, a SIM1 / eSIM switch (SIM2 was
+removed: it and eSIM share the same physical slot on this hardware and
+behaved identically, so it wasn't a real third option), a cellular
+connect/disconnect toggle next to the flag, a data-roaming toggle, and a
+data-usage bar against a cap you set. The connect toggle shows optimistic
+feedback (flips immediately on tap, re-confirms after 2s) since this
+router's own multi-WAN manager can silently revert a manual connect when
+a healthier WAN is already active — the animation just confirms the tap
+registered, independent of whether the connection itself succeeds.
+
+Every panel's colored header also shows the active WAN connection type
+top-right (Repeater / Ethernet / 4G / 5G), refreshed periodically.
 
 **Weather** — 3-day forecast (hand-drawn icons: sun/cloud/rain/snow/fog/storm)
 for a city you pick from a scrollable list of 40+ cities.
@@ -59,6 +69,10 @@ installed" instead of breaking if OpenClash isn't on the device.
 **Repeater** (from the Home tile) — scans and lists nearby WiFi, connects to
 open networks directly or opens the on-screen keyboard for a password.
 Uses the same `ubus` `repeater` object the stock GL.iNet UI uses.
+Reconnecting to a previously-connected network doesn't ask for the
+password again — `remember: true` on connect already persists credentials
+to `/etc/config/repeater`; the UI checks there first before falling back
+to the keyboard.
 
 **More** (from the Home tile) — 2.4GHz/5GHz radio toggles, an Analog/Digital
 clock-style switch, a **Return to Stock UI** button (switches back
