@@ -22,13 +22,13 @@ RGB565). Pure Python, one file.
 | ![Monitor](screenshots/panel_monitor.png) | ![Currency](screenshots/panel_fx.png) | ![OpenClash](screenshots/panel_openclash.png) |
 
 **Home** — two small clocks (independently pickable cities/timezones,
-switchable between analog and digital from More), today's date, and two
-tiles: **Repeater** and **More**, so you never need the stock GL.iNet home
-page.
+digital by default, switchable to analog from More), today's date, and
+two tiles: **Repeater** and **More**, so you never need the stock GL.iNet
+home page.
 
-| Analog | Digital |
+| Digital (default) | Analog |
 |---|---|
-| ![Analog clock](screenshots/panel_clock.png) | ![Digital clock](screenshots/panel_clock_digital.png) |
+| ![Digital clock](screenshots/panel_clock.png) | ![Analog clock](screenshots/panel_clock_analog.png) |
 
 **Active SIM** — country flag, full number, and three toggles: **Net**
 (network registration/attach — SMS and calls work even without a
@@ -66,21 +66,24 @@ year, pulled from [Frankfurter](https://frankfurter.dev), ECB reference
 rates).
 
 **OpenClash** — on/off, Global/Rule mode, current node (flag + guessed
-country from the node name) with a tap-to-switch node list, and session
-traffic — all read from Mihomo's local REST API. Gracefully shows "not
-installed" instead of breaking if OpenClash isn't on the device.
+country from the node name) with a tap-to-switch node list, session
+traffic, and an **Update Subscription** button (runs the same script
+LuCI's own subscription page does — re-fetches every configured
+subscription, reloads if changed) — all read from Mihomo's local REST
+API. Gracefully shows "not installed" instead of breaking if OpenClash
+isn't on the device.
 
 | Repeater | More | On-screen keyboard |
 |---|---|---|
 | ![Repeater](screenshots/panel_repeater.png) | ![More](screenshots/panel_more.png) | ![Keyboard](screenshots/panel_keyboard.png) |
 
-**Repeater** (from the Home tile) — scans and lists nearby WiFi, connects to
-open networks directly or opens the on-screen keyboard for a password.
-Uses the same `ubus` `repeater` object the stock GL.iNet UI uses.
-Reconnecting to a previously-connected network doesn't ask for the
-password again — `remember: true` on connect already persists credentials
-to `/etc/config/repeater`; the UI checks there first before falling back
-to the keyboard.
+**Repeater** (from the Home tile) — scans and lists nearby WiFi as a real
+scrollable list, connects to open networks directly or opens the
+on-screen keyboard for a password. Uses the same `ubus` `repeater` object
+the stock GL.iNet UI uses. Reconnecting to a previously-connected network
+doesn't ask for the password again — `remember: true` on connect already
+persists credentials to `/etc/config/repeater`; the UI checks there first
+before falling back to the keyboard.
 
 **More** (from the Home tile) — 2.4GHz/5GHz radio toggles, an Analog/Digital
 clock-style switch, a **Return to Stock UI** button (switches back
