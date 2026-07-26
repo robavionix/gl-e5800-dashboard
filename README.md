@@ -52,7 +52,15 @@ independently, hidden entirely when not applicable, refreshed
 periodically.
 
 **Weather** — 3-day forecast (hand-drawn icons: sun/cloud/rain/snow/fog/storm)
-for a city you pick from a scrollable list of 40+ cities.
+for a city you pick from an alphabetically-sorted, scrollable list of 40+
+cities, plus a manual **Update Now** button. Tap any of the three days
+(today/tomorrow/day after — all three, so it never feels like only "today"
+is interactive) for a detail screen: feels-like temperature, UV index
+(with category), wind speed, and air quality (US AQI + category, via
+Open-Meteo's separate air-quality API) — showing "No data yet" instead of
+a wrong or blank value wherever a field genuinely isn't available.
+
+![Weather day detail](screenshots/panel_weather_detail.png)
 
 **Monitor** — bandwidth (down/up Mbps on whichever interface currently holds
 the default route, so it keeps tracking the right link through a WAN
@@ -66,12 +74,19 @@ year, pulled from [Frankfurter](https://frankfurter.dev), ECB reference
 rates).
 
 **OpenClash** — on/off, Global/Rule mode, current node (flag + guessed
-country from the node name) with a tap-to-switch node list, session
-traffic, and an **Update Subscription** button (runs the same script
-LuCI's own subscription page does — re-fetches every configured
-subscription, reloads if changed) — all read from Mihomo's local REST
-API. Gracefully shows "not installed" instead of breaking if OpenClash
+country from the node name, including common Chinese keywords like 香港/
+日本/新加坡) with a tap-to-switch, scrollable node list, session traffic,
+and an **Update Subscription** button (runs the same script LuCI's own
+subscription page does — re-fetches every configured subscription,
+reloads if changed) — all read from Mihomo's local REST API. Node names
+render in the device's bundled CJK font, so Chinese subscription/node
+names (common with 机场-style providers) display correctly instead of
+boxes. Gracefully shows "not installed" instead of breaking if OpenClash
 isn't on the device.
+
+![Node list](screenshots/panel_oc_nodes.png)
+
+*(Node names above are synthetic/demo data — not a real subscription.)*
 
 | Repeater | More | On-screen keyboard |
 |---|---|---|
@@ -83,7 +98,10 @@ on-screen keyboard for a password. Uses the same `ubus` `repeater` object
 the stock GL.iNet UI uses. Reconnecting to a previously-connected network
 doesn't ask for the password again — `remember: true` on connect already
 persists credentials to `/etc/config/repeater`; the UI checks there first
-before falling back to the keyboard.
+before falling back to the keyboard. Connecting shows a spinner ("Connecting…
+SSID") that polls the real connection state in the background and clears
+itself once actually associated (or after a 20s timeout), instead of the
+screen just sitting there with no feedback while the handshake happens.
 
 **More** (from the Home tile) — a 2.4GHz toggle and a 5GHz/6GHz three-way
 switch (5G / Off / 6G — this hardware shares one antenna path between the
@@ -245,6 +263,17 @@ There's no settings UI for these — edit directly:
 
 ## Known limitations
 
+- **Open-Meteo's air-quality API has no daily-aggregate parameter** (a
+  `daily=us_aqi_max` request errors out — confirmed live) — only hourly
+  data is available, so `fetch_air_quality()` aggregates the daily max
+  itself by grouping the hourly series by date.
+- **Cached weather JSON needs a schema check, not just an age check.**
+  Adding new fields (feels-like, UV, wind) to `fetch_weather()` without
+  checking the *shape* of an existing cache file meant a cache written
+  before that change would silently serve stale data missing the new
+  keys for up to its full 2h TTL. The cache-freshness check now also
+  requires the new fields to be present, so old-format entries refetch
+  once and self-heal rather than looking like a real "no data" case.
 - **`/sbin/wifi reload` takes ~8-10s and serializes on its own file lock**
   (`/data/vendor/wifi/wifilock`) — firing one per toggle tap let calls pile
   up faster than they drained during testing, leaving a backlog where the

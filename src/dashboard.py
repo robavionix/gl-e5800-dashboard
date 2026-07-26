@@ -60,22 +60,22 @@ MCC_COUNTRY = {
 }
 
 CITIES = [
-    ("Europe/London", "London"),
-    ("Asia/Shanghai", "Shanghai"),
+    ("Pacific/Auckland", "Auckland"),
+    ("Europe/Berlin", "Berlin"),
+    ("America/Chicago", "Chicago"),
+    ("Asia/Dubai", "Dubai"),
     ("Asia/Hong_Kong", "Hong Kong"),
-    ("Asia/Tokyo", "Tokyo"),
+    ("Europe/London", "London"),
+    ("America/Los_Angeles", "Los Angeles"),
+    ("Europe/Moscow", "Moscow"),
+    ("America/New_York", "New York"),
+    ("Europe/Paris", "Paris"),
     ("Asia/Seoul", "Seoul"),
+    ("Asia/Shanghai", "Shanghai"),
     ("Asia/Singapore", "Singapore"),
     ("Australia/Sydney", "Sydney"),
-    ("Pacific/Auckland", "Auckland"),
-    ("America/New_York", "New York"),
-    ("America/Los_Angeles", "Los Angeles"),
-    ("America/Chicago", "Chicago"),
+    ("Asia/Tokyo", "Tokyo"),
     ("America/Toronto", "Toronto"),
-    ("Europe/Paris", "Paris"),
-    ("Europe/Berlin", "Berlin"),
-    ("Asia/Dubai", "Dubai"),
-    ("Europe/Moscow", "Moscow"),
 ]
 
 CURRENCIES = ["CNY", "JPY", "CAD", "AUD", "SGD", "NZD", "GBP", "EUR", "USD", "HKD"]
@@ -87,54 +87,54 @@ CURRENCY_NAMES = {
 
 DATA_CAP_PRESETS = [None, 500, 1024, 2048, 5120, 10240, 20480]
 
-# id -> (display name, lat, lon) -- same cities as the world clock, plus coords
+# id -> (display name, lat, lon) -- same cities as the world clock, plus coords.
+# Sorted alphabetically by name (the order this list is in is exactly the
+# scroll order both this picker and the clock city picker show).
 WEATHER_CITIES = [
-    ("London", 51.5074, -0.1278),
-    ("Shanghai", 31.2304, 121.4737),
-    ("Hong Kong", 22.3193, 114.1694),
-    ("Tokyo", 35.6762, 139.6503),
-    ("Seoul", 37.5665, 126.9780),
-    ("Singapore", 1.3521, 103.8198),
-    ("Sydney", -33.8688, 151.2093),
+    ("Aberdeen", 57.1497, -2.0943),
     ("Auckland", -36.8485, 174.7633),
-    ("New York", 40.7128, -74.0060),
-    ("Los Angeles", 34.0522, -118.2437),
-    ("Chicago", 41.8781, -87.6298),
-    ("Toronto", 43.6532, -79.3832),
-    ("Paris", 48.8566, 2.3522),
+    ("Bath", 51.3811, -2.3590),
+    ("Belfast", 54.5973, -5.9301),
     ("Berlin", 52.5200, 13.4050),
-    ("Dubai", 25.2048, 55.2708),
-    ("Moscow", 55.7558, 37.6173),
-    # Jiangsu / Zhejiang / Shanghai region
-    ("Hangzhou", 30.2741, 120.1551),
-    ("Suzhou", 31.2989, 120.5853),
-    ("Nanjing", 32.0603, 118.7969),
-    ("Ningbo", 29.8683, 121.5440),
-    # UK, down to Exeter-tier cities
-    ("Edinburgh", 55.9533, -3.1883),
-    ("Glasgow", 55.8642, -4.2518),
-    ("Manchester", 53.4808, -2.2426),
-    ("Liverpool", 53.4084, -2.9916),
-    ("Leeds", 53.8008, -1.5491),
-    ("Sheffield", 53.3811, -1.4701),
     ("Birmingham", 52.4862, -1.8904),
     ("Bristol", 51.4545, -2.5879),
-    ("Newcastle", 54.9783, -1.6178),
-    ("Nottingham", 52.9548, -1.1581),
-    ("Leicester", 52.6369, -1.1398),
-    ("Cardiff", 51.4816, -3.1791),
-    ("Belfast", 54.5973, -5.9301),
-    ("Southampton", 50.9097, -1.4044),
-    ("Portsmouth", 50.8198, -1.0880),
     ("Cambridge", 52.2053, 0.1218),
-    ("Oxford", 51.7520, -1.2577),
-    ("York", 53.9600, -1.0873),
-    ("Aberdeen", 57.1497, -2.0943),
+    ("Cardiff", 51.4816, -3.1791),
+    ("Chicago", 41.8781, -87.6298),
     ("Coventry", 52.4068, -1.5197),
-    ("Plymouth", 50.3755, -4.1427),
-    ("Norwich", 52.6309, 1.2974),
-    ("Bath", 51.3811, -2.3590),
+    ("Dubai", 25.2048, 55.2708),
+    ("Edinburgh", 55.9533, -3.1883),
     ("Exeter", 50.7184, -3.5339),
+    ("Glasgow", 55.8642, -4.2518),
+    ("Hangzhou", 30.2741, 120.1551),
+    ("Hong Kong", 22.3193, 114.1694),
+    ("Leeds", 53.8008, -1.5491),
+    ("Leicester", 52.6369, -1.1398),
+    ("Liverpool", 53.4084, -2.9916),
+    ("London", 51.5074, -0.1278),
+    ("Los Angeles", 34.0522, -118.2437),
+    ("Manchester", 53.4808, -2.2426),
+    ("Moscow", 55.7558, 37.6173),
+    ("Nanjing", 32.0603, 118.7969),
+    ("New York", 40.7128, -74.0060),
+    ("Newcastle", 54.9783, -1.6178),
+    ("Ningbo", 29.8683, 121.5440),
+    ("Norwich", 52.6309, 1.2974),
+    ("Nottingham", 52.9548, -1.1581),
+    ("Oxford", 51.7520, -1.2577),
+    ("Paris", 48.8566, 2.3522),
+    ("Plymouth", 50.3755, -4.1427),
+    ("Portsmouth", 50.8198, -1.0880),
+    ("Seoul", 37.5665, 126.9780),
+    ("Shanghai", 31.2304, 121.4737),
+    ("Sheffield", 53.3811, -1.4701),
+    ("Singapore", 1.3521, 103.8198),
+    ("Southampton", 50.9097, -1.4044),
+    ("Suzhou", 31.2989, 120.5853),
+    ("Sydney", -33.8688, 151.2093),
+    ("Tokyo", 35.6762, 139.6503),
+    ("Toronto", 43.6532, -79.3832),
+    ("York", 53.9600, -1.0873),
 ]
 
 DEFAULT_CONFIG = {
@@ -381,7 +381,7 @@ def wmo_info(code):
     return _WMO_MAP.get(code, ("Unknown", "cloud"))
 
 
-def fetch_weather(city_name):
+def fetch_weather(city_name, force=False):
     entry = next((c for c in WEATHER_CITIES if c[0] == city_name), WEATHER_CITIES[0])
     _, lat, lon = entry
     cache_file = STATE_DIR / f"weather_{city_name.replace(' ', '_')}.json"
@@ -391,24 +391,32 @@ def fetch_weather(city_name):
             cached = json.loads(cache_file.read_text())
         except Exception:
             cached = None
-    if cached and time.time() - cached.get("ts", 0) < 2 * 3600:
+    cache_fresh = (cached and time.time() - cached.get("ts", 0) < 2 * 3600
+                   and cached.get("days") and "uv_max" in cached["days"][0])
+    if not force and cache_fresh:
         return cached["days"]
 
     url = (f"https://api.open-meteo.com/v1/forecast?latitude={lat}&longitude={lon}"
-           "&daily=weather_code,temperature_2m_max,temperature_2m_min,precipitation_probability_max"
+           "&daily=weather_code,temperature_2m_max,temperature_2m_min,precipitation_probability_max,"
+           "apparent_temperature_max,apparent_temperature_min,wind_speed_10m_max,uv_index_max"
            "&timezone=auto&forecast_days=3")
-    raw = run(["curl", "-s", "--max-time", "6", url])
+    raw = run(["curl", "-s", "--max-time", "6" if force else "8", url])
     try:
         data = json.loads(raw)
         daily = data["daily"]
+        n = len(daily["time"])
         days = []
-        for i in range(len(daily["time"])):
+        for i in range(n):
             days.append({
                 "date": daily["time"][i],
                 "code": daily["weather_code"][i],
                 "tmax": daily["temperature_2m_max"][i],
                 "tmin": daily["temperature_2m_min"][i],
-                "precip": daily.get("precipitation_probability_max", [None] * 3)[i],
+                "precip": daily.get("precipitation_probability_max", [None] * n)[i],
+                "feels_max": daily.get("apparent_temperature_max", [None] * n)[i],
+                "feels_min": daily.get("apparent_temperature_min", [None] * n)[i],
+                "wind_max": daily.get("wind_speed_10m_max", [None] * n)[i],
+                "uv_max": daily.get("uv_index_max", [None] * n)[i],
             })
         if days:
             STATE_DIR.mkdir(parents=True, exist_ok=True)
@@ -417,6 +425,82 @@ def fetch_weather(city_name):
     except Exception:
         pass
     return cached["days"] if cached else []
+
+
+def fetch_air_quality(city_name, force=False):
+    """Open-Meteo's air-quality API only offers hourly data (confirmed live
+    -- a daily=us_aqi_max request errors out), so daily max PM2.5/PM10/US
+    AQI are aggregated here from the hourly series ourselves. Returns []
+    per day when a value is missing (e.g. sparse coverage in some regions)
+    rather than guessing -- callers should render that as "no data yet"."""
+    entry = next((c for c in WEATHER_CITIES if c[0] == city_name), WEATHER_CITIES[0])
+    _, lat, lon = entry
+    cache_file = STATE_DIR / f"aq_{city_name.replace(' ', '_')}.json"
+    cached = None
+    if cache_file.exists():
+        try:
+            cached = json.loads(cache_file.read_text())
+        except Exception:
+            cached = None
+    if not force and cached and time.time() - cached.get("ts", 0) < 2 * 3600:
+        return cached["days"]
+
+    url = (f"https://air-quality-api.open-meteo.com/v1/air-quality?latitude={lat}&longitude={lon}"
+           "&hourly=us_aqi,pm2_5,pm10&timezone=auto&forecast_days=3")
+    raw = run(["curl", "-s", "--max-time", "6" if force else "8", url])
+    try:
+        data = json.loads(raw)
+        hourly = data["hourly"]
+        times = hourly["time"]
+        aqis = hourly.get("us_aqi", [None] * len(times))
+        pm25s = hourly.get("pm2_5", [None] * len(times))
+        pm10s = hourly.get("pm10", [None] * len(times))
+        by_date = {}
+        for i, ts in enumerate(times):
+            date = ts.split("T")[0]
+            slot = by_date.setdefault(date, {"date": date, "aqi": None, "pm2_5": None, "pm10": None})
+            for key, series in (("aqi", aqis), ("pm2_5", pm25s), ("pm10", pm10s)):
+                v = series[i]
+                if v is not None and (slot[key] is None or v > slot[key]):
+                    slot[key] = v
+        days = [by_date[d] for d in sorted(by_date)]
+        if days:
+            STATE_DIR.mkdir(parents=True, exist_ok=True)
+            cache_file.write_text(json.dumps({"ts": time.time(), "days": days}))
+            return days
+    except Exception:
+        pass
+    return cached["days"] if cached else []
+
+
+def uv_category(uv):
+    if uv is None:
+        return None
+    if uv < 3:
+        return "Low"
+    if uv < 6:
+        return "Moderate"
+    if uv < 8:
+        return "High"
+    if uv < 11:
+        return "Very High"
+    return "Extreme"
+
+
+def aqi_category(aqi):
+    if aqi is None:
+        return None
+    if aqi <= 50:
+        return "Good"
+    if aqi <= 100:
+        return "Moderate"
+    if aqi <= 150:
+        return "Unhealthy (SG)"
+    if aqi <= 200:
+        return "Unhealthy"
+    if aqi <= 300:
+        return "Very Unhealthy"
+    return "Hazardous"
 
 
 def get_sim_status(cfg):
@@ -953,17 +1037,18 @@ def update_openclash_subscription():
 
 _COUNTRY_NAME_HINTS = [
     ("HONGKONG", "Hong Kong"), ("HONG KONG", "Hong Kong"), ("HK", "Hong Kong"),
-    ("TAIWAN", "Taiwan"), ("TW", "Taiwan"),
-    ("SINGAPORE", "Singapore"), ("SG", "Singapore"),
-    ("KOREA", "South Korea"), ("KR", "South Korea"),
-    ("JAPAN", "Japan"), ("TOKYO", "Japan"), ("JP", "Japan"),
-    ("BRITAIN", "UK"), ("LONDON", "UK"), ("UK", "UK"), ("GBR", "UK"),
-    ("GERMANY", "Germany"), ("DE", "Germany"),
-    ("FRANCE", "France"), ("FR", "France"),
-    ("CHINA", "China"), ("CN", "China"),
-    ("CANADA", "Canada"), ("CA", "Canada"),
-    ("AUSTRALIA", "Australia"), ("AU", "Australia"),
-    ("AMERICA", "USA"), ("UNITED STATES", "USA"), ("US", "USA"), ("USA", "USA"),
+    ("香港", "Hong Kong"),
+    ("TAIWAN", "Taiwan"), ("TW", "Taiwan"), ("台湾", "Taiwan"),
+    ("SINGAPORE", "Singapore"), ("SG", "Singapore"), ("新加坡", "Singapore"), ("狮城", "Singapore"),
+    ("KOREA", "South Korea"), ("KR", "South Korea"), ("韩国", "South Korea"), ("韓國", "South Korea"),
+    ("JAPAN", "Japan"), ("TOKYO", "Japan"), ("JP", "Japan"), ("日本", "Japan"),
+    ("BRITAIN", "UK"), ("LONDON", "UK"), ("UK", "UK"), ("GBR", "UK"), ("英国", "UK"), ("英國", "UK"),
+    ("GERMANY", "Germany"), ("DE", "Germany"), ("德国", "Germany"), ("德國", "Germany"),
+    ("FRANCE", "France"), ("FR", "France"), ("法国", "France"), ("法國", "France"),
+    ("CHINA", "China"), ("CN", "China"), ("中国", "China"), ("中國", "China"), ("大陆", "China"), ("大陸", "China"),
+    ("CANADA", "Canada"), ("CA", "Canada"), ("加拿大", "Canada"),
+    ("AUSTRALIA", "Australia"), ("AU", "Australia"), ("澳洲", "Australia"), ("澳大利亚", "Australia"),
+    ("AMERICA", "USA"), ("UNITED STATES", "USA"), ("US", "USA"), ("USA", "USA"), ("美国", "USA"), ("美國", "USA"),
 ]
 
 
@@ -1299,6 +1384,13 @@ def draw_page_dots(d, active_idx, count=6):
 
 def _mix(c1, c2, t):
     return tuple(int(c1[i] + (c2[i] - c1[i]) * t) for i in range(3))
+
+
+def draw_spinner(d, cx, cy, r, phase_deg, color, width=3):
+    """A 270-degree arc that rotates with `phase_deg` -- classic
+    "connecting" spinner look, redrawn each frame at a new phase."""
+    start = phase_deg % 360
+    d.arc([cx - r, cy - r, cx + r, cy + r], start=start, end=start + 270, fill=color, width=width)
 
 
 def draw_signal_bars(d, x0, y_base, bars, color, dim_color, bar_w=3, gap=2, max_h=10):
@@ -1655,9 +1747,9 @@ def panel_openclash(oc, traf, conn_type=None, cell_signal=None):
             draw_flag(d, 16, 164, 24, 16, traf["node_country"])
             d.text((48, 161), traf["node_country"], font=font("default_bold", 17), fill=FG)
         else:
-            name = traf["node_name"]
-            short = name if len(name) <= 16 else name[:15] + "…"
-            d.text((16, 164), short, font=font("default_medium", 15), fill=FG)
+            f = font("default_cn_medium", 15)
+            short = truncate_to_width(d, traf["node_name"], f, W - 32)
+            d.text((16, 164), short, font=f, fill=FG)
     else:
         d.text((16, 166), "no subscription yet", font=font("default_medium", 13), fill=DIM)
 
@@ -1735,6 +1827,21 @@ def panel_monitor(net_down, net_up, net_iface, cpu_pct, ram_pct, ram_used_gb, ra
     return img
 
 
+def weather_day_labels(days):
+    labels = ["Today", "Tomorrow"]
+    for i in range(2, len(days)):
+        try:
+            wd = datetime.strptime(days[i]["date"], "%Y-%m-%d").strftime("%a")
+        except Exception:
+            wd = "Day " + str(i + 1)
+        labels.append(wd)
+    return labels
+
+
+WEATHER_DAY_ZONE = (66, 226)
+WEATHER_UPDATE_BUTTON = (50, 268, 190, 288)
+
+
 def panel_weather(cfg, days, conn_type=None, cell_signal=None):
     img, d = new_canvas()
     draw_header(d, "WEATHER", ACCENT["weather"], conn_type, cell_signal)
@@ -1745,13 +1852,7 @@ def panel_weather(cfg, days, conn_type=None, cell_signal=None):
         draw_page_dots(d, 2)
         return img
 
-    day_labels = ["Today", "Tomorrow"]
-    for i in range(2, len(days)):
-        try:
-            wd = datetime.strptime(days[i]["date"], "%Y-%m-%d").strftime("%a")
-        except Exception:
-            wd = "Day " + str(i + 1)
-        day_labels.append(wd)
+    day_labels = weather_day_labels(days)
 
     col_w = (W - 32) / 3
     for i, day in enumerate(days[:3]):
@@ -1767,7 +1868,62 @@ def panel_weather(cfg, days, conn_type=None, cell_signal=None):
     d.line([16, 236, W - 16, 236], fill=(40, 44, 54))
     today_label, _ = wmo_info(days[0]["code"])
     centered_text(d, W / 2, 246, today_label, font("default_medium", 14), FG)
+
+    bx0, by0, bx1, by1 = WEATHER_UPDATE_BUTTON
+    d.rounded_rectangle([bx0, by0, bx1, by1], radius=(by1 - by0) / 2, outline=ACCENT["weather"], width=2)
+    centered_text_box(d, bx0, by0, bx1, by1, "Update Now", font("default_medium", 12), ACCENT["weather"])
+
     draw_page_dots(d, 2)
+    return img
+
+
+WEATHER_DETAIL_ROW_H = 34
+WEATHER_DETAIL_ROWS_TOP = 178
+
+
+def panel_weather_detail(cfg, day, aq, day_label):
+    img, d = new_canvas()
+    draw_back_header(d, day_label, ACCENT["weather"])
+
+    try:
+        wd = datetime.strptime(day["date"], "%Y-%m-%d").strftime("%a %d %b")
+    except Exception:
+        wd = day["date"]
+    centered_text(d, W / 2, 42, wd, font("default_medium", 13), DIM)
+
+    label, icon_key = wmo_info(day["code"])
+    draw_weather_icon(d, W / 2, 96, 30, icon_key)
+    centered_text(d, W / 2, 130, label, font("default_medium", 14), FG)
+    centered_text(d, W / 2, 150, f"{round(day['tmax'])}° / {round(day['tmin'])}°", font("default_bold", 20), FG)
+
+    d.line([16, WEATHER_DETAIL_ROWS_TOP - 10, W - 16, WEATHER_DETAIL_ROWS_TOP - 10], fill=(40, 44, 54))
+
+    feels_max, feels_min = day.get("feels_max"), day.get("feels_min")
+    feels_val = (f"{round(feels_max)}° / {round(feels_min)}°"
+                 if feels_max is not None and feels_min is not None else "No data yet")
+    uv = day.get("uv_max")
+    uv_val = f"{round(uv)} · {uv_category(uv)}" if uv is not None else "No data yet"
+    wind = day.get("wind_max")
+    wind_val = f"{round(wind)} km/h" if wind is not None else "No data yet"
+    aqi = (aq or {}).get("aqi")
+    aqi_val = f"{round(aqi)} · {aqi_category(aqi)}" if aqi is not None else "No data yet"
+
+    rows = [
+        ("Feels Like", feels_val),
+        ("UV Index", uv_val),
+        ("Wind", wind_val),
+        ("Air Quality", aqi_val),
+    ]
+    for i, (rlabel, rval) in enumerate(rows):
+        y = WEATHER_DETAIL_ROWS_TOP + i * WEATHER_DETAIL_ROW_H
+        d.text((16, y), rlabel, font=font("default_medium", 14), fill=DIM)
+        val_color = FG if rval != "No data yet" else DIM
+        val_font = font("default_medium", 14)
+        vbbox = d.textbbox((0, 0), rval, font=val_font)
+        d.text((W - 16 - (vbbox[2] - vbbox[0]), y), rval, font=val_font, fill=val_color)
+        if i > 0:
+            d.line([16, y - 8, W - 16, y - 8], fill=(28, 32, 42))
+
     return img
 
 
@@ -1897,13 +2053,21 @@ REPEATER_LIST_TOP = 110
 REPEATER_LIST_BOTTOM = 316
 REPEATER_ROW_H = 34
 REPEATER_DISCONNECT_ZONE = (34, 108)
+CONNECT_POLL_INTERVAL = 1.0
+CONNECT_TIMEOUT = 20.0
+SPINNER_FRAME_INTERVAL = 0.1
 
 
-def panel_repeater(rep, networks, scroll_px=0):
+def panel_repeater(rep, networks, scroll_px=0, connecting_ssid=None, spin_phase=0):
     img, d = new_canvas()
     draw_back_header(d, "Repeater", ACCENT["clock"])
 
-    if rep["connected"]:
+    if connecting_ssid:
+        draw_spinner(d, 26, 52, 10, spin_phase, ACCENT["clock"])
+        d.text((46, 44), "Connecting…", font=font("default_medium", 13), fill=ACCENT["clock"])
+        label = truncate_to_width(d, connecting_ssid, font("default_bold", 15), W - 62)
+        d.text((46, 62), label, font=font("default_bold", 15), fill=FG)
+    elif rep["connected"]:
         d.text((16, 44), "Connected", font=font("default_medium", 13), fill=ACCENT["clock"])
         d.text((16, 62), rep["ssid"], font=font("default_bold", 17), fill=FG)
         sub = f"{rep['ip'] or '—'}  ·  {rep['signal']} dBm" if rep["signal"] is not None else (rep["ip"] or "")
@@ -2096,16 +2260,21 @@ SCROLL_ROW_H = 32
 SCROLL_FONT_SIZE = 15
 
 
-def panel_scroll_picker(title, accent, items, selected, scroll_px):
+def panel_scroll_picker(title, accent, items, selected, scroll_px, font_name="default_medium"):
     """Like panel_picker but with a fixed, larger row height and a vertical
-    scroll offset -- for lists too long to shrink-to-fit on one screen."""
+    scroll offset -- for lists too long to shrink-to-fit on one screen.
+    `font_name` lets callers with non-Latin content (e.g. Chinese-named
+    OpenClash nodes) swap in a CJK-capable font without affecting the
+    other pickers that share this renderer."""
     img, d = new_canvas()
     draw_back_header(d, title, accent)
 
     list_h = PICKER_BOTTOM - PICKER_TOP
     list_img = Image.new("RGB", (W, list_h), BG)
     ld = ImageDraw.Draw(list_img)
-    f = font("default_medium", SCROLL_FONT_SIZE)
+    f = font(font_name, SCROLL_FONT_SIZE)
+    check_f = font("default_medium", SCROLL_FONT_SIZE)  # CJK fonts may lack a ✓ glyph
+    max_label_w = W - 56  # room for left margin + checkmark on the right
     for i, (key, label) in enumerate(items):
         y0 = i * SCROLL_ROW_H - scroll_px
         if y0 + SCROLL_ROW_H < 0 or y0 > list_h:
@@ -2113,12 +2282,15 @@ def panel_scroll_picker(title, accent, items, selected, scroll_px):
         sel = key == selected
         if sel:
             ld.rectangle([0, y0, W, y0 + SCROLL_ROW_H], fill=(28, 40, 56))
+        label = truncate_to_width(ld, label, f, max_label_w)
         bbox = ld.textbbox((0, 0), label, font=f)
         th = bbox[3] - bbox[1]
         color = accent if sel else FG
         ld.text((20, y0 + (SCROLL_ROW_H - th) / 2 - bbox[1]), label, font=f, fill=color)
         if sel:
-            ld.text((W - 30, y0 + (SCROLL_ROW_H - th) / 2 - bbox[1]), "✓", font=f, fill=accent)
+            cbbox = ld.textbbox((0, 0), "✓", font=check_f)
+            cth = cbbox[3] - cbbox[1]
+            ld.text((W - 30, y0 + (SCROLL_ROW_H - cth) / 2 - cbbox[1]), "✓", font=check_f, fill=accent)
         if i > 0:
             ld.line([0, y0, W, y0], fill=(28, 32, 42))
     img.paste(list_img, (0, PICKER_TOP))
@@ -2167,7 +2339,7 @@ def panel_datacap_picker(cfg):
     return panel_picker("Data Cap", ACCENT["sim"], items, selected)
 
 
-def panel_node_picker(traf):
+def panel_node_picker(traf, scroll_px=0):
     if not traf["running"]:
         img, d = new_canvas()
         draw_back_header(d, "Node", ACCENT["openclash"])
@@ -2180,7 +2352,8 @@ def panel_node_picker(traf):
         centered_text(d, W / 2, 154, "add one in LuCI first", font("default_medium", 13), DIM)
         return img
     items = [(n, n) for n in traf["nodes"]]
-    return panel_picker("Node", ACCENT["openclash"], items, traf["node_name"])
+    return panel_scroll_picker("Node", ACCENT["openclash"], items, traf["node_name"], scroll_px,
+                                font_name="default_cn_medium")
 
 
 def render_sub(view, cfg, oc, traf):
@@ -2269,9 +2442,17 @@ def hit_main_openclash(x, y):
     return None
 
 
-def hit_main_weather(y):
+def hit_main_weather(x, y):
     if WEATHER_CITY_ZONE[0] <= y < WEATHER_CITY_ZONE[1]:
         return "city"
+    bx0, by0, bx1, by1 = WEATHER_UPDATE_BUTTON
+    if bx0 - 6 <= x <= bx1 + 6 and by0 - 6 <= y <= by1 + 6:
+        return "update"
+    if WEATHER_DAY_ZONE[0] <= y < WEATHER_DAY_ZONE[1] and 16 <= x <= W - 16:
+        col_w = (W - 32) / 3
+        idx = int((x - 16) / col_w)
+        if 0 <= idx < 3:
+            return f"day:{idx}"
     return None
 
 
@@ -2313,6 +2494,7 @@ def mode_preview(outdir):
     oc = get_openclash_status()
     traf = get_openclash_traffic_and_node()
     wx = fetch_weather(cfg["weather_city"])
+    aq = fetch_air_quality(cfg["weather_city"])
     rep = get_repeater_status()
     rep_networks = repeater_scan()
     sysinfo = get_system_info()
@@ -2347,6 +2529,7 @@ def mode_preview(outdir):
         ("datacap", panel_datacap_picker(cfg)),
         ("oc_nodes", panel_node_picker(traf)),
         ("weather_city", panel_weather_picker(cfg)),
+        ("weather_detail", panel_weather_detail(cfg, wx[0], aq[0] if aq else None, weather_day_labels(wx)[0]) if wx else new_canvas()[0]),
         ("more", panel_more(wifi24, wifi_band, cfg["clock_style"], get_wifi56_conflict_idx(rep))),
         ("repeater", panel_repeater(rep, rep_networks)),
         ("confirm", panel_confirm("Reboot", "Reboot the router now?", ACCENT["clock"], yes_label="Reboot", danger=True)),
@@ -2496,6 +2679,8 @@ def mode_live():
     oc = get_openclash_status()
     traf = get_openclash_traffic_and_node()
     wx = fetch_weather(cfg["weather_city"])
+    aq = fetch_air_quality(cfg["weather_city"])
+    weather_day_idx = 0
     rep = get_repeater_status()
     last_fx_check = last_sim_check = last_oc_check = last_traf_check = last_wx_check = last_rep_check = time.time()
 
@@ -2546,6 +2731,10 @@ def mode_live():
     wifi_band = "5g"
     rep_networks = []
     scan_state = {"result": None, "running": False}
+    connecting_ssid = None
+    connecting_since = 0.0
+    last_connect_check = 0.0
+    last_spinner_draw = 0.0
 
     def start_repeater_scan():
         if scan_state["running"]:
@@ -2609,7 +2798,24 @@ def mode_live():
         nonlocal view, sub_dirty, cur_img, last_draw, picker_scroll_base
         nonlocal rep, kb_target_ssid, kb_target_bssid, kb_text, kb_layer, kb_caps
         nonlocal confirm_title, confirm_message, confirm_yes_label, confirm_action, confirm_return_view, confirm_danger
+        nonlocal connecting_ssid, connecting_since, last_connect_check, last_spinner_draw
         max_scroll = repeater_scroll_max(len(rep_networks))
+
+        if connecting_ssid is not None:
+            if now - last_connect_check >= CONNECT_POLL_INTERVAL:
+                last_connect_check = now
+                fresh = get_repeater_status()
+                if fresh["connected"] and fresh["ssid"] == connecting_ssid:
+                    rep = fresh
+                    connecting_ssid = None
+                    sub_dirty = True
+                elif now - connecting_since >= CONNECT_TIMEOUT:
+                    connecting_ssid = None
+                    sub_dirty = True
+            if connecting_ssid is not None and now - last_spinner_draw >= SPINNER_FRAME_INTERVAL:
+                last_spinner_draw = now
+                sub_dirty = True
+
         with touch_state.lock:
             active = touch_state.active
             dy, dx = touch_state.dy, touch_state.dx
@@ -2645,8 +2851,9 @@ def mode_live():
                     remembered_key = None if ap["open"] else get_remembered_repeater_keys().get(ap["ssid"])
                     if ap["open"] or remembered_key is not None:
                         repeater_connect(ap["ssid"], ap["bssid"], remembered_key or "")
-                        time.sleep(0.5)
-                        rep = get_repeater_status()
+                        connecting_ssid = ap["ssid"]
+                        connecting_since = now
+                        last_connect_check = now
                         start_repeater_scan()
                         sub_dirty = True
                     else:
@@ -2661,7 +2868,8 @@ def mode_live():
                 picker_scroll_base = min(max_scroll, max(0, picker_scroll_base - final_dy))
                 write_frame(panel_repeater(rep, rep_networks, picker_scroll_base))
         elif sub_dirty:
-            write_frame(panel_repeater(rep, rep_networks, picker_scroll_base))
+            spin_phase = int(now * 240) % 360
+            write_frame(panel_repeater(rep, rep_networks, picker_scroll_base, connecting_ssid, spin_phase))
             sub_dirty = False
 
     confirm_title = confirm_message = confirm_yes_label = confirm_action = confirm_return_view = ""
@@ -2711,6 +2919,7 @@ def mode_live():
                     last_traf_check = now
                 if now - last_wx_check > 1800:
                     wx = fetch_weather(cfg["weather_city"])
+                    aq = fetch_air_quality(cfg["weather_city"])
                     last_wx_check = now
                 if now - last_rep_check > 30:
                     rep = get_repeater_status()
@@ -2781,7 +2990,7 @@ def mode_live():
                         elif name == "openclash":
                             zone = hit_main_openclash(down_x, down_y)
                         elif name == "weather":
-                            zone = hit_main_weather(down_y)
+                            zone = hit_main_weather(down_x, down_y)
 
                         new_view = None
                         if name == "clock" and zone == "city_left":
@@ -2879,6 +3088,18 @@ def mode_live():
                         elif name == "weather" and zone == "city":
                             new_view = "weather_city"
                             picker_scroll_base = 0
+                        elif name == "weather" and zone == "update":
+                            flash = cur_img.copy()
+                            fd = ImageDraw.Draw(flash)
+                            fd.rectangle([0, 236, W, WEATHER_UPDATE_BUTTON[3] + 4], fill=BG)
+                            centered_text(fd, W / 2, 246, "Updating…", font("default_medium", 13), ACCENT["weather"])
+                            write_frame(flash)
+                            wx = fetch_weather(cfg["weather_city"], force=True)
+                            aq = fetch_air_quality(cfg["weather_city"], force=True)
+                            last_wx_check = now
+                        elif name == "weather" and zone and zone.startswith("day:"):
+                            weather_day_idx = int(zone.split(":", 1)[1])
+                            new_view = "weather_detail"
 
                         neighbor_img = None
                         state = "idle"
@@ -2917,12 +3138,25 @@ def mode_live():
                         write_frame(composite(cur_img, neighbor_img, dx_now, neighbor_on_right))
 
         else:  # sub-screen
+            if view == "oc_nodes":
+                def _select_node(key):
+                    nonlocal traf, last_traf_check
+                    select_openclash_node(traf["group"], key)
+                    traf = get_openclash_traffic_and_node()
+                    last_traf_check = now
+
+                items = [(n, n) for n in traf["nodes"]]
+                handle_scroll_picker(now, items, lambda s: panel_node_picker(traf, s), _select_node)
+                time.sleep(0.012)
+                continue
+
             if view == "weather_city":
                 def _select_weather_city(key):
-                    nonlocal wx, last_wx_check
+                    nonlocal wx, aq, last_wx_check
                     cfg["weather_city"] = key
                     save_config(cfg)
                     wx = fetch_weather(key)
+                    aq = fetch_air_quality(key)
                     last_wx_check = now
 
                 items = [(name, name) for name, _, _ in WEATHER_CITIES]
@@ -2975,6 +3209,11 @@ def mode_live():
                 elif view == "keyboard_wifi":
                     img = panel_keyboard("Wi-Fi Password", kb_text, kb_layer, kb_caps,
                                          ACCENT["clock"], connect_label="Connect")
+                elif view == "weather_detail":
+                    day = wx[weather_day_idx] if weather_day_idx < len(wx) else wx[0]
+                    day_aq = aq[weather_day_idx] if weather_day_idx < len(aq) else None
+                    day_label = weather_day_labels(wx)[weather_day_idx]
+                    img = panel_weather_detail(cfg, day, day_aq, day_label)
                 else:
                     img = render_sub(view, cfg, oc, traf)
                 write_frame(img)
@@ -3029,9 +3268,10 @@ def mode_live():
                         sub_dirty = True
                     elif action == "connect":
                         repeater_connect(kb_target_ssid, kb_target_bssid, kb_text)
+                        connecting_ssid = kb_target_ssid
+                        connecting_since = now
+                        last_connect_check = now
                         kb_text = ""
-                        time.sleep(0.5)
-                        rep = get_repeater_status()
                         start_repeater_scan()
                         view = "repeater"
                         sub_dirty = True
@@ -3093,17 +3333,6 @@ def mode_live():
                         cfg["data_cap_mb"] = DATA_CAP_PRESETS[idx]
                         save_config(cfg)
                         sim = get_sim_status(cfg)
-                        view = "main"
-                        cur_img = render_main(panel_idx)
-                        write_frame(cur_img)
-                        last_draw = now
-                elif is_tap and view == "oc_nodes":
-                    idx = hit_picker(down_y, len(traf["nodes"])) if traf["nodes"] else None
-                    if idx is not None:
-                        chosen = traf["nodes"][idx]
-                        select_openclash_node(traf["group"], chosen)
-                        traf = get_openclash_traffic_and_node()
-                        last_traf_check = now
                         view = "main"
                         cur_img = render_main(panel_idx)
                         write_frame(cur_img)
