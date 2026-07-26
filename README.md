@@ -30,18 +30,26 @@ page.
 |---|---|
 | ![Analog clock](screenshots/panel_clock.png) | ![Digital clock](screenshots/panel_clock_digital.png) |
 
-**Active SIM** — country flag, full number, a SIM1 / eSIM switch (SIM2 was
-removed: it and eSIM share the same physical slot on this hardware and
-behaved identically, so it wasn't a real third option), a cellular
-connect/disconnect toggle next to the flag, a data-roaming toggle, and a
-data-usage bar against a cap you set. The connect toggle shows optimistic
-feedback (flips immediately on tap, re-confirms after 2s) since this
-router's own multi-WAN manager can silently revert a manual connect when
-a healthier WAN is already active — the animation just confirms the tap
-registered, independent of whether the connection itself succeeds.
+**Active SIM** — country flag, full number, and three toggles: **Net**
+(network registration/attach — SMS and calls work even without a
+cellular data session), **Data** (the actual cellular data session), and
+**Roam** (data roaming permission for this SIM). A SIM1 / eSIM switch
+(SIM2 was removed: it and eSIM share the same physical slot on this
+hardware and behaved identically, so it wasn't a real third option) and
+a data-usage bar against a cap you set round it out.
 
-Every panel's colored header also shows the active WAN connection type
-top-right (Repeater / Ethernet / 4G / 5G), refreshed periodically.
+The Data toggle shows optimistic feedback (flips immediately on tap) and
+only re-confirms after 2s and snaps back if it didn't take **when a
+repeater/ethernet WAN is already active** — this router's own multi-WAN
+manager can silently revert a manual cellular connect in that case. With
+no competing WAN, the tap is trusted outright and left to connect in the
+background, since there's nothing to revert it.
+
+Every panel's colored header also shows, phone-status-bar style: cellular
+signal bars + radio tech (4G/5G) when the modem has signal, and the
+active WAN connection type (Repeater/Ethernet/4G/5G) — each shown
+independently, hidden entirely when not applicable, refreshed
+periodically.
 
 **Weather** — 3-day forecast (hand-drawn icons: sun/cloud/rain/snow/fog/storm)
 for a city you pick from a scrollable list of 40+ cities.

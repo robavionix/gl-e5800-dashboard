@@ -453,11 +453,19 @@ def get_sim_status(cfg):
 
     data_iface = ubus_call("network.interface.modem_cpu", "status")
     data_up = bool(data_iface.get("up"))
+    # "attached" (network registration -- SMS/calls) is a different thing
+    # from "data_up" (a live PDP data session on modem_cpu): the modem can
+    # be registered with the network without the data interface being up
+    # at all, which is exactly the "receives SMS but not using cellular
+    # for data" mode this is meant to represent. No direct ubus getter for
+    # registration state, so it's inferred from whether cell_info is
+    # currently populated at all (see _get_active_cell_info).
+    attached = bool(_get_active_cell_info().get("mode"))
 
     return {
         "slot": slot, "country": country, "phone": phone, "traffic_mb": traffic_mb,
         "cap_mb": cfg.get("data_cap_mb"), "sim_choice": sim_choice, "data_up": data_up,
-        "iccid": iccid, "roaming": roaming,
+        "iccid": iccid, "attached": attached, "roaming": roaming,
     }
 
 
@@ -472,6 +480,20 @@ def set_sim_choice(choice):
 
 def set_cellular_data_enabled(enabled):
     subprocess.Popen(["ifup" if enabled else "ifdown", "modem_cpu"])
+
+
+def set_network_attach_enabled(enabled):
+    """Toggle the modem's network registration (SMS/calls) independent of
+    the cellular DATA session (data_up / set_cellular_data_enabled) --
+    airplane-mode style: enabled=True registers with the network,
+    enabled=False fully detaches (no signal, no SMS/calls). This is the
+    "attach without necessarily using cellular for data" mode -- can stay
+    registered while a WiFi repeater/ethernet handles actual internet
+    traffic. NOTE: cellular.modem has no paired getter for this, so
+    get_sim_status infers current "attached" state from whether cell_info
+    is populated at all, rather than tracking a separate flag."""
+    run(["ubus", "call", "cellular.modem", "set_airplane_mode",
+         json.dumps({"enable": not enabled})])
 
 
 def set_roaming_enabled(iccid, enabled):
@@ -619,7 +641,36 @@ def get_wan_iface():
     return best_iface
 
 
-def get_wan_conn_type():
+def has_competing_wan():
+    """True if a non-cellular WAN (repeater WiFi or ethernet) currently
+    holds the default route. Confirmed live: this router's own backhaul
+    manager (QCMAP/kmwan) will silently revert a manual cellular connect
+    while a healthier WAN is already active, so the connect toggle's
+    optimistic-then-verify animation is only needed in that case -- with
+    no competing WAN, there's nothing to revert it, so the tap can just
+    be trusted and left to search/connect in the background."""
+    iface = get_wan_iface()
+    return bool(iface) and not ("rmnet" in iface or "modem" in iface)
+
+
+def _get_active_cell_info():
+    """cell_info dict (mode/rsrp/etc) for the currently-active SIM slot, or
+    {} if unavailable. Shared by get_wan_conn_type/get_cell_signal so they
+    don't each make their own redundant ubus round trip."""
+    modem = ubus_call("cellular.modem", "status", {"bus": "cpu"})
+    try:
+        slot = int(modem.get("current_sim_slot", 1))
+    except (TypeError, ValueError):
+        slot = 1
+    net = ubus_call("cellular.network", "info", {"bus": "cpu", "slot": slot})
+    for n in net.get("networks", []):
+        cell = n.get("cell_info") or {}
+        if cell.get("mode"):
+            return cell
+    return {}
+
+
+def get_wan_conn_type(cell_info=None):
     """Short label for the header's connection-status indicator: Repeater
     (WiFi client uplink), Ethernet, or 4G/5G (cellular, radio access tech
     read from cellular.network's cell_info.mode, e.g. "LTE FDD" -> 4G,
@@ -635,24 +686,43 @@ def get_wan_conn_type():
     if iface.startswith("eth"):
         return "Ethernet"
     if "rmnet" in iface or "modem" in iface:
-        modem = ubus_call("cellular.modem", "status", {"bus": "cpu"})
-        try:
-            slot = int(modem.get("current_sim_slot", 1))
-        except (TypeError, ValueError):
-            slot = 1
-        net = ubus_call("cellular.network", "info", {"bus": "cpu", "slot": slot})
-        mode = ""
-        for n in net.get("networks", []):
-            mode = (n.get("cell_info") or {}).get("mode", "")
-            if mode:
-                break
-        mode_u = mode.upper()
+        mode_u = (cell_info or _get_active_cell_info()).get("mode", "").upper()
         if "NR" in mode_u:
             return "5G"
         if mode_u:
             return "4G"
         return "Cellular"
     return None
+
+
+def get_cell_signal(cell_info=None):
+    """(bars 0-4, "4G"/"5G") for the active SIM's current cellular signal,
+    derived from RSRP (dBm); None if not registered/no signal at all --
+    matches ordinary phone status-bar behavior of hiding the cellular
+    indicator entirely when there's nothing to show. Independent of
+    whether cellular is actually the active WAN (get_wan_conn_type) --
+    this reflects the modem's own registration/signal, the same way a
+    phone shows signal bars regardless of whether you're on WiFi."""
+    cell = cell_info if cell_info is not None else _get_active_cell_info()
+    mode = cell.get("mode", "")
+    if not mode:
+        return None
+    try:
+        rsrp = int(cell.get("rsrp"))
+    except (TypeError, ValueError):
+        return None
+    if rsrp >= -80:
+        bars = 4
+    elif rsrp >= -95:
+        bars = 3
+    elif rsrp >= -105:
+        bars = 2
+    elif rsrp >= -115:
+        bars = 1
+    else:
+        bars = 0
+    rat = "5G" if "NR" in mode.upper() else "4G"
+    return bars, rat
 
 
 def sample_bandwidth(prev):
@@ -1134,13 +1204,45 @@ def draw_page_dots(d, active_idx, count=6):
         d.ellipse([x - r, y - r, x + r, y + r], fill=color)
 
 
-def draw_header(d, label, accent, conn_type=None):
+def _mix(c1, c2, t):
+    return tuple(int(c1[i] + (c2[i] - c1[i]) * t) for i in range(3))
+
+
+def draw_signal_bars(d, x0, y_base, bars, color, dim_color, bar_w=3, gap=2, max_h=10):
+    """4 ascending bars (classic phone signal icon), bottom-aligned at
+    y_base, growing upward. `bars` (0-4) of them filled with `color`, the
+    rest drawn dim (still visible against the colored header, just muted)."""
+    for i in range(4):
+        bh = max_h * (i + 1) / 4
+        bx0 = x0 + i * (bar_w + gap)
+        fill = color if i < bars else dim_color
+        d.rectangle([bx0, y_base - bh, bx0 + bar_w, y_base], fill=fill)
+
+
+def draw_header(d, label, accent, conn_type=None, cell_signal=None):
     d.rectangle([0, 0, W, 34], fill=accent)
     d.text((14, 8), label, font=font("default_bold", 18), fill=BG)
+
+    right_x = W - 14
     if conn_type:
         f = font("default_medium", 12)
         bbox = d.textbbox((0, 0), conn_type, font=f)
-        d.text((W - 14 - (bbox[2] - bbox[0]), 10), conn_type, font=f, fill=BG)
+        tw = bbox[2] - bbox[0]
+        d.text((right_x - tw, 10), conn_type, font=f, fill=BG)
+        right_x -= tw + 8
+
+    if cell_signal:
+        bars, rat = cell_signal
+        if conn_type != rat:
+            f2 = font("default_medium", 11)
+            bbox2 = d.textbbox((0, 0), rat, font=f2)
+            tw2 = bbox2[2] - bbox2[0]
+            d.text((right_x - tw2, 11), rat, font=f2, fill=BG)
+            right_x -= tw2 + 4
+        bars_w = 4 * 3 + 3 * 2
+        dim = _mix(BG, accent, 0.55)
+        draw_signal_bars(d, right_x - bars_w, 23, bars, BG, dim)
+        right_x -= bars_w + 6
 
 
 def draw_back_header(d, label, accent):
@@ -1253,7 +1355,10 @@ FX_BUTTON = (50, 268, 190, 288)
 
 SIM_CHOICE_RECT = (16, 86, 156, 110)
 SIM_ROAM_TOGGLE_RECT = (172, 88, 216, 108)
-SIM_CONNECT_TOGGLE_RECT = (172, 59, 216, 79)
+# Network (attach) and Data toggles sit side by side to the right of the
+# country name; Data (right) is right-aligned to the panel edge.
+SIM_ATTACH_TOGGLE_RECT = (142, 59, 180, 79)
+SIM_DATA_TOGGLE_RECT = (186, 59, 224, 79)
 SIM_DATA_ZONE = (172, 296)
 
 OC_TOGGLE_RECT = (172, 38, 218, 60)
@@ -1269,10 +1374,10 @@ PANEL_NAMES = ["clock", "sim", "weather", "monitor", "fx", "openclash"]
 
 # ---------- main panels ----------
 
-def panel_clock(cfg, rep, conn_type=None):
+def panel_clock(cfg, rep, conn_type=None, cell_signal=None):
     from zoneinfo import ZoneInfo
     img, d = new_canvas()
-    draw_header(d, "HOME", ACCENT["clock"], conn_type)
+    draw_header(d, "HOME", ACCENT["clock"], conn_type, cell_signal)
     tz_l, tz_r = cfg["clock_top"], cfg["clock_bottom"]
     dt_l = datetime.now(ZoneInfo(tz_l))
     dt_r = datetime.now(ZoneInfo(tz_r))
@@ -1319,9 +1424,9 @@ def draw_fx_row(d, y_label, y_value, from_code, rate, to_code):
     d.text((x, y_label), f" {to_code} ›", font=f_label, fill=DIM)
 
 
-def panel_fx(cfg, fx, fx_range, conn_type=None):
+def panel_fx(cfg, fx, fx_range, conn_type=None, cell_signal=None):
     img, d = new_canvas()
-    draw_header(d, "CURRENCY", ACCENT["fx"], conn_type)
+    draw_header(d, "CURRENCY", ACCENT["fx"], conn_type, cell_signal)
     top_from, top_to = cfg["fx_top_from"], cfg["fx_top_to"]
     bot_from, bot_to = cfg["fx_bottom_from"], cfg["fx_bottom_to"]
     top_rate = rate_between(top_from, top_to, fx)
@@ -1360,17 +1465,21 @@ SIM_CHOICE_LABELS = ["SIM1", "eSIM"]
 SIM_CHOICE_KEYS = ["sim1", "esim"]
 
 
-def panel_sim(cfg, sim, conn_type=None):
+def panel_sim(cfg, sim, conn_type=None, cell_signal=None):
     img, d = new_canvas()
-    draw_header(d, "ACTIVE SIM", ACCENT["sim"], conn_type)
+    draw_header(d, "ACTIVE SIM", ACCENT["sim"], conn_type, cell_signal)
     country = sim["country"] or "unknown"
     d.text((16, 44), f"Slot {sim['slot']}", font=font("default_medium", 14), fill=DIM)
-    centered_text(d, 194, 44, "Data", font("default_medium", 10), DIM)
     draw_flag(d, 16, 60, 26, 18, country)
     d.text((50, 57), country, font=font("default_bold", 20), fill=FG)
 
-    tx0, ty0, tx1, ty1 = SIM_CONNECT_TOGGLE_RECT
-    draw_toggle(d, tx0, ty0, sim["data_up"], ACCENT["sim"], w=tx1 - tx0, h=ty1 - ty0)
+    ax0, ay0, ax1, ay1 = SIM_ATTACH_TOGGLE_RECT
+    centered_text(d, (ax0 + ax1) / 2, 44, "Net", font("default_medium", 10), DIM)
+    draw_toggle(d, ax0, ay0, sim["attached"], ACCENT["sim"], w=ax1 - ax0, h=ay1 - ay0)
+
+    dx0, dy0, dx1, dy1 = SIM_DATA_TOGGLE_RECT
+    centered_text(d, (dx0 + dx1) / 2, 44, "Data", font("default_medium", 10), DIM)
+    draw_toggle(d, dx0, dy0, sim["data_up"], ACCENT["sim"], w=dx1 - dx0, h=dy1 - dy0)
 
     cx0, cy0, cx1, cy1 = SIM_CHOICE_RECT
     sel_idx = SIM_CHOICE_KEYS.index(sim["sim_choice"])
@@ -1409,9 +1518,9 @@ def panel_sim(cfg, sim, conn_type=None):
     return img
 
 
-def panel_openclash(oc, traf, conn_type=None):
+def panel_openclash(oc, traf, conn_type=None, cell_signal=None):
     img, d = new_canvas()
-    draw_header(d, "OPENCLASH", ACCENT["openclash"], conn_type)
+    draw_header(d, "OPENCLASH", ACCENT["openclash"], conn_type, cell_signal)
 
     if not oc["installed"]:
         centered_text(d, W / 2, 130, "OpenClash isn't installed", font("default_medium", 14), DIM)
@@ -1464,9 +1573,9 @@ MONITOR_CPU_BAR = (16, 144, W - 16, 158)
 MONITOR_RAM_BAR = (16, 200, W - 16, 214)
 
 
-def panel_monitor(net_down, net_up, net_iface, cpu_pct, ram_pct, ram_used_gb, ram_total_gb, temp_c, uptime_min, conn_type=None):
+def panel_monitor(net_down, net_up, net_iface, cpu_pct, ram_pct, ram_used_gb, ram_total_gb, temp_c, uptime_min, conn_type=None, cell_signal=None):
     img, d = new_canvas()
-    draw_header(d, "MONITOR", ACCENT["monitor"], conn_type)
+    draw_header(d, "MONITOR", ACCENT["monitor"], conn_type, cell_signal)
 
     bw_label = f"Bandwidth · {net_iface}" if net_iface else "Bandwidth"
     d.text((16, 44), bw_label, font=font("default_medium", 13), fill=DIM)
@@ -1518,9 +1627,9 @@ def panel_monitor(net_down, net_up, net_iface, cpu_pct, ram_pct, ram_used_gb, ra
     return img
 
 
-def panel_weather(cfg, days, conn_type=None):
+def panel_weather(cfg, days, conn_type=None, cell_signal=None):
     img, d = new_canvas()
-    draw_header(d, "WEATHER", ACCENT["weather"], conn_type)
+    draw_header(d, "WEATHER", ACCENT["weather"], conn_type, cell_signal)
     d.text((16, 44), f"{cfg['weather_city']}  ›", font=font("default_medium", 16), fill=FG)
 
     if not days:
@@ -1969,15 +2078,16 @@ def hit_main_fx(x, y):
 
 
 def hit_main_sim(x, y):
-    tx0, ty0, tx1, ty1 = SIM_CONNECT_TOGGLE_RECT
-    # Extra padding upward (vs. the usual +/-8) so the "Data" label at y=44
-    # -- separated from the toggle itself by a real gap -- is part of the
-    # same tap target rather than a dead zone above it. (The "Roam" label
-    # sits *below* its toggle instead, close enough that the usual +/-8
-    # padding already covers it -- this is why only this one was reported
-    # as unresponsive.)
-    if tx0 - 8 <= x <= tx1 + 8 and ty0 - 20 <= y <= ty1 + 8:
-        return "connect_toggle"
+    ax0, ay0, ax1, ay1 = SIM_ATTACH_TOGGLE_RECT
+    dx0, dy0, dx1, dy1 = SIM_DATA_TOGGLE_RECT
+    # Network and Data toggles sit side by side with their labels above
+    # (y=44) -- treated as one combined tap region split at the midpoint
+    # of the gap between them, same reasoning as the earlier fix: a label
+    # separated from its toggle by a real gap needs the tap zone extended
+    # up to cover it, not just tight padding around the toggle itself.
+    if min(ax0, dx0) - 8 <= x <= max(ax1, dx1) + 8 and 39 <= y <= max(ay1, dy1) + 8:
+        mid = (ax1 + dx0) / 2
+        return "attach_toggle" if x < mid else "data_toggle"
     cx0, cy0, cx1, cy1 = SIM_CHOICE_RECT
     if cx0 - 6 <= x <= cx1 + 6 and cy0 - 6 <= y <= cy1 + 6:
         seg_w = (cx1 - cx0) / len(SIM_CHOICE_KEYS)
@@ -2060,16 +2170,18 @@ def mode_preview(outdir):
     _, cpu_pct = sample_cpu(cpu_sample)
     ram_pct, ram_used_gb, ram_total_gb = get_ram_stats()
     temp_c = get_temp_c()
-    conn_type = get_wan_conn_type()
+    _cell_info = _get_active_cell_info()
+    conn_type = get_wan_conn_type(_cell_info)
+    cell_signal = get_cell_signal(_cell_info)
     cfg_digital = dict(cfg, clock_style="digital")
     screens = [
-        ("clock", panel_clock(cfg, rep, conn_type)),
-        ("clock_digital", panel_clock(cfg_digital, rep, conn_type)),
-        ("sim", panel_sim(cfg, sim, conn_type)),
-        ("weather", panel_weather(cfg, wx, conn_type)),
-        ("monitor", panel_monitor(net_down, net_up, net_iface, cpu_pct, ram_pct, ram_used_gb, ram_total_gb, temp_c, sysinfo["uptime_min"], conn_type)),
-        ("fx", panel_fx(cfg, fx, "month", conn_type)),
-        ("openclash", panel_openclash(oc, traf, conn_type)),
+        ("clock", panel_clock(cfg, rep, conn_type, cell_signal)),
+        ("clock_digital", panel_clock(cfg_digital, rep, conn_type, cell_signal)),
+        ("sim", panel_sim(cfg, sim, conn_type, cell_signal)),
+        ("weather", panel_weather(cfg, wx, conn_type, cell_signal)),
+        ("monitor", panel_monitor(net_down, net_up, net_iface, cpu_pct, ram_pct, ram_used_gb, ram_total_gb, temp_c, sysinfo["uptime_min"], conn_type, cell_signal)),
+        ("fx", panel_fx(cfg, fx, "month", conn_type, cell_signal)),
+        ("openclash", panel_openclash(oc, traf, conn_type, cell_signal)),
         ("city_top", panel_city_picker("top", cfg)),
         ("city_bottom", panel_city_picker("bottom", cfg)),
         ("fx_top_from", panel_currency_picker("top", "from", cfg)),
@@ -2237,25 +2349,27 @@ def mode_live():
     temp_c = get_temp_c()
     mon_uptime_min = get_system_info()["uptime_min"]
     last_mon_check = time.time()
-    conn_type = get_wan_conn_type()
+    _cell_info = _get_active_cell_info()
+    conn_type = get_wan_conn_type(_cell_info)
+    cell_signal = get_cell_signal(_cell_info)
     last_conn_check = time.time()
 
     def render_main(idx):
         name = PANEL_NAMES[idx]
         if name == "clock":
-            return panel_clock(cfg, rep, conn_type)
+            return panel_clock(cfg, rep, conn_type, cell_signal)
         elif name == "fx":
-            return panel_fx(cfg, fx, fx_range, conn_type)
+            return panel_fx(cfg, fx, fx_range, conn_type, cell_signal)
         elif name == "sim":
             display_sim = sim if sim_connect_override is None else dict(sim, data_up=sim_connect_override)
-            return panel_sim(cfg, display_sim, conn_type)
+            return panel_sim(cfg, display_sim, conn_type, cell_signal)
         elif name == "openclash":
-            return panel_openclash(oc, traf, conn_type)
+            return panel_openclash(oc, traf, conn_type, cell_signal)
         elif name == "weather":
-            return panel_weather(cfg, wx, conn_type)
+            return panel_weather(cfg, wx, conn_type, cell_signal)
         else:
             net_iface = net_sample[0] if net_sample else None
-            return panel_monitor(net_down, net_up, net_iface, cpu_pct, ram_pct, ram_used_gb, ram_total_gb, temp_c, mon_uptime_min, conn_type)
+            return panel_monitor(net_down, net_up, net_iface, cpu_pct, ram_pct, ram_used_gb, ram_total_gb, temp_c, mon_uptime_min, conn_type, cell_signal)
 
     panel_idx = 0
     view = "main"
@@ -2388,9 +2502,12 @@ def mode_live():
                     mon_uptime_min = get_system_info()["uptime_min"]
                     last_mon_check = now
                 if now - last_conn_check > 20:
-                    conn_type = get_wan_conn_type()
+                    _cell_info = _get_active_cell_info()
+                    conn_type = get_wan_conn_type(_cell_info)
+                    cell_signal = get_cell_signal(_cell_info)
                     last_conn_check = now
-                if sim_connect_override is not None and now >= sim_connect_override_until:
+                if (sim_connect_override is not None and sim_connect_override_until is not None
+                        and now >= sim_connect_override_until):
                     sim = get_sim_status(cfg)
                     sim_connect_override = None
                 if now - last_draw >= 1:
@@ -2489,11 +2606,29 @@ def mode_live():
                             if choice != sim["sim_choice"]:
                                 set_sim_choice(choice)
                                 sim = get_sim_status(cfg)
-                        elif name == "sim" and zone == "connect_toggle":
+                        elif name == "sim" and zone == "attach_toggle":
+                            # Network registration only (SMS/calls) --
+                            # doesn't compete with a WiFi/ethernet WAN the
+                            # way the data toggle below can, so no
+                            # optimistic/snap-back dance needed here.
+                            set_network_attach_enabled(not sim["attached"])
+                            sim = get_sim_status(cfg)
+                        elif name == "sim" and zone == "data_toggle":
                             new_state = not sim["data_up"]
                             set_cellular_data_enabled(new_state)
                             sim_connect_override = new_state
-                            sim_connect_override_until = now + CONNECT_OPTIMISTIC_SECONDS
+                            if new_state and has_competing_wan():
+                                # Turning on while repeater/ethernet is
+                                # already active: that WAN's manager may
+                                # revert this, so verify and snap back.
+                                sim_connect_override_until = now + CONNECT_OPTIMISTIC_SECONDS
+                            else:
+                                # Turning off always "works" from the UI's
+                                # perspective, and turning on with nothing
+                                # competing has nothing to revert it --
+                                # trust the tap, let it search/connect in
+                                # the background without second-guessing.
+                                sim_connect_override_until = None
                         elif name == "sim" and zone == "roam_toggle":
                             set_roaming_enabled(sim["iccid"], not sim["roaming"])
                             sim = get_sim_status(cfg)
