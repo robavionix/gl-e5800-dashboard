@@ -1,5 +1,5 @@
 Package: gl-e5800-dashboard
-Version: 3.0.0
+Version: 3.1.0
 Architecture: all
 Maintainer: robavionix
 Section: utils
@@ -8,6 +8,6 @@ Depends: python3, python3-numpy, libtiff6, zoneinfo-europe, zoneinfo-asia, zonei
 Source: https://github.com/robavionix/gl-e5800-dashboard
 Description: Custom touch dashboard for the GL-E5800's built-in screen.
  Replaces the stock gl_screen UI with a fully interactive touch dashboard
- (clock, active SIM, weather, bandwidth/device monitor, currency, OpenClash).
- Keeps the stock UI installed and switchable back at any time via
- /root/dashboard/toggle.sh.
+ (clock, active SIM + WireGuard, SMS inbox, weather, bandwidth/device
+ monitor, currency, OpenClash). Keeps the stock UI installed and
+ switchable back at any time via /root/dashboard/toggle.sh.

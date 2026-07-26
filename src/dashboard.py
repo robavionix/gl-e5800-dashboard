@@ -85,7 +85,10 @@ CURRENCY_NAMES = {
     "EUR": "Euro", "USD": "US Dollar", "HKD": "Hong Kong Dollar",
 }
 
-DATA_CAP_PRESETS = [None, 500, 1024, 2048, 5120, 10240, 20480]
+DATA_CAP_PRESETS = [
+    None, 500, 1024, 2048, 3072, 5120, 10240, 15360, 20480, 30720,
+    51200, 76800, 102400, 153600, 204800, 307200, 512000, 768000, 1024000,
+]
 
 # id -> (display name, lat, lon) -- same cities as the world clock, plus coords.
 # Sorted alphabetically by name (the order this list is in is exactly the
@@ -501,6 +504,128 @@ def aqi_category(aqi):
     if aqi <= 300:
         return "Very Unhealthy"
     return "Hazardous"
+
+
+# ---------- SMS ----------
+
+# smstools3 (`smsd`, confirmed live and actually running against this
+# modem via a local AT-over-TCP bridge on 127.0.0.1:44383) drops each
+# received message as a plain-text file here -- standard "SMS Server
+# Tools 3" spool format (`From:`/`Sent:` header lines, blank line, then
+# the body). Read-only: this only lists messages, it never moves or
+# deletes spool files, so it can't interfere with any other consumer
+# (e.g. GL.iNet's own SMS forwarding) that might also be watching these
+# directories.
+SMS_SPOOL_DIRS = ["/etc/spool/sms/incoming", "/etc/spool/sms/checked"]
+
+
+def _parse_sms_file(path):
+    """smstools3's header is always plain ASCII, but the body's actual byte
+    encoding depends on the `Alphabet` header -- confirmed live against a
+    real received message: `Alphabet: UCS2` bodies are raw big-endian
+    UTF-16 bytes (not UTF-8 text, not hex-encoded), while plain-ASCII
+    messages come through as `Alphabet: UTF-8`. Blindly UTF-8-decoding a
+    UCS2 body (the original approach) corrupts every non-ASCII message --
+    confirmed by a real device test that showed Chinese text as mojibake."""
+    try:
+        raw = path.read_bytes()
+    except Exception:
+        return None
+    sep = raw.find(b"\n\n")
+    header_bytes, body_bytes = (raw, b"") if sep == -1 else (raw[:sep], raw[sep + 2:])
+    header = header_bytes.decode("ascii", errors="replace")
+    fields = {}
+    for line in header.splitlines():
+        if ":" in line:
+            k, v = line.split(":", 1)
+            fields[k.strip().lower()] = v.strip()
+    alphabet = fields.get("alphabet", "").upper()
+    if alphabet in ("UCS2", "UCS-2", "UTF-16", "UTF16"):
+        body = body_bytes.decode("utf-16-be", errors="replace")
+    else:
+        body = body_bytes.decode("utf-8", errors="replace")
+    sent_raw = fields.get("sent", "")
+    try:
+        sent = datetime.strptime(sent_raw, "%y-%m-%d %H:%M:%S")
+    except Exception:
+        sent = None
+    return {
+        "from": fields.get("from", "Unknown"),
+        "sent": sent,
+        "sent_raw": sent_raw,
+        "body": body.strip(),
+    }
+
+
+def get_sms_messages():
+    messages = []
+    for d in SMS_SPOOL_DIRS:
+        p = Path(d)
+        if not p.is_dir():
+            continue
+        for f in p.iterdir():
+            if not f.is_file():
+                continue
+            msg = _parse_sms_file(f)
+            if msg:
+                messages.append(msg)
+    messages.sort(key=lambda m: m["sent"] or datetime.min, reverse=True)
+    return messages
+
+
+# ---------- WireGuard ----------
+
+# GL.iNet stores each added WireGuard peer as its own `wireguard.peer_NNNN`
+# UCI section (name, keys, endpoint, allowed_ips -- all of it), separate
+# from the actual `network` interface that carries traffic. Confirmed live
+# by reading /lib/netifd/proto/wgclient.sh and the wireguard hotplug
+# script: bringing a peer online just means creating a `network.wgclient`
+# interface with `proto=wgclient` and `config=<peer section name>` --
+# everything else (keys, endpoint, allowed_ips) is pulled live from that
+# wireguard.<config> section by the proto script itself at ifup time, so
+# nothing secret needs to be duplicated into `network`.
+WG_IFACE = "wgclient"
+
+
+def get_wireguard_peers():
+    out = run(["uci", "show", "wireguard"])
+    peers = []
+    for line in out.splitlines():
+        if line.startswith("wireguard.") and line.endswith("=peers"):
+            section = line[len("wireguard."):-len("=peers")]
+            name = uci_get(f"wireguard.{section}.name") or section
+            peers.append({"id": section, "name": name})
+    return peers
+
+
+def get_wireguard_active():
+    """None if the wgclient interface doesn't exist or isn't up, else the
+    wireguard.peer_NNNN id it's currently configured to carry."""
+    config = uci_get(f"network.{WG_IFACE}.config")
+    if not config:
+        return None
+    status = ubus_call(f"network.interface.{WG_IFACE}", "status")
+    return config if status.get("up") else None
+
+
+def set_wireguard_enabled(peer_id, enabled):
+    if enabled:
+        uci_set(f"network.{WG_IFACE}", "interface")
+        uci_set(f"network.{WG_IFACE}.proto", "wgclient")
+        uci_set(f"network.{WG_IFACE}.config", peer_id)
+        subprocess.Popen(["ifup", WG_IFACE])
+    else:
+        subprocess.Popen(["ifdown", WG_IFACE])
+
+
+_DEMO_SMS_MESSAGES = [
+    {"from": "+447700900123", "sent": datetime(2026, 7, 26, 14, 30, 0),
+     "sent_raw": "26-07-26 14:30:00",
+     "body": "Your verification code is 481920. It expires in 10 minutes."},
+    {"from": "+8613800138000", "sent": datetime(2026, 7, 25, 9, 15, 22),
+     "sent_raw": "26-07-25 09:15:22",
+     "body": "您好，您的验证码是123456，10分钟内有效，请勿泄露给他人。"},
+]
 
 
 def get_sim_status(cfg):
@@ -1364,6 +1489,19 @@ def _icon_lock(d, cx, cy, r, color):
     d.rounded_rectangle([cx - r, cy - r * 0.2, cx + r, cy + r], radius=2, fill=color)
 
 
+def _icon_shield(d, cx, cy, r, color):
+    pts = [(cx, cy - r), (cx + r, cy - r * 0.5), (cx + r, cy + r * 0.3),
+           (cx, cy + r), (cx - r, cy + r * 0.3), (cx - r, cy - r * 0.5)]
+    d.polygon(pts, outline=color, width=2)
+
+
+def _icon_sms(d, cx, cy, r, color):
+    x0, y0, x1, y1 = cx - r, cy - r * 0.7, cx + r, cy + r * 0.7
+    d.rounded_rectangle([x0, y0, x1, y1], radius=3, outline=color, width=2)
+    d.line([x0, y0, cx, cy + r * 0.15], fill=color, width=2)
+    d.line([cx, cy + r * 0.15, x1, y0], fill=color, width=2)
+
+
 # ---------- widgets ----------
 
 def new_canvas():
@@ -1490,6 +1628,23 @@ def truncate_to_width(d, text, f, max_w):
     return text[:1] + "…"
 
 
+def wrap_text_to_lines(d, text, f, max_w):
+    """Character-by-character wrap (not word-split) so it works for both
+    space-separated scripts and CJK, which has no spaces between words."""
+    lines = []
+    for paragraph in text.split("\n"):
+        line = ""
+        for ch in paragraph:
+            candidate = line + ch
+            if line and d.textbbox((0, 0), candidate, font=f)[2] > max_w:
+                lines.append(line)
+                line = ch
+            else:
+                line = candidate
+        lines.append(line)
+    return lines
+
+
 def draw_tile(d, x0, y0, x1, y1, icon_fn, label, subtitle, accent):
     d.rounded_rectangle([x0, y0, x1, y1], radius=10, fill=(22, 28, 40), outline=(42, 48, 60), width=1)
     cx = (x0 + x1) / 2
@@ -1543,6 +1698,7 @@ CLOCK_LEFT_ZONE = (0, 34, W // 2, 142)
 CLOCK_RIGHT_ZONE = (W // 2, 34, W, 142)
 REPEATER_TILE = (8, 150, 116, 244)
 MORE_TILE = (124, 150, 232, 244)
+SMS_TILE = (8, 250, 232, 296)
 
 FX_TOP_ZONE = (34, 122)
 FX_BOTTOM_ZONE = (128, 216)
@@ -1551,12 +1707,13 @@ FX_STATUS_Y = 252
 FX_BUTTON = (50, 268, 190, 288)
 
 SIM_CHOICE_RECT = (16, 86, 156, 110)
-SIM_ROAM_TOGGLE_RECT = (172, 88, 216, 108)
+SIM_ROAM_TOGGLE_RECT = (172, 86, 216, 110)
 # Network (attach) and Data toggles sit side by side to the right of the
-# country name; Data (right) is right-aligned to the panel edge.
-SIM_ATTACH_TOGGLE_RECT = (142, 59, 180, 79)
-SIM_DATA_TOGGLE_RECT = (186, 59, 224, 79)
-SIM_DATA_ZONE = (172, 296)
+# country name, shifted toward center rather than hugging the panel edge,
+# and sized to match Roam (44x24) so all three toggles feel equally easy
+# to tap.
+SIM_ATTACH_TOGGLE_RECT = (108, 57, 152, 81)
+SIM_DATA_TOGGLE_RECT = (158, 57, 202, 81)
 
 OC_TOGGLE_RECT = (172, 38, 218, 60)
 OC_MODE_SEG_RECT = (16, 100, 224, 128)
@@ -1567,12 +1724,12 @@ WEATHER_CITY_ZONE = (34, 66)
 
 PICKER_TOP, PICKER_BOTTOM = 38, 316
 
-PANEL_NAMES = ["clock", "sim", "weather", "monitor", "fx", "openclash"]
+PANEL_NAMES = ["clock", "sim", "monitor", "weather", "fx", "openclash"]
 
 
 # ---------- main panels ----------
 
-def panel_clock(cfg, rep, conn_type=None, cell_signal=None):
+def panel_clock(cfg, rep, conn_type=None, cell_signal=None, sms_messages=None):
     from zoneinfo import ZoneInfo
     img, d = new_canvas()
     draw_header(d, "HOME", ACCENT["clock"], conn_type, cell_signal)
@@ -1599,6 +1756,21 @@ def panel_clock(cfg, rep, conn_type=None, cell_signal=None):
     draw_tile(d, 124, 150, 232, 244,
               lambda dd, cx, cy, r, ac: _icon_settings_gear(dd, cx, cy, r, ac),
               "More", "Settings", ACCENT["clock"])
+
+    sx0, sy0, sx1, sy1 = SMS_TILE
+    d.rounded_rectangle([sx0, sy0, sx1, sy1], radius=10, fill=(22, 28, 40), outline=(42, 48, 60), width=1)
+    _icon_sms(d, sx0 + 28, (sy0 + sy1) / 2, 13, ACCENT["clock"])
+    messages = sms_messages or []
+    if messages:
+        latest = messages[0]
+        d.text((sx0 + 52, sy0 + 9), "Messages", font=font("default_bold", 14), fill=FG)
+        sub = f"{latest['from']}: {latest['body'].replace(chr(10), ' ')}"
+        f_sub = font("default_cn_medium", 11)
+        sub = truncate_to_width(d, sub, f_sub, (sx1 - sx0) - 64)
+        d.text((sx0 + 52, sy0 + 27), sub, font=f_sub, fill=DIM)
+    else:
+        d.text((sx0 + 52, sy0 + 9), "Messages", font=font("default_bold", 14), fill=FG)
+        d.text((sx0 + 52, sy0 + 27), "No messages", font=font("default_medium", 11), fill=DIM)
 
     draw_page_dots(d, 0)
     return img
@@ -1663,7 +1835,10 @@ SIM_CHOICE_LABELS = ["SIM1", "eSIM"]
 SIM_CHOICE_KEYS = ["sim1", "esim"]
 
 
-def panel_sim(cfg, sim, conn_type=None, cell_signal=None):
+SIM_WIREGUARD_TILE = (16, 248, W - 16, 286)
+
+
+def panel_sim(cfg, sim, conn_type=None, cell_signal=None, wg_peers=None, wg_active=None):
     img, d = new_canvas()
     draw_header(d, "ACTIVE SIM", ACCENT["sim"], conn_type, cell_signal)
     country = sim["country"] or "unknown"
@@ -1685,7 +1860,7 @@ def panel_sim(cfg, sim, conn_type=None, cell_signal=None):
 
     tx0, ty0, tx1, ty1 = SIM_ROAM_TOGGLE_RECT
     draw_toggle(d, tx0, ty0, sim["roaming"], ACCENT["sim"], w=tx1 - tx0, h=ty1 - ty0)
-    centered_text(d, 194, 112, "Roam", font("default_medium", 10), DIM)
+    centered_text(d, 194, 114, "Roam", font("default_medium", 10), DIM)
 
     d.text((16, 126), sim["phone"] or "—", font=font("default_mono_medium", 16), fill=DIM)
 
@@ -1693,9 +1868,9 @@ def panel_sim(cfg, sim, conn_type=None, cell_signal=None):
 
     d.text((16, 164), "Data used  ›", font=font("default_medium", 14), fill=DIM)
     used, cap = sim["traffic_mb"], sim["cap_mb"]
-    d.text((16, 182), f"{used:.1f} MB" if used is not None else "n/a", font=font("default_mono_medium", 28), fill=FG)
+    d.text((16, 180), f"{used:.1f} MB" if used is not None else "n/a", font=font("default_mono_medium", 20), fill=FG)
 
-    bx0, by0, bx1, by1 = 16, 226, W - 16, 242
+    bx0, by0, bx1, by1 = 16, 206, W - 16, 222
     d.rounded_rectangle([bx0, by0, bx1, by1], radius=8, outline=DIM, width=1)
     if used is not None and cap:
         pct = max(0, min(100, used / cap * 100))
@@ -1711,7 +1886,22 @@ def panel_sim(cfg, sim, conn_type=None, cell_signal=None):
         caption = "no limit set · tap to set"
     else:
         caption = "tap to set a limit"
-    centered_text(d, W / 2, 250, caption, font("default_medium", 12), DIM)
+    centered_text(d, W / 2, 228, caption, font("default_medium", 11), DIM)
+
+    wx0, wy0, wx1, wy1 = SIM_WIREGUARD_TILE
+    d.rounded_rectangle([wx0, wy0, wx1, wy1], radius=10, fill=(22, 28, 40), outline=(42, 48, 60), width=1)
+    _icon_shield(d, wx0 + 24, (wy0 + wy1) / 2, 11, ACCENT["sim"])
+    peers = wg_peers or []
+    active = next((p["name"] for p in peers if p["id"] == wg_active), None)
+    d.text((wx0 + 44, wy0 + 4), "WireGuard", font=font("default_bold", 13), fill=FG)
+    if active:
+        sub = f"On · {active}"
+    elif peers:
+        sub = "Off"
+    else:
+        sub = "No configs · add in LuCI"
+    d.text((wx0 + 44, wy0 + 20), sub, font=font("default_medium", 10), fill=DIM)
+
     draw_page_dots(d, 1)
     return img
 
@@ -1823,7 +2013,7 @@ def panel_monitor(net_down, net_up, net_iface, cpu_pct, ram_pct, ram_used_gb, ra
     up_h, up_m = divmod(uptime_min, 60)
     d.text((16, 264), f"Uptime   {up_h}h {up_m}m", font=font("default_medium", 15), fill=FG)
 
-    draw_page_dots(d, 3)
+    draw_page_dots(d, 2)
     return img
 
 
@@ -1849,7 +2039,7 @@ def panel_weather(cfg, days, conn_type=None, cell_signal=None):
 
     if not days:
         centered_text(d, W / 2, 150, "no data yet", font("default_medium", 14), DIM)
-        draw_page_dots(d, 2)
+        draw_page_dots(d, 3)
         return img
 
     day_labels = weather_day_labels(days)
@@ -1873,7 +2063,7 @@ def panel_weather(cfg, days, conn_type=None, cell_signal=None):
     d.rounded_rectangle([bx0, by0, bx1, by1], radius=(by1 - by0) / 2, outline=ACCENT["weather"], width=2)
     centered_text_box(d, bx0, by0, bx1, by1, "Update Now", font("default_medium", 12), ACCENT["weather"])
 
-    draw_page_dots(d, 2)
+    draw_page_dots(d, 3)
     return img
 
 
@@ -2128,6 +2318,112 @@ def hit_repeater(x, y, rep, n_networks, scroll_px=0):
     return (None, None)
 
 
+# ---------- SMS ----------
+
+SMS_ROW_H = 46
+SMS_LIST_TOP = 38
+SMS_LIST_BOTTOM = 316
+
+
+def panel_sms(messages, scroll_px=0):
+    img, d = new_canvas()
+    draw_back_header(d, "Messages", ACCENT["clock"])
+
+    if not messages:
+        centered_text(d, W / 2, 160, "No messages", font("default_medium", 14), DIM)
+        return img
+
+    list_h = SMS_LIST_BOTTOM - SMS_LIST_TOP
+    list_img = Image.new("RGB", (W, list_h), BG)
+    ld = ImageDraw.Draw(list_img)
+    f_sender = font("default_bold", 14)
+    f_time = font("default_medium", 11)
+    f_body = font("default_cn_medium", 12)
+    for i, msg in enumerate(messages):
+        y0 = i * SMS_ROW_H - scroll_px
+        if y0 + SMS_ROW_H < 0 or y0 > list_h:
+            continue
+        ld.text((16, y0 + 6), msg["from"], font=f_sender, fill=FG)
+        when = msg["sent"].strftime("%d %b %H:%M") if msg["sent"] else ""
+        wbbox = ld.textbbox((0, 0), when, font=f_time)
+        ld.text((W - 16 - (wbbox[2] - wbbox[0]), y0 + 9), when, font=f_time, fill=DIM)
+        preview = truncate_to_width(ld, msg["body"].replace("\n", " "), f_body, W - 32)
+        ld.text((16, y0 + 27), preview, font=f_body, fill=DIM)
+        if i > 0:
+            ld.line([16, y0, W - 16, y0], fill=(28, 32, 42))
+    img.paste(list_img, (0, SMS_LIST_TOP))
+
+    content_h = len(messages) * SMS_ROW_H
+    max_scroll = max(0, content_h - list_h)
+    if max_scroll > 0:
+        thumb_h = max(20, list_h * list_h / content_h)
+        thumb_y = SMS_LIST_TOP + (scroll_px / max_scroll) * (list_h - thumb_h)
+        d.rectangle([W - 6, thumb_y, W - 2, thumb_y + thumb_h], fill=(70, 76, 90))
+    return img
+
+
+def sms_scroll_max(n_messages):
+    return max(0, n_messages * SMS_ROW_H - (SMS_LIST_BOTTOM - SMS_LIST_TOP))
+
+
+def hit_sms(y, n_messages, scroll_px=0):
+    if not (SMS_LIST_TOP <= y < SMS_LIST_BOTTOM):
+        return None
+    idx = int((y - SMS_LIST_TOP + scroll_px) / SMS_ROW_H)
+    return idx if 0 <= idx < n_messages else None
+
+
+def panel_sms_detail(msg):
+    img, d = new_canvas()
+    draw_back_header(d, msg["from"], ACCENT["clock"])
+    when = msg["sent"].strftime("%a %d %b %Y, %H:%M") if msg["sent"] else msg.get("sent_raw", "")
+    centered_text(d, W / 2, 40, when, font("default_medium", 12), DIM)
+    d.line([16, 62, W - 16, 62], fill=(40, 44, 54))
+
+    f = font("default_cn_medium", 15)
+    y = 74
+    for line in wrap_text_to_lines(d, msg["body"], f, W - 32):
+        if y > H - 22:
+            break
+        d.text((16, y), line, font=f, fill=FG)
+        y += 22
+    return img
+
+
+# ---------- WireGuard ----------
+
+WIREGUARD_ROW_H = 44
+WIREGUARD_LIST_TOP = 44
+WIREGUARD_TOGGLE_W, WIREGUARD_TOGGLE_H = 44, 24
+
+
+def panel_wireguard(peers, active_id):
+    img, d = new_canvas()
+    draw_back_header(d, "WireGuard", ACCENT["sim"])
+    if not peers:
+        centered_text(d, W / 2, 140, "No WireGuard configs", font("default_medium", 14), DIM)
+        centered_text(d, W / 2, 164, "add one in LuCI first", font("default_medium", 13), DIM)
+        return img
+    for i, peer in enumerate(peers):
+        y0 = WIREGUARD_LIST_TOP + i * WIREGUARD_ROW_H
+        is_on = peer["id"] == active_id
+        name = truncate_to_width(d, peer["name"], font("default_medium", 16), W - 32 - WIREGUARD_TOGGLE_W)
+        d.text((16, y0 + (WIREGUARD_ROW_H - 20) / 2), name, font=font("default_medium", 16), fill=FG)
+        tx0 = W - 16 - WIREGUARD_TOGGLE_W
+        ty0 = y0 + (WIREGUARD_ROW_H - WIREGUARD_TOGGLE_H) / 2
+        draw_toggle(d, tx0, ty0, is_on, ACCENT["sim"], w=WIREGUARD_TOGGLE_W, h=WIREGUARD_TOGGLE_H)
+        if i > 0:
+            d.line([16, y0, W - 16, y0], fill=(28, 32, 42))
+    return img
+
+
+def hit_wireguard(y, n_peers):
+    if not (WIREGUARD_LIST_TOP <= y < WIREGUARD_LIST_TOP + n_peers * WIREGUARD_ROW_H):
+        return None
+    idx = int((y - WIREGUARD_LIST_TOP) / WIREGUARD_ROW_H)
+    return idx if 0 <= idx < n_peers else None
+
+
 # ---------- on-screen keyboard ----------
 
 KB_ROW_Y0 = 76
@@ -2333,10 +2629,10 @@ def panel_currency_picker(row, side, cfg, scroll_px=0):
     return panel_scroll_picker(f"{row_label} — {side_label}", ACCENT["fx"], items, selected, scroll_px)
 
 
-def panel_datacap_picker(cfg):
+def panel_datacap_picker(cfg, scroll_px=0):
     selected = cfg.get("data_cap_mb")
     items = [(v, cap_label(v)) for v in DATA_CAP_PRESETS]
-    return panel_picker("Data Cap", ACCENT["sim"], items, selected)
+    return panel_scroll_picker("Data Cap", ACCENT["sim"], items, selected, scroll_px)
 
 
 def panel_node_picker(traf, scroll_px=0):
@@ -2378,6 +2674,9 @@ def hit_main_clock(x, y):
     mx0, my0, mx1, my1 = MORE_TILE
     if mx0 <= x <= mx1 and my0 <= y <= my1:
         return "more"
+    sx0, sy0, sx1, sy1 = SMS_TILE
+    if sx0 <= x <= sx1 and sy0 <= y <= sy1:
+        return "sms"
     lx0, ly0, lx1, ly1 = CLOCK_LEFT_ZONE
     if lx0 <= x < lx1 and ly0 <= y < ly1:
         return "city_left"
@@ -2422,7 +2721,10 @@ def hit_main_sim(x, y):
     tx0, ty0, tx1, ty1 = SIM_ROAM_TOGGLE_RECT
     if tx0 - 8 <= x <= tx1 + 8 and ty0 - 8 <= y <= ty1 + 8:
         return "roam_toggle"
-    if SIM_DATA_ZONE[0] <= y < SIM_DATA_ZONE[1]:
+    wx0, wy0, wx1, wy1 = SIM_WIREGUARD_TILE
+    if wx0 <= x <= wx1 and wy0 <= y <= wy1:
+        return "wireguard"
+    if 156 <= y < wy0:
         return "data_cap"
     return None
 
@@ -2495,6 +2797,9 @@ def mode_preview(outdir):
     traf = get_openclash_traffic_and_node()
     wx = fetch_weather(cfg["weather_city"])
     aq = fetch_air_quality(cfg["weather_city"])
+    sms_messages = get_sms_messages()
+    wg_peers = get_wireguard_peers()
+    wg_active = get_wireguard_active()
     rep = get_repeater_status()
     rep_networks = repeater_scan()
     sysinfo = get_system_info()
@@ -2513,9 +2818,9 @@ def mode_preview(outdir):
     cell_signal = get_cell_signal(_cell_info)
     cfg_digital = dict(cfg, clock_style="digital")
     screens = [
-        ("clock", panel_clock(cfg, rep, conn_type, cell_signal)),
-        ("clock_digital", panel_clock(cfg_digital, rep, conn_type, cell_signal)),
-        ("sim", panel_sim(cfg, sim, conn_type, cell_signal)),
+        ("clock", panel_clock(cfg, rep, conn_type, cell_signal, sms_messages)),
+        ("clock_digital", panel_clock(cfg_digital, rep, conn_type, cell_signal, sms_messages)),
+        ("sim", panel_sim(cfg, sim, conn_type, cell_signal, wg_peers, wg_active)),
         ("weather", panel_weather(cfg, wx, conn_type, cell_signal)),
         ("monitor", panel_monitor(net_down, net_up, net_iface, cpu_pct, ram_pct, ram_used_gb, ram_total_gb, temp_c, sysinfo["uptime_min"], conn_type, cell_signal)),
         ("fx", panel_fx(cfg, fx, "month", conn_type, cell_signal)),
@@ -2530,6 +2835,9 @@ def mode_preview(outdir):
         ("oc_nodes", panel_node_picker(traf)),
         ("weather_city", panel_weather_picker(cfg)),
         ("weather_detail", panel_weather_detail(cfg, wx[0], aq[0] if aq else None, weather_day_labels(wx)[0]) if wx else new_canvas()[0]),
+        ("sms", panel_sms(sms_messages or _DEMO_SMS_MESSAGES)),
+        ("sms_detail", panel_sms_detail((sms_messages or _DEMO_SMS_MESSAGES)[0])),
+        ("wireguard", panel_wireguard(wg_peers, wg_active)),
         ("more", panel_more(wifi24, wifi_band, cfg["clock_style"], get_wifi56_conflict_idx(rep))),
         ("repeater", panel_repeater(rep, rep_networks)),
         ("confirm", panel_confirm("Reboot", "Reboot the router now?", ACCENT["clock"], yes_label="Reboot", danger=True)),
@@ -2681,8 +2989,13 @@ def mode_live():
     wx = fetch_weather(cfg["weather_city"])
     aq = fetch_air_quality(cfg["weather_city"])
     weather_day_idx = 0
+    sms_messages = get_sms_messages()
+    sms_selected_idx = 0
+    wg_peers = get_wireguard_peers()
+    wg_active = get_wireguard_active()
     rep = get_repeater_status()
     last_fx_check = last_sim_check = last_oc_check = last_traf_check = last_wx_check = last_rep_check = time.time()
+    last_sms_check = time.time()
 
     net_sample, net_down, net_up = None, None, None
     cpu_sample, cpu_pct = None, None
@@ -2698,12 +3011,12 @@ def mode_live():
     def render_main(idx):
         name = PANEL_NAMES[idx]
         if name == "clock":
-            return panel_clock(cfg, rep, conn_type, cell_signal)
+            return panel_clock(cfg, rep, conn_type, cell_signal, sms_messages)
         elif name == "fx":
             return panel_fx(cfg, fx, fx_range, conn_type, cell_signal)
         elif name == "sim":
             display_sim = sim if sim_connect_override is None else dict(sim, data_up=sim_connect_override)
-            return panel_sim(cfg, display_sim, conn_type, cell_signal)
+            return panel_sim(cfg, display_sim, conn_type, cell_signal, wg_peers, wg_active)
         elif name == "openclash":
             return panel_openclash(oc, traf, conn_type, cell_signal)
         elif name == "weather":
@@ -2872,6 +3185,45 @@ def mode_live():
             write_frame(panel_repeater(rep, rep_networks, picker_scroll_base, connecting_ssid, spin_phase))
             sub_dirty = False
 
+    def handle_sms_scroll(now):
+        """SMS-list sibling of handle_repeater_scroll: same drag/tap
+        mechanics, own row height (2-line rows need more space than the
+        shared SCROLL_ROW_H), tap opens the full message instead of
+        applying a single-value choice."""
+        nonlocal view, sub_dirty, cur_img, last_draw, picker_scroll_base, sms_selected_idx
+        max_scroll = sms_scroll_max(len(sms_messages))
+        with touch_state.lock:
+            active = touch_state.active
+            dy, dx = touch_state.dy, touch_state.dx
+            down_x, down_y = touch_state.down_x, touch_state.down_y
+            released = touch_state.release_pending
+            release_dx, release_dy = touch_state.release_dx, touch_state.release_dy
+            touch_state.release_pending = False
+
+        if active and (abs(dy) > TAP_JITTER_PX or abs(dx) > TAP_JITTER_PX):
+            live_scroll = min(max_scroll, max(0, picker_scroll_base - dy))
+            write_frame(panel_sms(sms_messages, live_scroll))
+        elif released:
+            final_dx, final_dy = release_dx, release_dy
+            is_tap = abs(final_dx) <= TAP_JITTER_PX and abs(final_dy) <= TAP_JITTER_PX
+            if is_tap and hit_back(down_y):
+                view = "main"
+                cur_img = render_main(panel_idx)
+                write_frame(cur_img)
+                last_draw = now
+            elif is_tap:
+                idx = hit_sms(down_y, len(sms_messages), picker_scroll_base)
+                if idx is not None:
+                    sms_selected_idx = idx
+                    view = "sms_detail"
+                    sub_dirty = True
+            else:
+                picker_scroll_base = min(max_scroll, max(0, picker_scroll_base - final_dy))
+                write_frame(panel_sms(sms_messages, picker_scroll_base))
+        elif sub_dirty:
+            write_frame(panel_sms(sms_messages, picker_scroll_base))
+            sub_dirty = False
+
     confirm_title = confirm_message = confirm_yes_label = confirm_action = confirm_return_view = ""
     confirm_danger = False
     kb_text = ""
@@ -2924,6 +3276,9 @@ def mode_live():
                 if now - last_rep_check > 30:
                     rep = get_repeater_status()
                     last_rep_check = now
+                if now - last_sms_check > 15:
+                    sms_messages = get_sms_messages()
+                    last_sms_check = now
                 if now - last_mon_check > 2:
                     net_sample, net_down, net_up = sample_bandwidth(net_sample)
                     cpu_sample, cpu_pct = sample_cpu(cpu_sample)
@@ -3009,6 +3364,10 @@ def mode_live():
                             wifi24 = get_wifi_radio_state("wifi2g")
                             wifi_band = get_wifi_band_state()
                             rep = get_repeater_status()
+                        elif name == "clock" and zone == "sms":
+                            new_view = "sms"
+                            picker_scroll_base = 0
+                            sms_messages = get_sms_messages()
                         elif name == "fx" and zone == "top_from":
                             new_view, fx_edit_side = "fx_top", "from"
                             picker_scroll_base = 0
@@ -3064,6 +3423,10 @@ def mode_live():
                         elif name == "sim" and zone == "roam_toggle":
                             set_roaming_enabled(sim["iccid"], not sim["roaming"])
                             sim = get_sim_status(cfg)
+                        elif name == "sim" and zone == "wireguard":
+                            new_view = "wireguard"
+                            wg_peers = get_wireguard_peers()
+                            wg_active = get_wireguard_active()
                         elif name == "sim" and zone == "data_cap":
                             new_view = "datacap"
                         elif name == "openclash" and zone == "toggle":
@@ -3138,6 +3501,18 @@ def mode_live():
                         write_frame(composite(cur_img, neighbor_img, dx_now, neighbor_on_right))
 
         else:  # sub-screen
+            if view == "datacap":
+                def _select_datacap(key):
+                    nonlocal sim
+                    cfg["data_cap_mb"] = key
+                    save_config(cfg)
+                    sim = get_sim_status(cfg)
+
+                items = [(v, cap_label(v)) for v in DATA_CAP_PRESETS]
+                handle_scroll_picker(now, items, lambda s: panel_datacap_picker(cfg, s), _select_datacap)
+                time.sleep(0.012)
+                continue
+
             if view == "oc_nodes":
                 def _select_node(key):
                     nonlocal traf, last_traf_check
@@ -3200,6 +3575,11 @@ def mode_live():
                 time.sleep(0.012)
                 continue
 
+            if view == "sms":
+                handle_sms_scroll(now)
+                time.sleep(0.012)
+                continue
+
             if sub_dirty:
                 if view == "more":
                     img = panel_more(wifi24, wifi_band, cfg["clock_style"], get_wifi56_conflict_idx(rep))
@@ -3214,6 +3594,11 @@ def mode_live():
                     day_aq = aq[weather_day_idx] if weather_day_idx < len(aq) else None
                     day_label = weather_day_labels(wx)[weather_day_idx]
                     img = panel_weather_detail(cfg, day, day_aq, day_label)
+                elif view == "sms_detail":
+                    idx = sms_selected_idx if sms_selected_idx < len(sms_messages) else 0
+                    img = panel_sms_detail(sms_messages[idx])
+                elif view == "wireguard":
+                    img = panel_wireguard(wg_peers, wg_active)
                 else:
                     img = render_sub(view, cfg, oc, traf)
                 write_frame(img)
@@ -3276,6 +3661,9 @@ def mode_live():
                         view = "repeater"
                         sub_dirty = True
 
+                elif view == "sms_detail" and is_tap and hit_back(down_y):
+                    view = "sms"
+                    sub_dirty = True
                 elif is_tap and hit_back(down_y):
                     view = "main"
                     cur_img = render_main(panel_idx)
@@ -3327,16 +3715,14 @@ def mode_live():
                         confirm_return_view = "more"
                         view = "confirm"
                         sub_dirty = True
-                elif is_tap and view == "datacap":
-                    idx = hit_picker(down_y, len(DATA_CAP_PRESETS))
+                elif is_tap and view == "wireguard":
+                    idx = hit_wireguard(down_y, len(wg_peers))
                     if idx is not None:
-                        cfg["data_cap_mb"] = DATA_CAP_PRESETS[idx]
-                        save_config(cfg)
-                        sim = get_sim_status(cfg)
-                        view = "main"
-                        cur_img = render_main(panel_idx)
-                        write_frame(cur_img)
-                        last_draw = now
+                        peer = wg_peers[idx]
+                        turning_on = wg_active != peer["id"]
+                        set_wireguard_enabled(peer["id"], turning_on)
+                        wg_active = peer["id"] if turning_on else None
+                        sub_dirty = True
                 elif not is_tap and final_dx > W * 0.3:
                     view = "main"
                     cur_img = render_main(panel_idx)

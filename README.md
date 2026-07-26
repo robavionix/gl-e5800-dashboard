@@ -13,30 +13,48 @@ RGB565). Pure Python, one file.
 
 ## Panels
 
-| Home | Active SIM | Weather |
+| Home | Active SIM | Monitor |
 |---|---|---|
-| ![Home](screenshots/panel_clock.png) | ![SIM](screenshots/panel_sim.png) | ![Weather](screenshots/panel_weather.png) |
+| ![Home](screenshots/panel_clock.png) | ![SIM](screenshots/panel_sim.png) | ![Monitor](screenshots/panel_monitor.png) |
 
-| Monitor | Currency | OpenClash |
+| Weather | Currency | OpenClash |
 |---|---|---|
-| ![Monitor](screenshots/panel_monitor.png) | ![Currency](screenshots/panel_fx.png) | ![OpenClash](screenshots/panel_openclash.png) |
+| ![Weather](screenshots/panel_weather.png) | ![Currency](screenshots/panel_fx.png) | ![OpenClash](screenshots/panel_openclash.png) |
 
 **Home** — two small clocks (independently pickable cities/timezones,
 digital by default, switchable to analog from More), today's date, and
-two tiles: **Repeater** and **More**, so you never need the stock GL.iNet
-home page.
+three tiles: **Repeater**, **More**, and **Messages** (below the other
+two), so you never need the stock GL.iNet home page.
 
 | Digital (default) | Analog |
 |---|---|
 | ![Digital clock](screenshots/panel_clock.png) | ![Analog clock](screenshots/panel_clock_analog.png) |
 
-**Active SIM** — country flag, full number, and three toggles: **Net**
-(network registration/attach — SMS and calls work even without a
+**Messages** (from the Home tile) — the router's built-in SMS receiver
+(`smsd`/smstools3, already running against the modem) writes each
+message to a plain-text spool file; this reads them (read-only, never
+moves or deletes a file, so it can't interfere with any other consumer
+of that spool) into a scrollable inbox list — sender + preview snippet
+per row, tap for the full message. Renders in the device's bundled CJK
+font so Chinese messages display correctly rather than as boxes — this
+needed a real fix, not just a font swap: `smstools3` writes non-ASCII
+message bodies as **raw UTF-16BE bytes** (`Alphabet: UCS2` in the file's
+header), not UTF-8 text, confirmed against a real received message.
+
+| Messages | Message detail |
+|---|---|
+| ![Messages](screenshots/panel_sms.png) | ![Message detail](screenshots/panel_sms_detail.png) |
+
+*(Numbers and message content above are synthetic/demo data.)*
+
+**Active SIM** — country flag, full number, and three same-sized toggles:
+**Net** (network registration/attach — SMS and calls work even without a
 cellular data session), **Data** (the actual cellular data session), and
 **Roam** (data roaming permission for this SIM). A SIM1 / eSIM switch
 (SIM2 was removed: it and eSIM share the same physical slot on this
-hardware and behaved identically, so it wasn't a real third option) and
-a data-usage bar against a cap you set round it out.
+hardware and behaved identically, so it wasn't a real third option), a
+data-usage bar against a cap you set (now a scrollable list, 500MB up to
+1000GB), and a **WireGuard** button.
 
 The Data toggle shows optimistic feedback (flips immediately on tap) and
 only re-confirms after 2s and snaps back if it didn't take **when a
@@ -45,11 +63,29 @@ manager can silently revert a manual cellular connect in that case. With
 no competing WAN, the tap is trusted outright and left to connect in the
 background, since there's nothing to revert it.
 
+**WireGuard** — lists every peer config already added on the router
+(GL.iNet stores each as its own `wireguard.peer_NNNN` UCI section) with a
+toggle to bring it up or down. Turning one on points the router's single
+`wgclient` network interface at that peer's config and brings it up
+(`ifup`); turning it off tears it down (`ifdown`) — the same mechanism
+the router's own firmware uses (confirmed by reading the actual netifd
+proto script and hotplug handlers, not guessed), so no separate/parallel
+VPN config path is created.
+
+![WireGuard](screenshots/panel_wireguard.png)
+
+*(Peer name above is synthetic/demo data.)*
+
 Every panel's colored header also shows, phone-status-bar style: cellular
 signal bars + radio tech (4G/5G) when the modem has signal, and the
 active WAN connection type (Repeater/Ethernet/4G/5G) — each shown
 independently, hidden entirely when not applicable, refreshed
 periodically.
+
+**Monitor** — bandwidth (down/up Mbps on whichever interface currently holds
+the default route, so it keeps tracking the right link through a WAN
+failover), CPU%, RAM used/total, SoC temperature, and uptime. Read-only,
+refreshes every 2 seconds.
 
 **Weather** — 3-day forecast (hand-drawn icons: sun/cloud/rain/snow/fog/storm)
 for a city you pick from an alphabetically-sorted, scrollable list of 40+
@@ -61,11 +97,6 @@ Open-Meteo's separate air-quality API) — showing "No data yet" instead of
 a wrong or blank value wherever a field genuinely isn't available.
 
 ![Weather day detail](screenshots/panel_weather_detail.png)
-
-**Monitor** — bandwidth (down/up Mbps on whichever interface currently holds
-the default route, so it keeps tracking the right link through a WAN
-failover), CPU%, RAM used/total, SoC temperature, and uptime. Read-only,
-refreshes every 2 seconds.
 
 **Currency** — two rows, each `1 {from} = {rate} {to}`, with `from` and
 `to` independently pickable from a 10-currency list (not fixed to any one
@@ -263,6 +294,21 @@ There's no settings UI for these — edit directly:
 
 ## Known limitations
 
+- **smstools3 writes non-ASCII SMS bodies as raw UTF-16BE bytes, not
+  UTF-8 text.** The spool file's header is always plain ASCII, but when
+  `Alphabet: UCS2` is set the body after the blank line is raw
+  big-endian UTF-16, confirmed against a real received Chinese message
+  (an initial UTF-8-decode-everything approach produced mojibake).
+  `_parse_sms_file()` decodes based on that header field rather than
+  assuming one encoding for the whole file.
+- **WireGuard peers and the actual network interface are separate
+  layers.** GL.iNet stores each added peer as its own
+  `wireguard.peer_NNNN` UCI section (keys, endpoint, allowed_ips), but
+  that's just configuration -- nothing carries traffic until a
+  `network.wgclient` interface (`proto=wgclient`, `config=<peer
+  section>`) exists and is `ifup`'d. Confirmed by reading
+  `/lib/netifd/proto/wgclient.sh` and the wireguard hotplug scripts
+  rather than guessing at an undocumented RPC.
 - **Open-Meteo's air-quality API has no daily-aggregate parameter** (a
   `daily=us_aqi_max` request errors out — confirmed live) — only hourly
   data is available, so `fetch_air_quality()` aggregates the daily max
