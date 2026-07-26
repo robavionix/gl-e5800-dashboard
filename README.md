@@ -99,6 +99,28 @@ and switchable back at any time (see [Uninstalling](#uninstalling)).
 
 ## Installation
 
+### Option A: install via LuCI (no SSH needed to get the files on)
+
+Grab the `.ipk` from [Releases](https://github.com/robavionix/gl-e5800-dashboard/releases/latest) and, in LuCI, go to
+**System → Software → Upload Package...**, pick the file, install. It's a
+real opkg package — installs the same files to the same paths as the
+manual steps below, pulls in `python3`/`python3-numpy`/`libtiff6`/all 5
+`zoneinfo-*` packages as normal opkg dependencies, and enables the
+power-button watcher. It deliberately does **not** switch the physical
+screen over by itself; that stays a manual step (see step 5 below or the
+Interaction section) so installing the package never surprises you with a
+live UI swap. Note this doesn't add a menu entry inside LuCI itself — the
+dashboard runs on the physical touchscreen, not as a web page; LuCI here
+is just the install mechanism.
+
+Prefer the CLI? `opkg install gl-e5800-dashboard_*.ipk` over SSH does the
+same thing. See [packages/](packages/) if you want to rebuild the `.ipk`
+yourself (also documents a couple of real opkg gotchas found while
+building it — worth a read if you're packaging anything else for this
+device).
+
+### Option B: manual install over SSH
+
 **Fast path:** clone this repo on a machine that can SSH to the router, then
 `./install.sh [router-ip]` (default `192.168.8.1`). It does everything in
 steps 1-3 below. Read on for what it's actually doing, or to do it by hand.
@@ -148,6 +170,13 @@ automatically restores the stock UI if the Python process dies repeatedly,
 so a bug can't permanently blank the screen.
 
 ### Uninstalling
+
+Installed via the `.ipk` (Option A): `opkg remove gl-e5800-dashboard`, or
+the same from LuCI's Software page — this switches the screen back to
+stock automatically first if the dashboard was live, then removes
+everything including the runtime-generated config/cache files.
+
+Installed manually (Option B):
 
 ```sh
 /root/dashboard/toggle.sh off

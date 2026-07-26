@@ -1,0 +1,44 @@
+#!/bin/sh
+set -e
+
+# python3-pillow conflicts with a file gl-sdk4-screen-large already owns (a
+# bundled libfreetype), so it can't be a normal opkg Depends, and it can't
+# be auto-installed from here either: opkg holds a non-reentrant lock for
+# the whole transaction, so calling opkg (even just `list-installed`) from
+# inside another package's postinst deadlocks on that same lock. Check via
+# Python directly instead, and tell the user to run the one extra command
+# themselves if it's missing.
+if ! python3 -c "import PIL" 2>/dev/null; then
+    cat <<'MSG'
+
+NOTE: python3-pillow isn't installed, and can't be pulled in automatically
+from here (see comment in postinst for why). Run this once before using
+the dashboard:
+
+  opkg install --nodeps python3-pillow
+
+MSG
+fi
+
+chmod 755 /root/dashboard/*.py /root/dashboard/*.sh
+chmod 755 /etc/init.d/citydash /etc/init.d/homebutton
+
+/etc/init.d/homebutton enable
+/etc/init.d/homebutton start
+
+cat <<'MSG'
+
+gl-e5800-dashboard installed. The stock GL.iNet screen is still active --
+nothing has changed on the physical display yet.
+
+Preview first (renders to PNGs, does not touch the live screen):
+  python3 /root/dashboard/dashboard.py --preview /root/dashboard/preview
+
+When ready to switch the physical screen over:
+  /root/dashboard/toggle.sh on
+
+To go back to the stock GL.iNet UI at any time:
+  /root/dashboard/toggle.sh off
+MSG
+
+exit 0

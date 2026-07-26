@@ -1,0 +1,14 @@
+#!/bin/sh
+set -e
+
+# If the custom dashboard is currently the active screen, switch back to
+# the stock gl_screen UI before removing its files, so uninstalling never
+# leaves the physical screen blank or crash-looping.
+if [ -x /etc/init.d/citydash ] && /etc/init.d/citydash enabled 2>/dev/null; then
+    /root/dashboard/toggle.sh off || true
+fi
+
+/etc/init.d/homebutton stop 2>/dev/null || true
+/etc/init.d/homebutton disable 2>/dev/null || true
+
+exit 0

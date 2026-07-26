@@ -1,0 +1,13 @@
+#!/bin/sh
+set -e
+
+# Clean up runtime-generated files that were never part of the package
+# payload (config.json and cached API responses), so removal is a true
+# clean uninstall rather than leaving orphaned state behind.
+rm -f /root/dashboard/config.json
+rm -f /root/dashboard/fx_hist_*.json
+rm -f /root/dashboard/weather_*.json
+rm -rf /root/dashboard/preview
+rmdir /root/dashboard 2>/dev/null || true
+
+exit 0

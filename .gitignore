@@ -5,3 +5,4 @@ config.json
 fx_cache.json
 fx_hist_*.json
 weather_*.json
+packages/*.ipk
