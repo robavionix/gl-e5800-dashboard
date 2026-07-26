@@ -146,7 +146,7 @@ DEFAULT_CONFIG = {
     "fx_bottom_to": "CNY",
     "data_cap_mb": None,
     "weather_city": "London",
-    "clock_style": "analog",
+    "clock_style": "digital",
 }
 
 _fonts = {}
@@ -858,6 +858,20 @@ def set_openclash_mode(mode):
         subprocess.Popen(["/etc/init.d/openclash", "restart"])
 
 
+def update_openclash_subscription():
+    """Re-fetches every configured subscription and reloads if changed --
+    the same script LuCI's own subscription page runs. With no argument,
+    openclash.sh iterates all openclash.@config_subscribe[] sections
+    (config_foreach sub_info_get "config_subscribe" "$1", "$1" here being
+    empty = no name filter = all of them). This does a real network fetch
+    + config validation + possible restart, so it's Popen'd non-blocking
+    like reboot_router/switch_to_stock_ui -- never run synchronously from
+    the touch-handling path."""
+    if not openclash_installed():
+        return
+    subprocess.Popen(["/usr/share/openclash/openclash.sh"])
+
+
 _COUNTRY_NAME_HINTS = [
     ("HONGKONG", "Hong Kong"), ("HONG KONG", "Hong Kong"), ("HK", "Hong Kong"),
     ("TAIWAN", "Taiwan"), ("TW", "Taiwan"),
@@ -1364,6 +1378,7 @@ SIM_DATA_ZONE = (172, 296)
 OC_TOGGLE_RECT = (172, 38, 218, 60)
 OC_MODE_SEG_RECT = (16, 100, 224, 128)
 OC_NODE_ZONE = (146, 192)
+OC_UPDATE_BUTTON = (24, 252, 216, 272)
 
 WEATHER_CITY_ZONE = (34, 66)
 
@@ -1564,7 +1579,9 @@ def panel_openclash(oc, traf, conn_type=None, cell_signal=None):
     else:
         d.text((16, 220), "—", font=font("default_mono_medium", 15), fill=DIM)
 
-    centered_text(d, W / 2, 266, "luci: 192.168.8.1:8080", font("default_medium", 11), DIM)
+    bx0, by0, bx1, by1 = OC_UPDATE_BUTTON
+    d.rounded_rectangle([bx0, by0, bx1, by1], radius=(by1 - by0) / 2, outline=ACCENT["openclash"], width=2)
+    centered_text(d, (bx0 + bx1) / 2, by0 + 4, "Update Subscription", font("default_medium", 12), ACCENT["openclash"])
     draw_page_dots(d, 5)
     return img
 
@@ -1763,11 +1780,12 @@ def hit_more(x, y):
 # ---------- Repeater ----------
 
 REPEATER_LIST_TOP = 110
+REPEATER_LIST_BOTTOM = 316
 REPEATER_ROW_H = 34
 REPEATER_DISCONNECT_ZONE = (34, 108)
 
 
-def panel_repeater(rep, networks):
+def panel_repeater(rep, networks, scroll_px=0):
     img, d = new_canvas()
     draw_back_header(d, "Repeater", ACCENT["clock"])
 
@@ -1785,28 +1803,49 @@ def panel_repeater(rep, networks):
 
     if not networks:
         centered_text(d, W / 2, 160, "Scanning…", font("default_medium", 13), DIM)
-    else:
-        max_rows = int((316 - REPEATER_LIST_TOP) / REPEATER_ROW_H)
-        for i, ap in enumerate(networks[:max_rows]):
-            y0 = REPEATER_LIST_TOP + i * REPEATER_ROW_H
-            label = truncate_to_width(d, ap["ssid"], font("default_medium", 14), 150)
-            d.text((20, y0 + 8), label, font=font("default_medium", 14), fill=FG)
-            if ap["open"]:
-                d.text((W - 46, y0 + 9), "open", font=font("default_medium", 11), fill=DIM)
-            else:
-                _icon_lock(d, W - 28, y0 + REPEATER_ROW_H / 2, 7, DIM)
-            if i > 0:
-                d.line([16, y0, W - 16, y0], fill=(26, 30, 40))
+        return img
+
+    # Scrollable list (same mechanics as panel_scroll_picker -- render into
+    # an off-canvas strip, clip rows outside the visible window, composite
+    # in, draw a scrollbar thumb if the content overflows) rather than the
+    # old fixed-row fit-to-screen approach, which silently dropped any
+    # networks past whatever fit in the available height.
+    list_h = REPEATER_LIST_BOTTOM - REPEATER_LIST_TOP
+    list_img = Image.new("RGB", (W, list_h), BG)
+    ld = ImageDraw.Draw(list_img)
+    for i, ap in enumerate(networks):
+        y0 = i * REPEATER_ROW_H - scroll_px
+        if y0 + REPEATER_ROW_H < 0 or y0 > list_h:
+            continue
+        label = truncate_to_width(ld, ap["ssid"], font("default_medium", 14), 150)
+        ld.text((20, y0 + 8), label, font=font("default_medium", 14), fill=FG)
+        if ap["open"]:
+            ld.text((W - 46, y0 + 9), "open", font=font("default_medium", 11), fill=DIM)
+        else:
+            _icon_lock(ld, W - 28, y0 + REPEATER_ROW_H / 2, 7, DIM)
+        if i > 0:
+            ld.line([16, y0, W - 16, y0], fill=(26, 30, 40))
+    img.paste(list_img, (0, REPEATER_LIST_TOP))
+
+    content_h = len(networks) * REPEATER_ROW_H
+    max_scroll = max(0, content_h - list_h)
+    if max_scroll > 0:
+        thumb_h = max(20, list_h * list_h / content_h)
+        thumb_y = REPEATER_LIST_TOP + (scroll_px / max_scroll) * (list_h - thumb_h)
+        d.rectangle([W - 6, thumb_y, W - 2, thumb_y + thumb_h], fill=(70, 76, 90))
     return img
 
 
-def hit_repeater(x, y, rep, n_networks):
+def repeater_scroll_max(n_networks):
+    return max(0, n_networks * REPEATER_ROW_H - (REPEATER_LIST_BOTTOM - REPEATER_LIST_TOP))
+
+
+def hit_repeater(x, y, rep, n_networks, scroll_px=0):
     if rep["connected"] and REPEATER_DISCONNECT_ZONE[0] <= y < REPEATER_DISCONNECT_ZONE[1]:
         return ("disconnect", None)
-    if y >= REPEATER_LIST_TOP:
-        idx = int((y - REPEATER_LIST_TOP) / REPEATER_ROW_H)
-        max_rows = int((316 - REPEATER_LIST_TOP) / REPEATER_ROW_H)
-        if 0 <= idx < min(n_networks, max_rows):
+    if REPEATER_LIST_TOP <= y < REPEATER_LIST_BOTTOM:
+        idx = int((y - REPEATER_LIST_TOP + scroll_px) / REPEATER_ROW_H)
+        if 0 <= idx < n_networks:
             return ("select", idx)
     return (None, None)
 
@@ -2110,6 +2149,9 @@ def hit_main_openclash(x, y):
         return "mode_global" if x < (sx0 + sx1) / 2 else "mode_rule"
     if OC_NODE_ZONE[0] <= y < OC_NODE_ZONE[1]:
         return "node"
+    bx0, by0, bx1, by1 = OC_UPDATE_BUTTON
+    if bx0 - 6 <= x <= bx1 + 6 and by0 - 6 <= y <= by1 + 6:
+        return "update_sub"
     return None
 
 
@@ -2443,6 +2485,70 @@ def mode_live():
             write_frame(render_fn(picker_scroll_base))
             sub_dirty = False
 
+    def handle_repeater_scroll(now):
+        """Repeater-specific sibling of handle_scroll_picker: same
+        drag-to-scroll mechanics, but the tap action is more involved than
+        a single on_select -- a network can connect immediately, need a
+        password, or the disconnect zone above the (unscrolled) list can
+        fire instead of anything in it."""
+        nonlocal view, sub_dirty, cur_img, last_draw, picker_scroll_base
+        nonlocal rep, kb_target_ssid, kb_target_bssid, kb_text, kb_layer, kb_caps
+        nonlocal confirm_title, confirm_message, confirm_yes_label, confirm_action, confirm_return_view, confirm_danger
+        max_scroll = repeater_scroll_max(len(rep_networks))
+        with touch_state.lock:
+            active = touch_state.active
+            dy, dx = touch_state.dy, touch_state.dx
+            down_x, down_y = touch_state.down_x, touch_state.down_y
+            released = touch_state.release_pending
+            release_dx, release_dy = touch_state.release_dx, touch_state.release_dy
+            touch_state.release_pending = False
+
+        if active and (abs(dy) > TAP_JITTER_PX or abs(dx) > TAP_JITTER_PX):
+            live_scroll = min(max_scroll, max(0, picker_scroll_base - dy))
+            write_frame(panel_repeater(rep, rep_networks, live_scroll))
+        elif released:
+            final_dx, final_dy = release_dx, release_dy
+            is_tap = abs(final_dx) <= TAP_JITTER_PX and abs(final_dy) <= TAP_JITTER_PX
+            if is_tap and hit_back(down_y):
+                view = "main"
+                cur_img = render_main(panel_idx)
+                write_frame(cur_img)
+                last_draw = now
+            elif is_tap:
+                action, val = hit_repeater(down_x, down_y, rep, len(rep_networks), picker_scroll_base)
+                if action == "disconnect":
+                    confirm_title = "Repeater"
+                    confirm_message = f"Disconnect from {rep['ssid']}?"
+                    confirm_yes_label = "Disconnect"
+                    confirm_danger = True
+                    confirm_action = "repeater_disconnect"
+                    confirm_return_view = "repeater"
+                    view = "confirm"
+                    sub_dirty = True
+                elif action == "select":
+                    ap = rep_networks[val]
+                    remembered_key = None if ap["open"] else get_remembered_repeater_keys().get(ap["ssid"])
+                    if ap["open"] or remembered_key is not None:
+                        repeater_connect(ap["ssid"], ap["bssid"], remembered_key or "")
+                        time.sleep(0.5)
+                        rep = get_repeater_status()
+                        start_repeater_scan()
+                        sub_dirty = True
+                    else:
+                        kb_target_ssid = ap["ssid"]
+                        kb_target_bssid = ap["bssid"]
+                        kb_text = ""
+                        kb_layer = "letters"
+                        kb_caps = False
+                        view = "keyboard_wifi"
+                        sub_dirty = True
+            else:
+                picker_scroll_base = min(max_scroll, max(0, picker_scroll_base - final_dy))
+                write_frame(panel_repeater(rep, rep_networks, picker_scroll_base))
+        elif sub_dirty:
+            write_frame(panel_repeater(rep, rep_networks, picker_scroll_base))
+            sub_dirty = False
+
     confirm_title = confirm_message = confirm_yes_label = confirm_action = confirm_return_view = ""
     confirm_danger = False
     kb_text = ""
@@ -2571,6 +2677,7 @@ def mode_live():
                             picker_scroll_base = 0
                         elif name == "clock" and zone == "repeater":
                             new_view = "repeater"
+                            picker_scroll_base = 0
                             rep = get_repeater_status()
                             start_repeater_scan()
                         elif name == "clock" and zone == "more":
@@ -2645,6 +2752,14 @@ def mode_live():
                             oc = get_openclash_status()
                         elif name == "openclash" and zone == "node":
                             new_view = "oc_nodes"
+                        elif name == "openclash" and zone == "update_sub":
+                            flash = cur_img.copy()
+                            fd = ImageDraw.Draw(flash)
+                            bx0, by0, bx1, by1 = OC_UPDATE_BUTTON
+                            fd.rectangle([0, by0 - 20, W, by1 + 4], fill=BG)
+                            centered_text(fd, W / 2, by0 - 16, "Updating…", font("default_medium", 12), ACCENT["openclash"])
+                            write_frame(flash)
+                            update_openclash_subscription()
                         elif name == "weather" and zone == "city":
                             new_view = "weather_city"
                             picker_scroll_base = 0
@@ -2730,11 +2845,14 @@ def mode_live():
                 scan_state["result"] = None
                 sub_dirty = True
 
+            if view == "repeater":
+                handle_repeater_scroll(now)
+                time.sleep(0.012)
+                continue
+
             if sub_dirty:
                 if view == "more":
                     img = panel_more(wifi24, wifi5, cfg["clock_style"])
-                elif view == "repeater":
-                    img = panel_repeater(rep, rep_networks)
                 elif view == "confirm":
                     img = panel_confirm(confirm_title, confirm_message, ACCENT["clock"],
                                         yes_label=confirm_yes_label, danger=confirm_danger)
@@ -2833,34 +2951,6 @@ def mode_live():
                         confirm_return_view = "more"
                         view = "confirm"
                         sub_dirty = True
-                elif is_tap and view == "repeater":
-                    action, val = hit_repeater(down_x, down_y, rep, len(rep_networks))
-                    if action == "disconnect":
-                        confirm_title = "Repeater"
-                        confirm_message = f"Disconnect from {rep['ssid']}?"
-                        confirm_yes_label = "Disconnect"
-                        confirm_danger = True
-                        confirm_action = "repeater_disconnect"
-                        confirm_return_view = "repeater"
-                        view = "confirm"
-                        sub_dirty = True
-                    elif action == "select":
-                        ap = rep_networks[val]
-                        remembered_key = None if ap["open"] else get_remembered_repeater_keys().get(ap["ssid"])
-                        if ap["open"] or remembered_key is not None:
-                            repeater_connect(ap["ssid"], ap["bssid"], remembered_key or "")
-                            time.sleep(0.5)
-                            rep = get_repeater_status()
-                            start_repeater_scan()
-                            sub_dirty = True
-                        else:
-                            kb_target_ssid = ap["ssid"]
-                            kb_target_bssid = ap["bssid"]
-                            kb_text = ""
-                            kb_layer = "letters"
-                            kb_caps = False
-                            view = "keyboard_wifi"
-                            sub_dirty = True
                 elif is_tap and view == "datacap":
                     idx = hit_picker(down_y, len(DATA_CAP_PRESETS))
                     if idx is not None:
