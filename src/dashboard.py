@@ -435,26 +435,21 @@ def get_sim_status(cfg):
                     pass
     country = None
     phone = None
+    iccid = None
+    roaming = False
     if active:
         country = MCC_COUNTRY.get(active.get("mcc", ""), f"MCC {active.get('mcc', '?')}")
         phone = active.get("phone_number") or ""
+        iccid = active.get("iccid")
+        if iccid:
+            roaming = bool(ubus_call("cellular.sim", "get_config", {"iccid": iccid}).get("roaming", False))
 
     prio = ubus_call("cellular.modem", "get_slot_priority_config", {"bus": "cpu"}).get("slot_priority", [1, 2])
-    esim_mode = ""
-    try:
-        esim_mode = (STATE_DIR.parent / "esim" / "mode").read_text().strip()
-    except Exception:
-        pass
-    # "sim_choice" reflects the UI's 3-way pick; slot 2 is shared between a
-    # physical SIM2 and the eSIM profile on this hardware (slot_support_esim
-    # == [2]), so we can't always tell them apart -- esim_mode is our best
-    # signal ("remote" observed when the eSIM profile is the active one).
-    if prio and prio[0] == 1:
-        sim_choice = "sim1"
-    elif esim_mode == "remote":
-        sim_choice = "esim"
-    else:
-        sim_choice = "sim2"
+    # "sim_choice" reflects the UI's 2-way pick. SIM2 was removed from the
+    # picker: it and eSIM both live on slot 2 on this hardware and both just
+    # reorder slot priority to prefer slot 2, so there was no way to
+    # actually select one over the other -- SIM2 was dead weight in the UI.
+    sim_choice = "sim1" if prio and prio[0] == 1 else "esim"
 
     data_iface = ubus_call("network.interface.modem_cpu", "status")
     data_up = bool(data_iface.get("up"))
@@ -462,12 +457,13 @@ def get_sim_status(cfg):
     return {
         "slot": slot, "country": country, "phone": phone, "traffic_mb": traffic_mb,
         "cap_mb": cfg.get("data_cap_mb"), "sim_choice": sim_choice, "data_up": data_up,
+        "iccid": iccid, "roaming": roaming,
     }
 
 
 def set_sim_choice(choice):
-    """choice: 'sim1' | 'sim2' | 'esim'. SIM2 and eSIM both live on slot 2 on
-    this hardware -- both just reorder slot priority to prefer slot 2."""
+    """choice: 'sim1' | 'esim'. eSIM lives on slot 2 on this hardware --
+    same slot the removed 'sim2' option used to target."""
     target_slot = 1 if choice == "sim1" else 2
     other = 2 if target_slot == 1 else 1
     run(["ubus", "call", "cellular.modem", "set_slot_priority_config",
@@ -476,6 +472,22 @@ def set_sim_choice(choice):
 
 def set_cellular_data_enabled(enabled):
     subprocess.Popen(["ifup" if enabled else "ifdown", "modem_cpu"])
+
+
+def set_roaming_enabled(iccid, enabled):
+    """Data roaming permission for a given SIM, via cellular.sim's
+    get_config/set_config -- a per-iccid config table (auth/apn/roaming/
+    etc), not a standalone flag, so this reads the current table and
+    writes it back with only 'roaming' changed rather than clobbering the
+    rest (apn, pincode, auth...) with a partial object."""
+    if not iccid:
+        return
+    cur = ubus_call("cellular.sim", "get_config", {"iccid": iccid})
+    if not cur:
+        return
+    cur["roaming"] = enabled
+    run(["ubus", "call", "cellular.sim", "set_config",
+         json.dumps({"iccid": iccid, "data": cur})])
 
 
 # ---------- repeater (station/WiFi-extender mode) ----------
@@ -519,6 +531,30 @@ def repeater_connect(ssid, bssid, key):
     if key:
         params["key"] = key
     subprocess.Popen(["ubus", "call", "repeater", "connect", json.dumps(params)])
+
+
+def get_remembered_repeater_keys():
+    """SSID -> key for every network repeater_connect's remember=True has
+    ever saved, straight from /etc/config/repeater's anonymous @network[]
+    sections (this is where the ubus 'repeater' service itself persists
+    them -- not a separate store of our own). Used so re-selecting a
+    previously-connected network can reconnect immediately instead of
+    demanding the password again."""
+    out = run(["uci", "show", "repeater"])
+    ssid_by_idx, key_by_idx = {}, {}
+    for line in out.splitlines():
+        if ".ssid=" not in line and ".key=" not in line:
+            continue
+        try:
+            idx = line.split("[", 1)[1].split("]", 1)[0]
+            value = line.split("=", 1)[1].strip().strip("'")
+        except IndexError:
+            continue
+        if ".ssid=" in line:
+            ssid_by_idx[idx] = value
+        else:
+            key_by_idx[idx] = value
+    return {ssid_by_idx[i]: key_by_idx[i] for i in ssid_by_idx if i in key_by_idx}
 
 
 def repeater_disconnect():
@@ -581,6 +617,42 @@ def get_wan_iface():
     except Exception:
         pass
     return best_iface
+
+
+def get_wan_conn_type():
+    """Short label for the header's connection-status indicator: Repeater
+    (WiFi client uplink), Ethernet, or 4G/5G (cellular, radio access tech
+    read from cellular.network's cell_info.mode, e.g. "LTE FDD" -> 4G,
+    anything with "NR" -> 5G). Does a couple of ubus calls, so -- same
+    lesson as the fx-history and repeater-scan fixes -- this is refreshed
+    periodically in mode_live's idle loop, never called from inside a
+    panel's own render function."""
+    iface = get_wan_iface()
+    if not iface:
+        return None
+    if iface.startswith("wlan"):
+        return "Repeater"
+    if iface.startswith("eth"):
+        return "Ethernet"
+    if "rmnet" in iface or "modem" in iface:
+        modem = ubus_call("cellular.modem", "status", {"bus": "cpu"})
+        try:
+            slot = int(modem.get("current_sim_slot", 1))
+        except (TypeError, ValueError):
+            slot = 1
+        net = ubus_call("cellular.network", "info", {"bus": "cpu", "slot": slot})
+        mode = ""
+        for n in net.get("networks", []):
+            mode = (n.get("cell_info") or {}).get("mode", "")
+            if mode:
+                break
+        mode_u = mode.upper()
+        if "NR" in mode_u:
+            return "5G"
+        if mode_u:
+            return "4G"
+        return "Cellular"
+    return None
 
 
 def sample_bandwidth(prev):
@@ -1062,9 +1134,13 @@ def draw_page_dots(d, active_idx, count=6):
         d.ellipse([x - r, y - r, x + r, y + r], fill=color)
 
 
-def draw_header(d, label, accent):
+def draw_header(d, label, accent, conn_type=None):
     d.rectangle([0, 0, W, 34], fill=accent)
     d.text((14, 8), label, font=font("default_bold", 18), fill=BG)
+    if conn_type:
+        f = font("default_medium", 12)
+        bbox = d.textbbox((0, 0), conn_type, font=f)
+        d.text((W - 14 - (bbox[2] - bbox[0]), 10), conn_type, font=f, fill=BG)
 
 
 def draw_back_header(d, label, accent):
@@ -1176,8 +1252,9 @@ FX_STATUS_Y = 252
 FX_BUTTON = (50, 268, 190, 288)
 
 SIM_CHOICE_RECT = (16, 86, 156, 110)
-SIM_DATA_TOGGLE_RECT = (172, 88, 216, 108)
-SIM_DATA_ZONE = (160, 296)
+SIM_ROAM_TOGGLE_RECT = (172, 88, 216, 108)
+SIM_CONNECT_TOGGLE_RECT = (172, 59, 216, 79)
+SIM_DATA_ZONE = (172, 296)
 
 OC_TOGGLE_RECT = (172, 38, 218, 60)
 OC_MODE_SEG_RECT = (16, 100, 224, 128)
@@ -1192,10 +1269,10 @@ PANEL_NAMES = ["clock", "sim", "weather", "monitor", "fx", "openclash"]
 
 # ---------- main panels ----------
 
-def panel_clock(cfg, rep):
+def panel_clock(cfg, rep, conn_type=None):
     from zoneinfo import ZoneInfo
     img, d = new_canvas()
-    draw_header(d, "HOME", ACCENT["clock"])
+    draw_header(d, "HOME", ACCENT["clock"], conn_type)
     tz_l, tz_r = cfg["clock_top"], cfg["clock_bottom"]
     dt_l = datetime.now(ZoneInfo(tz_l))
     dt_r = datetime.now(ZoneInfo(tz_r))
@@ -1242,9 +1319,9 @@ def draw_fx_row(d, y_label, y_value, from_code, rate, to_code):
     d.text((x, y_label), f" {to_code} ›", font=f_label, fill=DIM)
 
 
-def panel_fx(cfg, fx, fx_range):
+def panel_fx(cfg, fx, fx_range, conn_type=None):
     img, d = new_canvas()
-    draw_header(d, "CURRENCY", ACCENT["fx"])
+    draw_header(d, "CURRENCY", ACCENT["fx"], conn_type)
     top_from, top_to = cfg["fx_top_from"], cfg["fx_top_to"]
     bot_from, bot_to = cfg["fx_bottom_from"], cfg["fx_bottom_to"]
     top_rate = rate_between(top_from, top_to, fx)
@@ -1279,39 +1356,44 @@ def panel_fx(cfg, fx, fx_range):
     return img
 
 
-SIM_CHOICE_LABELS = ["SIM1", "SIM2", "eSIM"]
-SIM_CHOICE_KEYS = ["sim1", "sim2", "esim"]
+SIM_CHOICE_LABELS = ["SIM1", "eSIM"]
+SIM_CHOICE_KEYS = ["sim1", "esim"]
 
 
-def panel_sim(cfg, sim):
+def panel_sim(cfg, sim, conn_type=None):
     img, d = new_canvas()
-    draw_header(d, "ACTIVE SIM", ACCENT["sim"])
+    draw_header(d, "ACTIVE SIM", ACCENT["sim"], conn_type)
     country = sim["country"] or "unknown"
     d.text((16, 44), f"Slot {sim['slot']}", font=font("default_medium", 14), fill=DIM)
+    centered_text(d, 194, 44, "Data", font("default_medium", 10), DIM)
     draw_flag(d, 16, 60, 26, 18, country)
     d.text((50, 57), country, font=font("default_bold", 20), fill=FG)
+
+    tx0, ty0, tx1, ty1 = SIM_CONNECT_TOGGLE_RECT
+    draw_toggle(d, tx0, ty0, sim["data_up"], ACCENT["sim"], w=tx1 - tx0, h=ty1 - ty0)
 
     cx0, cy0, cx1, cy1 = SIM_CHOICE_RECT
     sel_idx = SIM_CHOICE_KEYS.index(sim["sim_choice"])
     draw_segmented(d, cx0, cy0, cx1 - cx0, cy1 - cy0, SIM_CHOICE_LABELS, sel_idx, ACCENT["sim"], fsize=11)
 
-    tx0, ty0, tx1, ty1 = SIM_DATA_TOGGLE_RECT
-    draw_toggle(d, tx0, ty0, sim["data_up"], ACCENT["sim"], w=tx1 - tx0, h=ty1 - ty0)
+    tx0, ty0, tx1, ty1 = SIM_ROAM_TOGGLE_RECT
+    draw_toggle(d, tx0, ty0, sim["roaming"], ACCENT["sim"], w=tx1 - tx0, h=ty1 - ty0)
+    centered_text(d, 194, 112, "Roam", font("default_medium", 10), DIM)
 
-    d.text((16, 114), sim["phone"] or "—", font=font("default_mono_medium", 16), fill=DIM)
+    d.text((16, 126), sim["phone"] or "—", font=font("default_mono_medium", 16), fill=DIM)
 
-    d.line([16, 140, W - 16, 140], fill=DIM)
+    d.line([16, 152, W - 16, 152], fill=DIM)
 
-    d.text((16, 152), "Data used  ›", font=font("default_medium", 14), fill=DIM)
+    d.text((16, 164), "Data used  ›", font=font("default_medium", 14), fill=DIM)
     used, cap = sim["traffic_mb"], sim["cap_mb"]
-    d.text((16, 170), f"{used:.1f} MB" if used is not None else "n/a", font=font("default_mono_medium", 28), fill=FG)
+    d.text((16, 182), f"{used:.1f} MB" if used is not None else "n/a", font=font("default_mono_medium", 28), fill=FG)
 
-    bx0, by0, bx1, by1 = 16, 214, W - 16, 230
+    bx0, by0, bx1, by1 = 16, 226, W - 16, 242
     d.rounded_rectangle([bx0, by0, bx1, by1], radius=8, outline=DIM, width=1)
     if used is not None and cap:
         pct = max(0, min(100, used / cap * 100))
         bar_w = int((bx1 - bx0 - 4) * pct / 100)
-        if bar_w > 12:
+        if bar_w > 20:
             d.rounded_rectangle([bx0 + 2, by0 + 2, bx0 + 2 + bar_w, by1 - 2], radius=6, fill=ACCENT["sim"])
         elif bar_w > 0:
             # PIL's rounded_rectangle breaks ("x1 must be >= x0") when the
@@ -1322,14 +1404,14 @@ def panel_sim(cfg, sim):
         caption = "no limit set · tap to set"
     else:
         caption = "tap to set a limit"
-    centered_text(d, W / 2, 238, caption, font("default_medium", 12), DIM)
+    centered_text(d, W / 2, 250, caption, font("default_medium", 12), DIM)
     draw_page_dots(d, 1)
     return img
 
 
-def panel_openclash(oc, traf):
+def panel_openclash(oc, traf, conn_type=None):
     img, d = new_canvas()
-    draw_header(d, "OPENCLASH", ACCENT["openclash"])
+    draw_header(d, "OPENCLASH", ACCENT["openclash"], conn_type)
 
     if not oc["installed"]:
         centered_text(d, W / 2, 130, "OpenClash isn't installed", font("default_medium", 14), DIM)
@@ -1382,9 +1464,9 @@ MONITOR_CPU_BAR = (16, 144, W - 16, 158)
 MONITOR_RAM_BAR = (16, 200, W - 16, 214)
 
 
-def panel_monitor(net_down, net_up, net_iface, cpu_pct, ram_pct, ram_used_gb, ram_total_gb, temp_c, uptime_min):
+def panel_monitor(net_down, net_up, net_iface, cpu_pct, ram_pct, ram_used_gb, ram_total_gb, temp_c, uptime_min, conn_type=None):
     img, d = new_canvas()
-    draw_header(d, "MONITOR", ACCENT["monitor"])
+    draw_header(d, "MONITOR", ACCENT["monitor"], conn_type)
 
     bw_label = f"Bandwidth · {net_iface}" if net_iface else "Bandwidth"
     d.text((16, 44), bw_label, font=font("default_medium", 13), fill=DIM)
@@ -1404,7 +1486,7 @@ def panel_monitor(net_down, net_up, net_iface, cpu_pct, ram_pct, ram_used_gb, ra
     d.rounded_rectangle([bx0, by0, bx1, by1], radius=6, outline=DIM, width=1)
     if cpu_pct is not None:
         bw = int((bx1 - bx0 - 4) * cpu_pct / 100)
-        if bw > 8:
+        if bw > 14:
             d.rounded_rectangle([bx0 + 2, by0 + 2, bx0 + 2 + bw, by1 - 2], radius=4, fill=ACCENT["monitor"])
         elif bw > 0:
             # PIL's rounded_rectangle breaks ("x1 must be >= x0") when the
@@ -1420,7 +1502,7 @@ def panel_monitor(net_down, net_up, net_iface, cpu_pct, ram_pct, ram_used_gb, ra
     d.rounded_rectangle([bx0, by0, bx1, by1], radius=6, outline=DIM, width=1)
     if ram_pct is not None:
         bw = int((bx1 - bx0 - 4) * ram_pct / 100)
-        if bw > 8:
+        if bw > 14:
             d.rounded_rectangle([bx0 + 2, by0 + 2, bx0 + 2 + bw, by1 - 2], radius=4, fill=ACCENT["monitor"])
         elif bw > 0:
             d.rectangle([bx0 + 2, by0 + 2, bx0 + 2 + bw, by1 - 2], fill=ACCENT["monitor"])
@@ -1436,9 +1518,9 @@ def panel_monitor(net_down, net_up, net_iface, cpu_pct, ram_pct, ram_used_gb, ra
     return img
 
 
-def panel_weather(cfg, days):
+def panel_weather(cfg, days, conn_type=None):
     img, d = new_canvas()
-    draw_header(d, "WEATHER", ACCENT["weather"])
+    draw_header(d, "WEATHER", ACCENT["weather"], conn_type)
     d.text((16, 44), f"{cfg['weather_city']}  ›", font=font("default_medium", 16), fill=FG)
 
     if not days:
@@ -1887,14 +1969,23 @@ def hit_main_fx(x, y):
 
 
 def hit_main_sim(x, y):
+    tx0, ty0, tx1, ty1 = SIM_CONNECT_TOGGLE_RECT
+    # Extra padding upward (vs. the usual +/-8) so the "Data" label at y=44
+    # -- separated from the toggle itself by a real gap -- is part of the
+    # same tap target rather than a dead zone above it. (The "Roam" label
+    # sits *below* its toggle instead, close enough that the usual +/-8
+    # padding already covers it -- this is why only this one was reported
+    # as unresponsive.)
+    if tx0 - 8 <= x <= tx1 + 8 and ty0 - 20 <= y <= ty1 + 8:
+        return "connect_toggle"
     cx0, cy0, cx1, cy1 = SIM_CHOICE_RECT
     if cx0 - 6 <= x <= cx1 + 6 and cy0 - 6 <= y <= cy1 + 6:
         seg_w = (cx1 - cx0) / len(SIM_CHOICE_KEYS)
         idx = min(len(SIM_CHOICE_KEYS) - 1, max(0, int((x - cx0) / seg_w)))
         return f"choice:{SIM_CHOICE_KEYS[idx]}"
-    tx0, ty0, tx1, ty1 = SIM_DATA_TOGGLE_RECT
+    tx0, ty0, tx1, ty1 = SIM_ROAM_TOGGLE_RECT
     if tx0 - 8 <= x <= tx1 + 8 and ty0 - 8 <= y <= ty1 + 8:
-        return "data_toggle"
+        return "roam_toggle"
     if SIM_DATA_ZONE[0] <= y < SIM_DATA_ZONE[1]:
         return "data_cap"
     return None
@@ -1969,15 +2060,16 @@ def mode_preview(outdir):
     _, cpu_pct = sample_cpu(cpu_sample)
     ram_pct, ram_used_gb, ram_total_gb = get_ram_stats()
     temp_c = get_temp_c()
+    conn_type = get_wan_conn_type()
     cfg_digital = dict(cfg, clock_style="digital")
     screens = [
-        ("clock", panel_clock(cfg, rep)),
-        ("clock_digital", panel_clock(cfg_digital, rep)),
-        ("sim", panel_sim(cfg, sim)),
-        ("weather", panel_weather(cfg, wx)),
-        ("monitor", panel_monitor(net_down, net_up, net_iface, cpu_pct, ram_pct, ram_used_gb, ram_total_gb, temp_c, sysinfo["uptime_min"])),
-        ("fx", panel_fx(cfg, fx, "month")),
-        ("openclash", panel_openclash(oc, traf)),
+        ("clock", panel_clock(cfg, rep, conn_type)),
+        ("clock_digital", panel_clock(cfg_digital, rep, conn_type)),
+        ("sim", panel_sim(cfg, sim, conn_type)),
+        ("weather", panel_weather(cfg, wx, conn_type)),
+        ("monitor", panel_monitor(net_down, net_up, net_iface, cpu_pct, ram_pct, ram_used_gb, ram_total_gb, temp_c, sysinfo["uptime_min"], conn_type)),
+        ("fx", panel_fx(cfg, fx, "month", conn_type)),
+        ("openclash", panel_openclash(oc, traf, conn_type)),
         ("city_top", panel_city_picker("top", cfg)),
         ("city_bottom", panel_city_picker("bottom", cfg)),
         ("fx_top_from", panel_currency_picker("top", "from", cfg)),
@@ -2145,22 +2237,25 @@ def mode_live():
     temp_c = get_temp_c()
     mon_uptime_min = get_system_info()["uptime_min"]
     last_mon_check = time.time()
+    conn_type = get_wan_conn_type()
+    last_conn_check = time.time()
 
     def render_main(idx):
         name = PANEL_NAMES[idx]
         if name == "clock":
-            return panel_clock(cfg, rep)
+            return panel_clock(cfg, rep, conn_type)
         elif name == "fx":
-            return panel_fx(cfg, fx, fx_range)
+            return panel_fx(cfg, fx, fx_range, conn_type)
         elif name == "sim":
-            return panel_sim(cfg, sim)
+            display_sim = sim if sim_connect_override is None else dict(sim, data_up=sim_connect_override)
+            return panel_sim(cfg, display_sim, conn_type)
         elif name == "openclash":
-            return panel_openclash(oc, traf)
+            return panel_openclash(oc, traf, conn_type)
         elif name == "weather":
-            return panel_weather(cfg, wx)
+            return panel_weather(cfg, wx, conn_type)
         else:
             net_iface = net_sample[0] if net_sample else None
-            return panel_monitor(net_down, net_up, net_iface, cpu_pct, ram_pct, ram_used_gb, ram_total_gb, temp_c, mon_uptime_min)
+            return panel_monitor(net_down, net_up, net_iface, cpu_pct, ram_pct, ram_used_gb, ram_total_gb, temp_c, mon_uptime_min, conn_type)
 
     panel_idx = 0
     view = "main"
@@ -2242,6 +2337,19 @@ def mode_live():
     kb_target_ssid = kb_target_bssid = None
     picker_scroll_base = 0.0
     fx_edit_side = "from"
+    # Optimistic display state for the cellular connect toggle: this
+    # router's own backhaul manager can silently revert a manual ifup
+    # when a healthier WAN (the repeater WiFi) is already up, sometimes
+    # within a couple of seconds -- from the user's side a tap that WAS
+    # received looked identical to a tap that wasn't, since the toggle
+    # never visibly moved. Show the tapped-for state immediately, then
+    # after CONNECT_OPTIMISTIC_SECONDS re-check the real interface state
+    # and snap back if it didn't actually take. This is purely cosmetic
+    # confirmation that the tap registered -- it doesn't change whether
+    # the connection itself succeeds.
+    sim_connect_override = None
+    sim_connect_override_until = 0.0
+    CONNECT_OPTIMISTIC_SECONDS = 2.0
 
     while not _stop:
         now = time.time()
@@ -2279,6 +2387,12 @@ def mode_live():
                     temp_c = get_temp_c()
                     mon_uptime_min = get_system_info()["uptime_min"]
                     last_mon_check = now
+                if now - last_conn_check > 20:
+                    conn_type = get_wan_conn_type()
+                    last_conn_check = now
+                if sim_connect_override is not None and now >= sim_connect_override_until:
+                    sim = get_sim_status(cfg)
+                    sim_connect_override = None
                 if now - last_draw >= 1:
                     cur_img = render_main(panel_idx)
                     write_frame(cur_img)
@@ -2375,8 +2489,13 @@ def mode_live():
                             if choice != sim["sim_choice"]:
                                 set_sim_choice(choice)
                                 sim = get_sim_status(cfg)
-                        elif name == "sim" and zone == "data_toggle":
-                            set_cellular_data_enabled(not sim["data_up"])
+                        elif name == "sim" and zone == "connect_toggle":
+                            new_state = not sim["data_up"]
+                            set_cellular_data_enabled(new_state)
+                            sim_connect_override = new_state
+                            sim_connect_override_until = now + CONNECT_OPTIMISTIC_SECONDS
+                        elif name == "sim" and zone == "roam_toggle":
+                            set_roaming_enabled(sim["iccid"], not sim["roaming"])
                             sim = get_sim_status(cfg)
                         elif name == "sim" and zone == "data_cap":
                             new_view = "datacap"
@@ -2592,8 +2711,9 @@ def mode_live():
                         sub_dirty = True
                     elif action == "select":
                         ap = rep_networks[val]
-                        if ap["open"]:
-                            repeater_connect(ap["ssid"], ap["bssid"], "")
+                        remembered_key = None if ap["open"] else get_remembered_repeater_keys().get(ap["ssid"])
+                        if ap["open"] or remembered_key is not None:
+                            repeater_connect(ap["ssid"], ap["bssid"], remembered_key or "")
                             time.sleep(0.5)
                             rep = get_repeater_status()
                             start_repeater_scan()
