@@ -61,7 +61,9 @@ open networks directly or opens the on-screen keyboard for a password.
 Uses the same `ubus` `repeater` object the stock GL.iNet UI uses.
 
 **More** (from the Home tile) — 2.4GHz/5GHz radio toggles, an Analog/Digital
-clock-style switch, uptime/LAN IP, and a confirm-gated reboot.
+clock-style switch, a **Return to Stock UI** button (switches back
+immediately, no confirm dialog — same effect as the power-button hold
+gesture, just more discoverable/reliable), and a confirm-gated reboot.
 
 **On-screen keyboard** — built because this screen has no physical or
 pop-up keyboard. Two layers (letters/symbols), persistent caps toggle.
@@ -73,12 +75,19 @@ pop-up keyboard. Two layers (letters/symbols), persistent caps toggle.
 - **Tap** into a panel for detail screens (pick a city, pick a currency, set
   a data cap, configure OpenClash's node, etc). Tap the header or swipe
   right to go back.
-- **Triple-press the power button** to switch between this dashboard and the
-  stock GL.iNet screen at any time (round-trip tested at ~0.3-1.5s).
-- **Single-press the power button** to sleep/wake the screen — real
-  backlight control, not a fake black frame. (Disambiguated from the
-  triple-press by waiting 0.6s of silence after the last press before
-  acting, so a triple-tap doesn't also fire the single-press action.)
+- **Hold the power button ~1-2.5s** to switch between this dashboard and the
+  stock GL.iNet screen at any time (round-trip tested at ~0.3-1.5s). Or use
+  **More → Return to Stock UI** for the same switch without touching the
+  power button at all.
+- **Quick-tap the power button** to sleep/wake the screen — real backlight
+  control, not a fake black frame. Classified by press *duration* on
+  release (tap vs. hold), not by counting presses — an earlier tap-counting
+  design (single tap = sleep, triple tap = switch UI) turned out to be
+  fragile against contact bounce, where one physical tap could register as
+  two raw press/release edges; duration-based detection sidesteps that
+  since each press/release pair is handled the instant it completes.
+  Holding past ~2.5s is left alone entirely and falls through to the
+  hardware's own long-press-to-poweroff path.
 
 ## Requirements
 

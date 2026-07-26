@@ -315,6 +315,51 @@ def fetch_fx_history(from_code, to_code, rng):
     return cached["points"] if cached else []
 
 
+_fx_hist_cache = {}  # (from_code, to_code, rng) -> {"points": [...] or None, "fetching": bool}
+
+
+def get_fx_history_cached(from_code, to_code, rng):
+    """Non-blocking wrapper around fetch_fx_history. panel_fx() renders
+    from the touch-handling loop (both for normal redraws and for the
+    neighbor-panel pre-render at drag-start), so it can never block on
+    fetch_fx_history's network call -- a cache miss there was measured to
+    freeze the whole UI for up to 6s (curl's --max-time), which got much
+    more likely once Currency stopped being fixed-target-CNY and gained a
+    10x10 from/to combination space. Same reasoning as the repeater-scan
+    background thread: don't call unmeasured/slow I/O synchronously from
+    the touch path. Returns already-available points immediately (empty
+    list if nothing cached yet), kicking off a background fetch instead of
+    blocking."""
+    if from_code == to_code:
+        return fetch_fx_history(from_code, to_code, rng)  # synthetic flat line, no network
+
+    key = (from_code, to_code, rng)
+    entry = _fx_hist_cache.get(key)
+    if entry is None:
+        cache_file = STATE_DIR / f"fx_hist_{from_code}_{to_code}_{rng}.json"
+        cached_points = None
+        if cache_file.exists():
+            try:
+                cached = json.loads(cache_file.read_text())
+                if time.time() - cached.get("ts", 0) < 12 * 3600:
+                    cached_points = cached["points"]
+            except Exception:
+                pass
+        entry = {"points": cached_points, "fetching": False}
+        _fx_hist_cache[key] = entry
+
+    if entry["points"] is None and not entry["fetching"]:
+        entry["fetching"] = True
+
+        def worker():
+            entry["points"] = fetch_fx_history(from_code, to_code, rng)
+            entry["fetching"] = False
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    return entry["points"] or []
+
+
 # WMO weather codes (Open-Meteo) -> (short label, icon key)
 _WMO_MAP = {
     0: ("Clear", "sun"), 1: ("Mostly clear", "sun"), 2: ("Partly cloudy", "cloud_sun"),
@@ -503,6 +548,14 @@ def get_system_info():
 
 def reboot_router():
     subprocess.Popen(["/sbin/reboot"])
+
+
+def switch_to_stock_ui():
+    # Non-blocking: toggle.sh off stops citydash (this very process), so it
+    # has to keep running independently of us -- same pattern as reboot_router
+    # above. run.sh's signal forwarding + the existing power-button hold
+    # gesture already exercise this exact shutdown path.
+    subprocess.Popen(["/root/dashboard/toggle.sh", "off"])
 
 
 # ---------- system monitor (bandwidth + CPU/RAM/temp) ----------
@@ -1198,13 +1251,13 @@ def panel_fx(cfg, fx, fx_range):
     bot_rate = rate_between(bot_from, bot_to, fx)
 
     draw_fx_row(d, 40, 38, top_from, top_rate, top_to)
-    top_hist = fetch_fx_history(top_from, top_to, fx_range)
+    top_hist = get_fx_history_cached(top_from, top_to, fx_range)
     draw_sparkline(d, 16, 62, W - 32, 56, top_hist, ACCENT["fx"])
 
     d.line([16, 126, W - 16, 126], fill=DIM)
 
     draw_fx_row(d, 132, 130, bot_from, bot_rate, bot_to)
-    bot_hist = fetch_fx_history(bot_from, bot_to, fx_range)
+    bot_hist = get_fx_history_cached(bot_from, bot_to, fx_range)
     draw_sparkline(d, 16, 154, W - 32, 56, bot_hist, ACCENT["fx"])
 
     rx0, ry0, rx1, ry1 = FX_RANGE_RECT
@@ -1258,8 +1311,12 @@ def panel_sim(cfg, sim):
     if used is not None and cap:
         pct = max(0, min(100, used / cap * 100))
         bar_w = int((bx1 - bx0 - 4) * pct / 100)
-        if bar_w > 0:
+        if bar_w > 12:
             d.rounded_rectangle([bx0 + 2, by0 + 2, bx0 + 2 + bar_w, by1 - 2], radius=6, fill=ACCENT["sim"])
+        elif bar_w > 0:
+            # PIL's rounded_rectangle breaks ("x1 must be >= x0") when the
+            # shape is thinner than ~2x the corner radius.
+            d.rectangle([bx0 + 2, by0 + 2, bx0 + 2 + bar_w, by1 - 2], fill=ACCENT["sim"])
         caption = f"{pct:.0f}% of {cap_label(cap)} used"
     elif cap is None:
         caption = "no limit set · tap to set"
@@ -1347,8 +1404,14 @@ def panel_monitor(net_down, net_up, net_iface, cpu_pct, ram_pct, ram_used_gb, ra
     d.rounded_rectangle([bx0, by0, bx1, by1], radius=6, outline=DIM, width=1)
     if cpu_pct is not None:
         bw = int((bx1 - bx0 - 4) * cpu_pct / 100)
-        if bw > 0:
+        if bw > 8:
             d.rounded_rectangle([bx0 + 2, by0 + 2, bx0 + 2 + bw, by1 - 2], radius=4, fill=ACCENT["monitor"])
+        elif bw > 0:
+            # PIL's rounded_rectangle breaks ("x1 must be >= x0") when the
+            # shape is thinner than ~2x the corner radius -- plain
+            # rectangle for anything that thin (same fix as elsewhere in
+            # this file for the same underlying PIL quirk).
+            d.rectangle([bx0 + 2, by0 + 2, bx0 + 2 + bw, by1 - 2], fill=ACCENT["monitor"])
 
     d.text((16, 180), "RAM", font=font("default_medium", 14), fill=FG)
     ram_txt = f"{ram_used_gb:.1f} / {ram_total_gb:.1f} GB" if ram_pct is not None else "—"
@@ -1357,8 +1420,10 @@ def panel_monitor(net_down, net_up, net_iface, cpu_pct, ram_pct, ram_used_gb, ra
     d.rounded_rectangle([bx0, by0, bx1, by1], radius=6, outline=DIM, width=1)
     if ram_pct is not None:
         bw = int((bx1 - bx0 - 4) * ram_pct / 100)
-        if bw > 0:
+        if bw > 8:
             d.rounded_rectangle([bx0 + 2, by0 + 2, bx0 + 2 + bw, by1 - 2], radius=4, fill=ACCENT["monitor"])
+        elif bw > 0:
+            d.rectangle([bx0 + 2, by0 + 2, bx0 + 2 + bw, by1 - 2], fill=ACCENT["monitor"])
 
     d.line([16, 230, W - 16, 230], fill=(40, 44, 54))
 
@@ -1446,38 +1511,37 @@ def hit_confirm(x, y):
 
 # ---------- More / settings ----------
 
-MORE_WIFI24_TOGGLE = (176, 101, 224, 127)
-MORE_WIFI5_TOGGLE = (176, 138, 224, 164)
-MORE_CLOCK_STYLE_SEG = (16, 218, 224, 244)
-MORE_REBOOT_RECT = (16, 270, W - 16, 306)
+MORE_WIFI24_TOGGLE = (176, 37, 224, 63)
+MORE_WIFI5_TOGGLE = (176, 74, 224, 100)
+MORE_CLOCK_STYLE_SEG = (16, 154, 224, 180)
+MORE_RETURN_STOCK_RECT = (16, 206, W - 16, 242)
+MORE_REBOOT_RECT = (16, 252, W - 16, 288)
 
 
-def panel_more(sysinfo, wifi24, wifi5, clock_style):
+def panel_more(wifi24, wifi5, clock_style):
     img, d = new_canvas()
     draw_back_header(d, "More", ACCENT["clock"])
 
-    d.text((16, 44), "System", font=font("default_medium", 13), fill=DIM)
-    up_h, up_m = divmod(sysinfo["uptime_min"], 60)
-    d.text((16, 62), f"Up {up_h}h {up_m}m  ·  {sysinfo['lan_ip']}", font=font("default_medium", 13), fill=FG)
-
-    d.line([16, 92, W - 16, 92], fill=(40, 44, 54))
-
-    d.text((16, 108), "2.4GHz WiFi", font=font("default_medium", 15), fill=FG)
+    d.text((16, 44), "2.4GHz WiFi", font=font("default_medium", 15), fill=FG)
     tx0, ty0, tx1, ty1 = MORE_WIFI24_TOGGLE
     draw_toggle(d, tx0, ty0, wifi24, ACCENT["clock"], w=tx1 - tx0, h=ty1 - ty0)
 
-    d.text((16, 145), "5GHz WiFi", font=font("default_medium", 15), fill=FG)
+    d.text((16, 81), "5GHz WiFi", font=font("default_medium", 15), fill=FG)
     tx0, ty0, tx1, ty1 = MORE_WIFI5_TOGGLE
     draw_toggle(d, tx0, ty0, wifi5, ACCENT["clock"], w=tx1 - tx0, h=ty1 - ty0)
 
-    d.line([16, 182, W - 16, 182], fill=(40, 44, 54))
+    d.line([16, 118, W - 16, 118], fill=(40, 44, 54))
 
-    d.text((16, 192), "Clock Style", font=font("default_medium", 15), fill=FG)
+    d.text((16, 128), "Clock Style", font=font("default_medium", 15), fill=FG)
     sx0, sy0, sx1, sy1 = MORE_CLOCK_STYLE_SEG
     sel_idx = 0 if clock_style == "analog" else 1
     draw_segmented(d, sx0, sy0, sx1 - sx0, sy1 - sy0, ["Analog", "Digital"], sel_idx, ACCENT["clock"])
 
-    d.line([16, 258, W - 16, 258], fill=(40, 44, 54))
+    d.line([16, 194, W - 16, 194], fill=(40, 44, 54))
+
+    rx0, ry0, rx1, ry1 = MORE_RETURN_STOCK_RECT
+    d.rounded_rectangle([rx0, ry0, rx1, ry1], radius=8, outline=ACCENT["clock"], width=2)
+    centered_text(d, (rx0 + rx1) / 2, ry0 + 10, "Return to Stock UI", font("default_bold", 14), ACCENT["clock"])
 
     rx0, ry0, rx1, ry1 = MORE_REBOOT_RECT
     d.rounded_rectangle([rx0, ry0, rx1, ry1], radius=8, outline=(200, 80, 80), width=2)
@@ -1496,6 +1560,9 @@ def hit_more(x, y):
     sx0, sy0, sx1, sy1 = MORE_CLOCK_STYLE_SEG
     if sx0 <= x <= sx1 and sy0 <= y <= sy1:
         return "clock_analog" if x < (sx0 + sx1) / 2 else "clock_digital"
+    rx0, ry0, rx1, ry1 = MORE_RETURN_STOCK_RECT
+    if rx0 <= x <= rx1 and ry0 <= y <= ry1:
+        return "return_stock"
     rx0, ry0, rx1, ry1 = MORE_REBOOT_RECT
     if rx0 <= x <= rx1 and ry0 <= y <= ry1:
         return "reboot"
@@ -1920,7 +1987,7 @@ def mode_preview(outdir):
         ("datacap", panel_datacap_picker(cfg)),
         ("oc_nodes", panel_node_picker(traf)),
         ("weather_city", panel_weather_picker(cfg)),
-        ("more", panel_more(sysinfo, wifi24, wifi5, cfg["clock_style"])),
+        ("more", panel_more(wifi24, wifi5, cfg["clock_style"])),
         ("repeater", panel_repeater(rep, rep_networks)),
         ("confirm", panel_confirm("Reboot", "Reboot the router now?", ACCENT["clock"], yes_label="Reboot", danger=True)),
         ("keyboard", panel_keyboard("Wi-Fi Password", "myPass", "letters", True, ACCENT["clock"])),
@@ -2277,7 +2344,6 @@ def mode_live():
                             start_repeater_scan()
                         elif name == "clock" and zone == "more":
                             new_view = "more"
-                            sysinfo = get_system_info()
                             wifi24 = get_wifi_radio_state("wifi0")
                             wifi5 = get_wifi_radio_state("wifi1")
                         elif name == "fx" and zone == "top_from":
@@ -2412,7 +2478,7 @@ def mode_live():
 
             if sub_dirty:
                 if view == "more":
-                    img = panel_more(sysinfo, wifi24, wifi5, cfg["clock_style"])
+                    img = panel_more(wifi24, wifi5, cfg["clock_style"])
                 elif view == "repeater":
                     img = panel_repeater(rep, rep_networks)
                 elif view == "confirm":
@@ -2502,6 +2568,8 @@ def mode_live():
                         cfg["clock_style"] = "digital"
                         save_config(cfg)
                         sub_dirty = True
+                    elif action == "return_stock":
+                        switch_to_stock_ui()
                     elif action == "reboot":
                         confirm_title = "Reboot"
                         confirm_message = "Reboot the router now?"
