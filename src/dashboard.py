@@ -1375,6 +1375,18 @@ def centered_text(d, cx, y, text, f, fill):
     d.text((cx - tw / 2, y), text, font=f, fill=fill)
 
 
+def centered_text_box(d, x0, y0, x1, y1, text, f, fill):
+    """Centers on both axes within [x0,y0,x1,y1] -- unlike centered_text
+    (horizontal-only, `y` is a hand-picked top offset), this accounts for
+    the font's actual glyph bbox so it lands in the true middle of a
+    button regardless of font metrics or box height."""
+    bbox = d.textbbox((0, 0), text, font=f)
+    tw, th = bbox[2] - bbox[0], bbox[3] - bbox[1]
+    tx = (x0 + x1) / 2 - tw / 2
+    ty = y0 + ((y1 - y0) - th) / 2 - bbox[1]
+    d.text((tx, ty), text, font=f, fill=fill)
+
+
 def truncate_to_width(d, text, f, max_w):
     if d.textbbox((0, 0), text, font=f)[2] <= max_w:
         return text
@@ -1550,7 +1562,7 @@ def panel_fx(cfg, fx, fx_range, conn_type=None, cell_signal=None):
 
     bx0, by0, bx1, by1 = FX_BUTTON
     d.rounded_rectangle([bx0, by0, bx1, by1], radius=(by1 - by0) / 2, outline=ACCENT["fx"], width=2)
-    centered_text(d, (bx0 + bx1) / 2, by0 + 4, "Update Now", font("default_medium", 12), ACCENT["fx"])
+    centered_text_box(d, bx0, by0, bx1, by1, "Update Now", font("default_medium", 12), ACCENT["fx"])
     draw_page_dots(d, 4)
     return img
 
@@ -1660,7 +1672,7 @@ def panel_openclash(oc, traf, conn_type=None, cell_signal=None):
 
     bx0, by0, bx1, by1 = OC_UPDATE_BUTTON
     d.rounded_rectangle([bx0, by0, bx1, by1], radius=(by1 - by0) / 2, outline=ACCENT["openclash"], width=2)
-    centered_text(d, (bx0 + bx1) / 2, by0 + 4, "Update Subscription", font("default_medium", 12), ACCENT["openclash"])
+    centered_text_box(d, bx0, by0, bx1, by1, "Update Subscription", font("default_medium", 12), ACCENT["openclash"])
     draw_page_dots(d, 5)
     return img
 
