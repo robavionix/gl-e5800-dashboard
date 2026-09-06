@@ -16,6 +16,7 @@ Usage:
                           channel order on real hardware
 """
 import json
+import math
 import os
 import signal
 import struct
@@ -26,6 +27,7 @@ import time
 from datetime import datetime, timedelta
 from pathlib import Path
 
+import numpy as np
 from PIL import Image, ImageDraw, ImageFont
 
 W, H = 240, 320
@@ -162,12 +164,22 @@ def font(name, size):
     return _fonts[key]
 
 
-def run(cmd, timeout=8):
+def run_checked(cmd, timeout=8):
+    """(ok, stdout). ok is False when the command could not run at all
+    (binary missing, timeout, ...) or exited non-zero -- which is a
+    different thing from a command that ran fine and printed nothing.
+    run() collapses both to "" for the many callers that genuinely do not
+    care; anything that would otherwise read a failure as a meaningful
+    empty value must use this instead."""
     try:
         out = subprocess.run(cmd, capture_output=True, timeout=timeout, text=True)
-        return out.stdout.strip()
+        return out.returncode == 0, out.stdout.strip()
     except Exception:
-        return ""
+        return False, ""
+
+
+def run(cmd, timeout=8):
+    return run_checked(cmd, timeout)[1]
 
 
 def ubus_call(obj, method, params=None):
@@ -181,8 +193,14 @@ def ubus_call(obj, method, params=None):
         return {}
 
 
-def uci_get(key):
-    return run(["uci", "-q", "get", key])
+def uci_get(key, default=""):
+    """`uci -q get` exits non-zero both for an absent key and for uci
+    itself failing, so those two stay indistinguishable here -- callers
+    that must tell them apart (get_wifi_radio_state) probe the section as
+    well. `default` exists so a caller can at least choose which way an
+    unreadable value falls."""
+    ok, out = run_checked(["uci", "-q", "get", key])
+    return out if ok else default
 
 
 def uci_set(key, val):
@@ -192,13 +210,35 @@ def uci_set(key, val):
 
 BACKLIGHT_PATH = "/sys/class/backlight/soc:backlight/brightness"
 
+# button_watch.py drops this file instead of switching the UI out from
+# under you: a 1-2s hold is easy to trigger by accident (it sits between
+# "tap" and the hardware's own poweroff hold), and losing the whole
+# dashboard with no warning or undo is a harsh outcome for a misread
+# gesture. When the dashboard is running it now gets to ask first. Going
+# the other way -- stock UI back to dashboard -- still switches directly,
+# since there is nothing of ours on screen to ask with.
+SWITCH_REQUEST_FILE = "/tmp/dashboard_ui_switch_request"
+
+
+_asleep_cache = {"ts": 0.0, "val": False}
+_ASLEEP_TTL = 0.4
+
 
 def is_screen_asleep():
+    """Cached for _ASLEEP_TTL: mode_live polls this every loop iteration
+    (~80x/s), and re-opening a sysfs file that often is pure overhead on
+    this SoC. 0.4s is far below any human-perceptible wake latency."""
+    now = time.time()
+    if now - _asleep_cache["ts"] < _ASLEEP_TTL:
+        return _asleep_cache["val"]
     try:
         with open(BACKLIGHT_PATH) as f:
-            return f.read().strip() == "0"
+            val = f.read().strip() == "0"
     except Exception:
-        return False
+        val = False
+    _asleep_cache["ts"] = now
+    _asleep_cache["val"] = val
+    return val
 
 
 # ---------- config ----------
@@ -214,8 +254,19 @@ def load_config():
 
 
 def save_config(cfg):
+    """Atomic: write a sibling temp file, fsync, then rename over the real
+    one. A plain write_text can leave a half-written file if the router
+    loses power mid-write -- and load_config silently falls back to
+    DEFAULT_CONFIG on a parse error, so that would wipe every setting with
+    no indication why. There is a Shutdown button in this very UI, so this
+    is not a theoretical window."""
     STATE_DIR.mkdir(parents=True, exist_ok=True)
-    CONFIG_FILE.write_text(json.dumps(cfg))
+    tmp = CONFIG_FILE.with_suffix(".json.tmp")
+    with open(tmp, "w") as f:
+        json.dump(cfg, f)
+        f.flush()
+        os.fsync(f.fileno())
+    os.replace(tmp, CONFIG_FILE)
 
 
 def city_name(tz_id):
@@ -231,6 +282,72 @@ def cap_label(v):
     if v >= 1024:
         return f"{v / 1024:.0f} GB"
     return f"{v:.0f} MB"
+
+
+# ---------- background refresh ----------
+
+class Refresher:
+    """Runs the periodic data pulls on one background thread and publishes
+    the results, so the render loop only ever reads already-fetched
+    values.
+
+    Every one of these jobs used to be called straight from mode_live's
+    idle branch. fetch_fx alone blocks for up to curl's --max-time (8s),
+    and the weather tick does two of those back to back -- during which
+    the loop drew nothing and read no touch events, i.e. the screen was
+    genuinely frozen for up to ~16s at a time. The author had already
+    diagnosed exactly this class of bug twice (see get_fx_history_cached
+    and the repeater-scan thread) and moved those off the UI path; these
+    were the ones left behind.
+
+    Jobs are plain callables run in registration order; a job that raises
+    keeps its previous value rather than taking the thread down."""
+
+    def __init__(self):
+        self.lock = threading.Lock()
+        self._values = {}
+        self._jobs = []          # [name, fn, interval, next_at]
+        self._wake = threading.Event()
+
+    def add(self, name, fn, interval, initial=None, run_now=True):
+        with self.lock:
+            self._values[name] = initial
+        self._jobs.append([name, fn, interval, 0.0 if run_now else time.time() + interval])
+
+    def get(self, name, default=None):
+        with self.lock:
+            val = self._values.get(name)
+        return default if val is None else val
+
+    def request(self, name):
+        """Ask for one job to run as soon as the worker next wakes."""
+        for job in self._jobs:
+            if job[0] == name:
+                job[3] = 0.0
+        self._wake.set()
+
+    def start(self):
+        threading.Thread(target=self._loop, daemon=True).start()
+
+    def _loop(self):
+        while not _stop:
+            now = time.time()
+            sleep_for = 5.0
+            for job in self._jobs:
+                name, fn, interval, next_at = job
+                if now >= next_at:
+                    try:
+                        value = fn()
+                    except Exception:
+                        value = None
+                    job[3] = time.time() + interval
+                    if value is not None:
+                        with self.lock:
+                            self._values[name] = value
+                else:
+                    sleep_for = min(sleep_for, next_at - now)
+            self._wake.wait(max(0.05, sleep_for))
+            self._wake.clear()
 
 
 # ---------- data sources ----------
@@ -318,7 +435,8 @@ def fetch_fx_history(from_code, to_code, rng):
     return cached["points"] if cached else []
 
 
-_fx_hist_cache = {}  # (from_code, to_code, rng) -> {"points": [...] or None, "fetching": bool}
+_fx_hist_cache = {}  # (from, to, rng) -> {"points": [...] or None, "fetching": bool, "failed_at": float}
+_FX_HIST_RETRY_AFTER = 120.0
 
 
 def get_fx_history_cached(from_code, to_code, rng):
@@ -348,15 +466,30 @@ def get_fx_history_cached(from_code, to_code, rng):
                     cached_points = cached["points"]
             except Exception:
                 pass
-        entry = {"points": cached_points, "fetching": False}
+        entry = {"points": cached_points, "fetching": False, "failed_at": 0.0}
         _fx_hist_cache[key] = entry
 
-    if entry["points"] is None and not entry["fetching"]:
+    # A failed fetch used to store [] here, which is not None -- so the
+    # "never fetched yet" guard below stopped firing and the chart stayed
+    # permanently blank for the rest of the process's life after a single
+    # offline moment. Keep points None on failure and retry on a backoff
+    # instead, so the chart heals itself once the network is back.
+    now = time.time()
+    needs_fetch = (entry["points"] is None and not entry["fetching"]
+                   and now - entry.get("failed_at", 0.0) >= _FX_HIST_RETRY_AFTER)
+    if needs_fetch:
         entry["fetching"] = True
 
         def worker():
-            entry["points"] = fetch_fx_history(from_code, to_code, rng)
-            entry["fetching"] = False
+            try:
+                points = fetch_fx_history(from_code, to_code, rng)
+                if points:
+                    entry["points"] = points
+                    entry["failed_at"] = 0.0
+                else:
+                    entry["failed_at"] = time.time()
+            finally:
+                entry["fetching"] = False
 
         threading.Thread(target=worker, daemon=True).start()
 
@@ -531,8 +664,13 @@ def _parse_sms_file(path):
         raw = path.read_bytes()
     except Exception:
         return None
-    sep = raw.find(b"\n\n")
-    header_bytes, body_bytes = (raw, b"") if sep == -1 else (raw[:sep], raw[sep + 2:])
+    # Accept CRLF as well as LF as the header/body separator -- a spool
+    # file written with CRLF contains no "\n\n" at all, so the old check
+    # put the whole file in the header and left every body empty.
+    sep, sep_len = raw.find(b"\r\n\r\n"), 4
+    if sep == -1:
+        sep, sep_len = raw.find(b"\n\n"), 2
+    header_bytes, body_bytes = (raw, b"") if sep == -1 else (raw[:sep], raw[sep + sep_len:])
     header = header_bytes.decode("ascii", errors="replace")
     fields = {}
     for line in header.splitlines():
@@ -807,7 +945,16 @@ def get_wifi_radio_state(iface):
     radio-level flag never touched the setting that actually determines
     whether the WiFi network is visible, which is why the toggle could
     show "on" while the network was genuinely off the whole time."""
-    return uci_get(f"wireless.{iface}.disabled") != "1"
+    ok, out = run_checked(["uci", "-q", "get", f"wireless.{iface}.disabled"])
+    if ok:
+        return out != "1"
+    # Non-zero also means "key absent", which on OpenWrt is the normal way
+    # of saying enabled -- so only call it unknown if the section itself
+    # cannot be read either. Returning None rather than True keeps a broken
+    # uci from being displayed as a confident "WiFi is on".
+    if run_checked(["uci", "-q", "show", f"wireless.{iface}"])[0]:
+        return True
+    return None
 
 
 _wifi_reload_state = {"running": False, "pending": False}
@@ -815,14 +962,25 @@ _wifi_reload_lock = threading.Lock()
 
 
 def _wifi_reload_worker():
-    while True:
+    """The try/finally matters: without it, any exception out of
+    subprocess.run kills this thread while `running` stays True, and
+    request_wifi_reload then refuses to ever start another worker -- every
+    later WiFi toggle would write UCI and silently never reload, which is
+    the exact desync this coalescing was added to prevent."""
+    try:
+        while True:
+            with _wifi_reload_lock:
+                _wifi_reload_state["pending"] = False
+            try:
+                subprocess.run(["/sbin/wifi", "reload"], timeout=60)
+            except Exception:
+                pass
+            with _wifi_reload_lock:
+                if not _wifi_reload_state["pending"]:
+                    return
+    finally:
         with _wifi_reload_lock:
-            _wifi_reload_state["pending"] = False
-        subprocess.run(["/sbin/wifi", "reload"])
-        with _wifi_reload_lock:
-            if not _wifi_reload_state["pending"]:
-                _wifi_reload_state["running"] = False
-                return
+            _wifi_reload_state["running"] = False
 
 
 def request_wifi_reload():
@@ -878,14 +1036,25 @@ def get_wifi56_conflict_idx(rep):
     return None
 
 
+_lan_ip_cache = {"ts": 0.0, "val": None}
+
+
 def get_system_info():
-    uptime_s = run(["cat", "/proc/uptime"]).split()[0]
+    """Reads /proc/uptime directly instead of spawning `cat`, and caches
+    the LAN IP for a minute: mode_live calls this every 2s purely for the
+    uptime line, and two process spawns every 2s is real load on this
+    SoC for a number that changes once a minute."""
+    uptime_min = 0
     try:
-        uptime_min = int(float(uptime_s) / 60)
+        with open("/proc/uptime") as f:
+            uptime_min = int(float(f.read().split()[0]) / 60)
     except Exception:
-        uptime_min = 0
-    lan_ip = uci_get("network.lan.ipaddr") or "192.168.8.1"
-    return {"uptime_min": uptime_min, "lan_ip": lan_ip}
+        pass
+    now = time.time()
+    if _lan_ip_cache["val"] is None or now - _lan_ip_cache["ts"] > 60:
+        _lan_ip_cache["val"] = uci_get("network.lan.ipaddr") or "192.168.8.1"
+        _lan_ip_cache["ts"] = now
+    return {"uptime_min": uptime_min, "lan_ip": _lan_ip_cache["val"]}
 
 
 def reboot_router():
@@ -897,11 +1066,16 @@ def shutdown_router():
 
 
 def switch_to_stock_ui():
-    # Non-blocking: toggle.sh off stops citydash (this very process), so it
-    # has to keep running independently of us -- same pattern as reboot_router
-    # above. run.sh's signal forwarding + the existing power-button hold
-    # gesture already exercise this exact shutdown path.
-    subprocess.Popen(["/root/dashboard/toggle.sh", "off"])
+    # Non-blocking AND detached: toggle.sh off stops citydash (this very
+    # process), so it has to outlive us. Popen alone leaves it in our
+    # process group, so procd's stop can take it down partway through --
+    # after gl_screen has been stopped but before it is started again,
+    # which leaves the physical screen dark with neither UI running.
+    # start_new_session puts it in its own session so that can't happen.
+    try:
+        subprocess.Popen(["/root/dashboard/toggle.sh", "off"], start_new_session=True)
+    except TypeError:      # very old Python without start_new_session
+        subprocess.Popen(["setsid", "/root/dashboard/toggle.sh", "off"])
 
 
 # ---------- system monitor (bandwidth + CPU/RAM/temp) ----------
@@ -1146,7 +1320,7 @@ def set_openclash_mode(mode):
         subprocess.Popen(["/etc/init.d/openclash", "restart"])
 
 
-def update_openclash_subscription():
+def update_openclash_subscription(wait=False):
     """Re-fetches every configured subscription and reloads if changed --
     the same script LuCI's own subscription page runs. With no argument,
     openclash.sh iterates all openclash.@config_subscribe[] sections
@@ -1156,8 +1330,15 @@ def update_openclash_subscription():
     like reboot_router/switch_to_stock_ui -- never run synchronously from
     the touch-handling path."""
     if not openclash_installed():
-        return
-    subprocess.Popen(["/usr/share/openclash/openclash.sh"])
+        return False
+    proc = subprocess.Popen(["/usr/share/openclash/openclash.sh"])
+    if not wait:
+        return True
+    try:
+        proc.wait(timeout=180)
+    except Exception:
+        return False
+    return proc.returncode == 0
 
 
 _COUNTRY_NAME_HINTS = [
@@ -1194,10 +1375,19 @@ def _mihomo_api():
     return f"http://127.0.0.1:{port}", headers
 
 
+def openclash_traffic_empty():
+    """Single source of truth for the shape panel_openclash and
+    panel_node_picker expect. mode_live seeds its first frame from this
+    too -- hand-writing a second "empty" dict there is exactly how you end
+    up with a KeyError on the very first render, before any refresh has
+    landed."""
+    return {"running": False, "up_mb": None, "down_mb": None, "node_name": None,
+            "node_country": None, "nodes": [], "group": None}
+
+
 def get_openclash_traffic_and_node():
     if not openclash_installed():
-        return {"running": False, "up_mb": None, "down_mb": None, "node_name": None,
-                "node_country": None, "nodes": [], "group": None}
+        return openclash_traffic_empty()
     base, headers = _mihomo_api()
     conn_raw = run(["curl", "-s", "--max-time", "2"] + headers + [f"{base}/connections"])
     try:
@@ -1205,8 +1395,7 @@ def get_openclash_traffic_and_node():
         up_mb = conn.get("uploadTotal", 0) / 1024 / 1024
         down_mb = conn.get("downloadTotal", 0) / 1024 / 1024
     except Exception:
-        return {"running": False, "up_mb": None, "down_mb": None, "node_name": None,
-                "node_country": None, "nodes": [], "group": None}
+        return openclash_traffic_empty()
 
     node_name, node_country, nodes, group = None, None, [], None
     proxies_raw = run(["curl", "-s", "--max-time", "2"] + headers + [f"{base}/proxies"])
@@ -1378,7 +1567,6 @@ _FOG = (130, 138, 152)
 def _icon_sun(d, cx, cy, r):
     d.ellipse([cx - r, cy - r, cx + r, cy + r], fill=_SUN)
     for i in range(8):
-        import math
         ang = i * math.pi / 4
         x0, y0 = cx + math.cos(ang) * r * 1.35, cy + math.sin(ang) * r * 1.35
         x1, y1 = cx + math.cos(ang) * r * 1.7, cy + math.sin(ang) * r * 1.7
@@ -1409,7 +1597,6 @@ def _icon_snow(d, cx, cy, r):
     for dx in (-0.5, 0, 0.5):
         x, y = cx + dx * r, cy + r * 1.0
         for ang in range(0, 180, 60):
-            import math
             rad = math.radians(ang)
             d.line([x - 4 * math.cos(rad), y - 4 * math.sin(rad),
                     x + 4 * math.cos(rad), y + 4 * math.sin(rad)], fill=_SNOW, width=1)
@@ -1437,7 +1624,6 @@ def draw_weather_icon(d, cx, cy, r, icon_key):
 
 
 def draw_analog_clock(d, cx, cy, r, dt, accent):
-    import math
     d.ellipse([cx - r, cy - r, cx + r, cy + r], outline=FG, width=2)
     for h in range(12):
         ang = math.radians(h * 30 - 90)
@@ -1468,7 +1654,6 @@ def draw_digital_clock(d, cx, cy, dt, accent):
 
 
 def _icon_wifi_signal(d, cx, cy, r, color):
-    import math
     d.ellipse([cx - 2, cy + r * 0.55 - 2, cx + 2, cy + r * 0.55 + 2], fill=color)
     for frac in (0.45, 0.72, 1.0):
         rr = r * frac
@@ -1500,6 +1685,87 @@ def _icon_sms(d, cx, cy, r, color):
     d.rounded_rectangle([x0, y0, x1, y1], radius=3, outline=color, width=2)
     d.line([x0, y0, cx, cy + r * 0.15], fill=color, width=2)
     d.line([cx, cy + r * 0.15, x1, y0], fill=color, width=2)
+
+
+# ---------- loading overlay ----------
+
+SPINNER_SPEED_DPS = 300.0     # degrees/second -- iOS-ish, brisk but calm
+
+
+def draw_ring_spinner(d, cx, cy, r, phase_deg, accent, width=3, arc_deg=270, segments=18):
+    """A rotating arc with a brightness ramp toward its leading end. PIL
+    can only stroke an arc in one flat colour, so the ramp is drawn as
+    `segments` short arcs -- cheap at this size and it reads as a proper
+    fading tail rather than a plain spinning stick."""
+    track = _mix(BG, accent, 0.18)
+    d.arc([cx - r, cy - r, cx + r, cy + r], 0, 360, fill=track, width=width)
+    step = arc_deg / segments
+    for i in range(segments):
+        t = (i + 1) / segments                     # 0 = tail, 1 = head
+        col = _mix(track, accent, t * t)           # squared: longer dim tail
+        a0 = phase_deg + i * step
+        d.arc([cx - r, cy - r, cx + r, cy + r], a0, a0 + step + 1, fill=col, width=width)
+
+
+def draw_loading_overlay(base, label=None, phase_deg=0.0, accent=None):
+    """Dim whatever was on screen and float a spinner (and optional
+    caption) over it. Keeping the real screen visible underneath -- rather
+    than replacing it with a blank "loading" page -- is what makes a slow
+    action read as *busy* instead of *crashed*, which was the whole
+    complaint: several actions here take seconds with no feedback at all."""
+    accent = accent or ACCENT["clock"]
+    img = Image.blend(base, Image.new("RGB", (W, H), (0, 0, 0)), 0.62)
+    d = ImageDraw.Draw(img)
+    cx, cy = W // 2, H // 2 - (12 if label else 0)
+    if label:
+        f = font("default_medium", 13)
+        tw = d.textlength(label, font=f)
+        card_w = max(132, tw + 44)
+        card_h = 116
+        x0, y0 = cx - card_w / 2, cy - 44
+        d.rounded_rectangle([x0, y0, x0 + card_w, y0 + card_h], radius=16,
+                            fill=(26, 34, 52), outline=(48, 58, 82))
+        draw_ring_spinner(d, cx, cy + 2, 17, phase_deg, accent)
+        centered_text(d, cx, y0 + card_h - 28, label, f, FG)
+    else:
+        draw_ring_spinner(d, cx, cy, 19, phase_deg, accent)
+    return img
+
+
+def run_with_spinner(base_img, label, fn, accent=None, min_visible=0.4, fps=30):
+    """Run fn() on a worker thread, animating the overlay until it returns.
+
+    Used for the handful of genuinely slow, *user-initiated* actions
+    (force-refresh, picking a weather city, applying a data cap). Those
+    can't just be moved to the background refresher the way the periodic
+    pulls were -- the user is waiting on the result -- so instead of
+    freezing on a still frame they now get a live spinner over the screen
+    they tapped from. min_visible stops a fast action from flashing the
+    overlay for two frames."""
+    box = {}
+
+    def worker():
+        try:
+            box["value"] = fn()
+        except Exception:
+            box["value"] = None
+
+    th = threading.Thread(target=worker, daemon=True)
+    th.start()
+    t0 = time.time()
+    interval = 1.0 / fps
+    while True:
+        elapsed = time.time() - t0
+        if not th.is_alive() and elapsed >= min_visible:
+            break
+        write_frame(draw_loading_overlay(base_img, label, elapsed * SPINNER_SPEED_DPS, accent))
+        time.sleep(interval)
+    # Anything tapped while the overlay was up was aimed at the busy
+    # screen, not at whatever comes next -- drop it rather than letting it
+    # land on a screen the user never saw.
+    with touch_state.lock:
+        touch_state.release_pending = False
+    return box.get("value")
 
 
 # ---------- widgets ----------
@@ -2248,7 +2514,7 @@ CONNECT_TIMEOUT = 20.0
 SPINNER_FRAME_INTERVAL = 0.1
 
 
-def panel_repeater(rep, networks, scroll_px=0, connecting_ssid=None, spin_phase=0):
+def panel_repeater(rep, networks, scroll_px=0, connecting_ssid=None, spin_phase=0, error=None):
     img, d = new_canvas()
     draw_back_header(d, "Repeater", ACCENT["clock"])
 
@@ -2263,6 +2529,12 @@ def panel_repeater(rep, networks, scroll_px=0, connecting_ssid=None, spin_phase=
         sub = f"{rep['ip'] or '—'}  ·  {rep['signal']} dBm" if rep["signal"] is not None else (rep["ip"] or "")
         d.text((16, 84), sub, font=font("default_medium", 12), fill=DIM)
         centered_text(d, W - 46, 50, "Disconnect", font("default_medium", 11), (220, 120, 120))
+    elif error:
+        # A failed join used to be completely silent: the spinner just
+        # stopped after CONNECT_TIMEOUT and the list came back, so a wrong
+        # password looked exactly like a weak signal or a mistap.
+        d.text((16, 44), "Couldn’t connect", font=font("default_medium", 15), fill=(230, 130, 130))
+        d.text((16, 64), error, font=font("default_medium", 11), fill=DIM)
     else:
         d.text((16, 44), "Not connected", font=font("default_medium", 15), fill=DIM)
         d.text((16, 64), "Tap a network below to connect", font=font("default_medium", 11), fill=DIM)
@@ -2302,6 +2574,11 @@ def panel_repeater(rep, networks, scroll_px=0, connecting_ssid=None, spin_phase=
         thumb_y = REPEATER_LIST_TOP + (scroll_px / max_scroll) * (list_h - thumb_h)
         d.rectangle([W - 6, thumb_y, W - 2, thumb_y + thumb_h], fill=(70, 76, 90))
     return img
+
+
+def truncate_ssid(ssid, limit=18):
+    ssid = ssid or ""
+    return ssid if len(ssid) <= limit else ssid[:limit - 1] + "…"
 
 
 def repeater_scroll_max(n_networks):
@@ -2771,7 +3048,6 @@ def hit_back(y):
 
 
 def to_rgb565_bytes(img):
-    import numpy as np
     arr = np.asarray(img.convert("RGB"), dtype=np.uint32)
     r = (arr[:, :, 0] >> 3) << 11
     g = (arr[:, :, 1] >> 2) << 5
@@ -2780,10 +3056,36 @@ def to_rgb565_bytes(img):
     return packed.tobytes()
 
 
+_fb = None
+
+
+def _fb_handle():
+    """Keep /dev/fb0 open for the process lifetime instead of reopening it
+    per frame. During a drag this runs ~80x/s; open+close per frame is
+    pure syscall overhead in the one path where smoothness matters most.
+    Falls back to per-frame opens if the handle ever goes bad."""
+    global _fb
+    if _fb is None:
+        _fb = open(FB_PATH, "r+b", buffering=0)
+    return _fb
+
+
 def write_frame(img):
     data = to_rgb565_bytes(img)
-    with open(FB_PATH, "r+b") as fb:
+    global _fb
+    try:
+        fb = _fb_handle()
+        fb.seek(0)
         fb.write(data)
+    except Exception:
+        try:
+            if _fb is not None:
+                _fb.close()
+        except Exception:
+            pass
+        _fb = None
+        with open(FB_PATH, "r+b") as fb:
+            fb.write(data)
 
 
 # ---------- modes ----------
@@ -2878,11 +3180,19 @@ TOUCH_DEV = "/dev/input/event0"
 _EVENT_FMT = "qqHHi"
 _EVENT_SIZE = struct.calcsize(_EVENT_FMT)
 EV_ABS = 3
+ABS_MT_SLOT = 47
 ABS_MT_POSITION_X = 53
 ABS_MT_POSITION_Y = 54
 ABS_MT_TRACKING_ID = 57
 
 TAP_JITTER_PX = 10
+
+# Flick paging: a short, fast swipe should page even though it never
+# travelled the 30% of screen width the old distance-only rule demanded.
+# That rule is why quick flicks felt like they "didn't take" -- the panel
+# sprang back despite an obviously deliberate gesture.
+FLICK_VELOCITY_PX_S = 260.0
+_VEL_SMOOTHING = 0.6
 
 
 class TouchState:
@@ -2895,9 +3205,13 @@ class TouchState:
         self.dy = 0
         self.down_x = 0
         self.down_y = 0
+        self.have_pos = False   # a position event has arrived for THIS touch
+        self.vx = 0.0           # smoothed horizontal velocity, px/s
         self.release_pending = False
         self.release_dx = 0
         self.release_dy = 0
+        self.release_vx = 0.0
+        self.error = None       # set if the input device can't be read
 
 
 touch_state = TouchState()
@@ -2906,9 +3220,23 @@ touch_state = TouchState()
 def _touch_reader():
     import os as _os
     start_x = start_y = None
+    last_x = None
+    last_t = 0.0
     down = False
+    slot = 0
     try:
-        with open(TOUCH_DEV, "rb") as f:
+        f = open(TOUCH_DEV, "rb")
+    except Exception as e:
+        # Losing the touch device leaves a dashboard that still redraws
+        # happily but ignores every tap. That used to be a single line on
+        # stderr nobody reads; surface it on the screen instead so the
+        # device doesn't just look wedged.
+        with touch_state.lock:
+            touch_state.error = "touch input unavailable"
+        print(f"touch reader could not open {TOUCH_DEV}: {e}", file=sys.stderr)
+        return
+    try:
+        with f:
             fd = f.fileno()
             _os.set_blocking(fd, False)
             while not _stop:
@@ -2922,6 +3250,15 @@ def _touch_reader():
                 _, _, typ, code, val = struct.unpack(_EVENT_FMT, data)
                 if typ != EV_ABS:
                     continue
+                # Multitouch protocol B interleaves slots. Without tracking
+                # ABS_MT_SLOT, a second finger's coordinates were folded
+                # into the same gesture, which on a screen this small made
+                # an accidental two-finger touch jump panels.
+                if code == ABS_MT_SLOT:
+                    slot = val
+                    continue
+                if slot != 0:
+                    continue
                 if code == ABS_MT_TRACKING_ID:
                     if val == -1 and down:
                         with touch_state.lock:
@@ -2929,20 +3266,36 @@ def _touch_reader():
                             touch_state.release_pending = True
                             touch_state.release_dx = touch_state.dx
                             touch_state.release_dy = touch_state.dy
+                            touch_state.release_vx = touch_state.vx
                         down = False
-                        start_x = start_y = None
+                        start_x = start_y = last_x = None
                     else:
                         down = True
-                        start_x = start_y = None
+                        start_x = start_y = last_x = None
                         with touch_state.lock:
                             touch_state.active = True
                             touch_state.dx = 0
                             touch_state.dy = 0
+                            touch_state.vx = 0.0
+                            # down_x/down_y still hold the PREVIOUS touch's
+                            # coordinates until the first position event of
+                            # this one lands; have_pos marks them stale so a
+                            # release in that window can't be hit-tested
+                            # against where the last tap happened to be.
+                            touch_state.have_pos = False
                 elif code == ABS_MT_POSITION_X and down:
+                    now_t = time.time()
                     if start_x is None:
                         start_x = val
                         with touch_state.lock:
                             touch_state.down_x = val
+                            touch_state.have_pos = True
+                    elif last_x is not None and now_t > last_t:
+                        inst = (val - last_x) / (now_t - last_t)
+                        with touch_state.lock:
+                            touch_state.vx = (_VEL_SMOOTHING * touch_state.vx
+                                              + (1 - _VEL_SMOOTHING) * inst)
+                    last_x, last_t = val, now_t
                     with touch_state.lock:
                         touch_state.dx = val - start_x
                 elif code == ABS_MT_POSITION_Y and down:
@@ -2953,24 +3306,57 @@ def _touch_reader():
                     with touch_state.lock:
                         touch_state.dy = val - start_y
     except Exception as e:
+        with touch_state.lock:
+            touch_state.error = "touch input stopped"
         print(f"touch reader stopped: {e}", file=sys.stderr)
+
+
+def ease_out_quint(t):
+    """Sharper initial move and a longer settle than cubic -- closer to the
+    deceleration curve a paged iOS scroll view uses, which is most of why
+    that feels "fast but not abrupt"."""
+    return 1 - (1 - t) ** 5
 
 
 def ease_out_cubic(t):
     return 1 - (1 - t) ** 3
 
 
-def composite(cur_img, other_img, dx, other_on_right):
-    canvas = Image.new("RGB", (W, H), BG)
-    canvas.paste(cur_img, (dx, 0))
+def build_strip(cur_img, other_img, other_on_right):
+    """Pre-compose the two panels side by side once per drag, so each
+    animation frame is a single crop instead of allocating a fresh canvas
+    and pasting two full 240x320 images into it. At 60fps on this SoC that
+    per-frame allocation was a real slice of the frame budget."""
+    strip = Image.new("RGB", (W * 2, H), BG)
     if other_on_right:
-        canvas.paste(other_img, (dx + W, 0))
+        strip.paste(cur_img, (0, 0))
+        strip.paste(other_img, (W, 0))
     else:
-        canvas.paste(other_img, (dx - W, 0))
-    return canvas
+        strip.paste(other_img, (0, 0))
+        strip.paste(cur_img, (W, 0))
+    return strip
 
 
-ANIM_SECONDS = 0.22
+def strip_frame(strip, dx, other_on_right):
+    base = 0 if other_on_right else W
+    x = max(0, min(W, base - dx))
+    return strip.crop((x, 0, x + W, H))
+
+
+ANIM_SECONDS = 0.26
+ANIM_MIN_SECONDS = 0.14
+FRAME_INTERVAL = 1.0 / 60
+
+
+def flick_duration(distance_px, velocity_px_s):
+    """Carry the finger's own speed into the settle animation instead of
+    always taking a fixed 0.22s: a hard flick finishes quickly, a slow drag
+    released near the threshold eases out gently. Same idea as UIKit
+    handing a scroll view its release velocity."""
+    v = abs(velocity_px_s)
+    if v < 1:
+        return ANIM_SECONDS
+    return max(ANIM_MIN_SECONDS, min(ANIM_SECONDS, abs(distance_px) / v))
 
 
 def mode_live():
@@ -2981,21 +3367,40 @@ def mode_live():
     reader.start()
 
     cfg = load_config()
-    fx = fetch_fx()
     fx_range = "week"
-    sim = get_sim_status(cfg)
-    oc = get_openclash_status()
-    traf = get_openclash_traffic_and_node()
-    wx = fetch_weather(cfg["weather_city"])
-    aq = fetch_air_quality(cfg["weather_city"])
     weather_day_idx = 0
-    sms_messages = get_sms_messages()
     sms_selected_idx = 0
-    wg_peers = get_wireguard_peers()
-    wg_active = get_wireguard_active()
-    rep = get_repeater_status()
-    last_fx_check = last_sim_check = last_oc_check = last_traf_check = last_wx_check = last_rep_check = time.time()
-    last_sms_check = time.time()
+
+    # Everything that touches the network, ubus or the SMS spool now runs
+    # on the refresher's thread. The render loop below only ever reads
+    # already-fetched values, so a slow curl or a wedged ubus call can no
+    # longer stall drawing or touch handling.
+    refresher = Refresher()
+    refresher.add("fx", fetch_fx, 300)
+    refresher.add("sim", lambda: get_sim_status(cfg), 30)
+    refresher.add("oc", get_openclash_status, 30)
+    refresher.add("traf", get_openclash_traffic_and_node, 20)
+    refresher.add("wx", lambda: fetch_weather(cfg["weather_city"]), 1800)
+    refresher.add("aq", lambda: fetch_air_quality(cfg["weather_city"]), 1800)
+    refresher.add("sms", get_sms_messages, 15)
+    refresher.add("rep", get_repeater_status, 30)
+    refresher.add("wg_peers", get_wireguard_peers, 120)
+    refresher.add("wg_active", get_wireguard_active, 30)
+    refresher.add("cell", _get_active_cell_info, 20)
+    refresher.start()
+
+    # Seeded from cache/defaults so the first frame draws immediately
+    # instead of waiting on the first refresher pass.
+    fx = fetch_fx()
+    sim = {"slot": "1", "country": None, "phone": "", "traffic_mb": None,
+           "cap_mb": cfg.get("data_cap_mb"), "sim_choice": "sim1", "data_up": False,
+           "iccid": None, "attached": False, "roaming": False}
+    oc = {"installed": openclash_installed(), "enabled": False, "mode": "rule"}
+    traf = openclash_traffic_empty()
+    wx, aq = [], []
+    sms_messages = []
+    wg_peers, wg_active = [], None
+    rep = {"connected": False, "ssid": None, "signal": None, "ip": None}
 
     net_sample, net_down, net_up = None, None, None
     cpu_sample, cpu_pct = None, None
@@ -3006,9 +3411,18 @@ def mode_live():
     _cell_info = _get_active_cell_info()
     conn_type = get_wan_conn_type(_cell_info)
     cell_signal = get_cell_signal(_cell_info)
-    last_conn_check = time.time()
 
     def render_main(idx):
+        img = _render_panel(idx)
+        with touch_state.lock:
+            err = touch_state.error
+        if err:
+            d = ImageDraw.Draw(img)
+            d.rectangle([0, H - 20, W, H], fill=(90, 26, 34))
+            centered_text(d, W / 2, H - 17, err, font("default_medium", 11), (255, 220, 220))
+        return img
+
+    def _render_panel(idx):
         name = PANEL_NAMES[idx]
         if name == "clock":
             return panel_clock(cfg, rep, conn_type, cell_signal, sms_messages)
@@ -3034,12 +3448,14 @@ def mode_live():
     state = "idle"  # idle | dragging | animating  (main-carousel only)
     neighbor_img = None
     neighbor_on_right = True
+    drag_strip = None
+    last_dx_drawn = None
     anim_from_dx = anim_target_dx = anim_t0 = 0
+    anim_seconds = ANIM_SECONDS
     anim_next_idx = panel_idx
     sub_dirty = True
 
     # state for the newer sub-screens (More, Repeater, Confirm, Keyboard)
-    sysinfo = {"uptime_min": 0, "lan_ip": "192.168.8.1"}
     wifi24 = True
     wifi_band = "5g"
     rep_networks = []
@@ -3048,6 +3464,7 @@ def mode_live():
     connecting_since = 0.0
     last_connect_check = 0.0
     last_spinner_draw = 0.0
+    connect_error = None
 
     def start_repeater_scan():
         if scan_state["running"]:
@@ -3072,6 +3489,7 @@ def mode_live():
             active = touch_state.active
             dy, dx = touch_state.dy, touch_state.dx
             down_x, down_y = touch_state.down_x, touch_state.down_y
+            have_pos = touch_state.have_pos
             released = touch_state.release_pending
             release_dx, release_dy = touch_state.release_dx, touch_state.release_dy
             touch_state.release_pending = False
@@ -3081,7 +3499,8 @@ def mode_live():
             write_frame(render_fn(live_scroll))
         elif released:
             final_dx, final_dy = release_dx, release_dy
-            is_tap = abs(final_dx) <= TAP_JITTER_PX and abs(final_dy) <= TAP_JITTER_PX
+            is_tap = (have_pos and abs(final_dx) <= TAP_JITTER_PX
+                      and abs(final_dy) <= TAP_JITTER_PX)
             if is_tap and hit_back(down_y):
                 view = "main"
                 cur_img = render_main(panel_idx)
@@ -3090,7 +3509,10 @@ def mode_live():
             elif is_tap:
                 idx = hit_scroll_picker(down_y, len(items), picker_scroll_base)
                 if idx is not None:
-                    on_select(items[idx][0])
+                    # Hand the picker frame to on_select so a slow apply can
+                    # dim *this* screen and spin over it, instead of freezing
+                    # on it with no sign of life.
+                    on_select(items[idx][0], render_fn(picker_scroll_base))
                     view = "main"
                     cur_img = render_main(panel_idx)
                     write_frame(cur_img)
@@ -3112,6 +3534,7 @@ def mode_live():
         nonlocal rep, kb_target_ssid, kb_target_bssid, kb_text, kb_layer, kb_caps
         nonlocal confirm_title, confirm_message, confirm_yes_label, confirm_action, confirm_return_view, confirm_danger
         nonlocal connecting_ssid, connecting_since, last_connect_check, last_spinner_draw
+        nonlocal connect_error
         max_scroll = repeater_scroll_max(len(rep_networks))
 
         if connecting_ssid is not None:
@@ -3121,8 +3544,11 @@ def mode_live():
                 if fresh["connected"] and fresh["ssid"] == connecting_ssid:
                     rep = fresh
                     connecting_ssid = None
+                    connect_error = None
                     sub_dirty = True
                 elif now - connecting_since >= CONNECT_TIMEOUT:
+                    connect_error = "%s didn’t accept the connection — wrong password?" % (
+                        truncate_ssid(connecting_ssid))
                     connecting_ssid = None
                     sub_dirty = True
             if connecting_ssid is not None and now - last_spinner_draw >= SPINNER_FRAME_INTERVAL:
@@ -3133,16 +3559,18 @@ def mode_live():
             active = touch_state.active
             dy, dx = touch_state.dy, touch_state.dx
             down_x, down_y = touch_state.down_x, touch_state.down_y
+            have_pos = touch_state.have_pos
             released = touch_state.release_pending
             release_dx, release_dy = touch_state.release_dx, touch_state.release_dy
             touch_state.release_pending = False
 
         if active and (abs(dy) > TAP_JITTER_PX or abs(dx) > TAP_JITTER_PX):
             live_scroll = min(max_scroll, max(0, picker_scroll_base - dy))
-            write_frame(panel_repeater(rep, rep_networks, live_scroll))
+            write_frame(panel_repeater(rep, rep_networks, live_scroll, error=connect_error))
         elif released:
             final_dx, final_dy = release_dx, release_dy
-            is_tap = abs(final_dx) <= TAP_JITTER_PX and abs(final_dy) <= TAP_JITTER_PX
+            is_tap = (have_pos and abs(final_dx) <= TAP_JITTER_PX
+                      and abs(final_dy) <= TAP_JITTER_PX)
             if is_tap and hit_back(down_y):
                 view = "main"
                 cur_img = render_main(panel_idx)
@@ -3164,6 +3592,7 @@ def mode_live():
                     remembered_key = None if ap["open"] else get_remembered_repeater_keys().get(ap["ssid"])
                     if ap["open"] or remembered_key is not None:
                         repeater_connect(ap["ssid"], ap["bssid"], remembered_key or "")
+                        connect_error = None
                         connecting_ssid = ap["ssid"]
                         connecting_since = now
                         last_connect_check = now
@@ -3179,10 +3608,11 @@ def mode_live():
                         sub_dirty = True
             else:
                 picker_scroll_base = min(max_scroll, max(0, picker_scroll_base - final_dy))
-                write_frame(panel_repeater(rep, rep_networks, picker_scroll_base))
+                write_frame(panel_repeater(rep, rep_networks, picker_scroll_base, error=connect_error))
         elif sub_dirty:
             spin_phase = int(now * 240) % 360
-            write_frame(panel_repeater(rep, rep_networks, picker_scroll_base, connecting_ssid, spin_phase))
+            write_frame(panel_repeater(rep, rep_networks, picker_scroll_base, connecting_ssid,
+                                       spin_phase, error=connect_error))
             sub_dirty = False
 
     def handle_sms_scroll(now):
@@ -3196,6 +3626,7 @@ def mode_live():
             active = touch_state.active
             dy, dx = touch_state.dy, touch_state.dx
             down_x, down_y = touch_state.down_x, touch_state.down_y
+            have_pos = touch_state.have_pos
             released = touch_state.release_pending
             release_dx, release_dy = touch_state.release_dx, touch_state.release_dy
             touch_state.release_pending = False
@@ -3205,7 +3636,8 @@ def mode_live():
             write_frame(panel_sms(sms_messages, live_scroll))
         elif released:
             final_dx, final_dy = release_dx, release_dy
-            is_tap = abs(final_dx) <= TAP_JITTER_PX and abs(final_dy) <= TAP_JITTER_PX
+            is_tap = (have_pos and abs(final_dx) <= TAP_JITTER_PX
+                      and abs(final_dy) <= TAP_JITTER_PX)
             if is_tap and hit_back(down_y):
                 view = "main"
                 cur_img = render_main(panel_idx)
@@ -3245,6 +3677,7 @@ def mode_live():
     sim_connect_override = None
     sim_connect_override_until = 0.0
     CONNECT_OPTIMISTIC_SECONDS = 2.0
+    last_switch_req_check = 0.0
 
     while not _stop:
         now = time.time()
@@ -3255,30 +3688,40 @@ def mode_live():
             time.sleep(0.1)
             continue
 
+        if now - last_switch_req_check > 0.3:
+            last_switch_req_check = now
+            if os.path.exists(SWITCH_REQUEST_FILE):
+                try:
+                    os.remove(SWITCH_REQUEST_FILE)
+                except Exception:
+                    pass
+                confirm_title = "Stock UI"
+                confirm_message = "Hand the screen back to the GL.iNet UI?"
+                confirm_yes_label = "Switch"
+                confirm_danger = False
+                confirm_action = "return_stock"
+                confirm_return_view = view if view != "confirm" else "main"
+                view = "confirm"
+                sub_dirty = True
+
         if view == "main":
             if state == "idle":
-                if now - last_fx_check > 300:
-                    fx = fetch_fx()
-                    last_fx_check = now
-                if now - last_sim_check > 30:
-                    sim = get_sim_status(cfg)
-                    last_sim_check = now
-                if now - last_oc_check > 30:
-                    oc = get_openclash_status()
-                    last_oc_check = now
-                if now - last_traf_check > 20:
-                    traf = get_openclash_traffic_and_node()
-                    last_traf_check = now
-                if now - last_wx_check > 1800:
-                    wx = fetch_weather(cfg["weather_city"])
-                    aq = fetch_air_quality(cfg["weather_city"])
-                    last_wx_check = now
-                if now - last_rep_check > 30:
-                    rep = get_repeater_status()
-                    last_rep_check = now
-                if now - last_sms_check > 15:
-                    sms_messages = get_sms_messages()
-                    last_sms_check = now
+                # Pull whatever the background refresher has ready. These
+                # are plain dict reads -- no I/O on this thread.
+                fx = refresher.get("fx", fx)
+                sim = refresher.get("sim", sim)
+                oc = refresher.get("oc", oc)
+                traf = refresher.get("traf", traf)
+                wx = refresher.get("wx", wx)
+                aq = refresher.get("aq", aq)
+                sms_messages = refresher.get("sms", sms_messages)
+                rep = refresher.get("rep", rep)
+                wg_peers = refresher.get("wg_peers", wg_peers)
+                wg_active = refresher.get("wg_active", wg_active)
+                _cell = refresher.get("cell")
+                if _cell is not None:
+                    conn_type = get_wan_conn_type(_cell)
+                    cell_signal = get_cell_signal(_cell)
                 if now - last_mon_check > 2:
                     net_sample, net_down, net_up = sample_bandwidth(net_sample)
                     cpu_sample, cpu_pct = sample_cpu(cpu_sample)
@@ -3286,14 +3729,16 @@ def mode_live():
                     temp_c = get_temp_c()
                     mon_uptime_min = get_system_info()["uptime_min"]
                     last_mon_check = now
-                if now - last_conn_check > 20:
-                    _cell_info = _get_active_cell_info()
-                    conn_type = get_wan_conn_type(_cell_info)
-                    cell_signal = get_cell_signal(_cell_info)
-                    last_conn_check = now
-                if (sim_connect_override is not None and sim_connect_override_until is not None
-                        and now >= sim_connect_override_until):
-                    sim = get_sim_status(cfg)
+                # The override MUST always expire. It used to be skipped
+                # entirely whenever sim_connect_override_until was None --
+                # which is exactly what the "turning off" and "turning on
+                # with no competing WAN" branches set it to -- so the Data
+                # toggle then displayed the tapped-for value forever,
+                # masking the real interface state for the rest of the
+                # process's life. That inverted the whole point of the
+                # feature, which is honest feedback.
+                if sim_connect_override is not None and now >= sim_connect_override_until:
+                    refresher.request("sim")
                     sim_connect_override = None
                 if now - last_draw >= 1:
                     cur_img = render_main(panel_idx)
@@ -3313,6 +3758,8 @@ def mode_live():
                     down_x, down_y = touch_state.down_x, touch_state.down_y
                     released = touch_state.release_pending
                     release_dx, release_dy = touch_state.release_dx, touch_state.release_dy
+                    release_vx = touch_state.release_vx
+                    have_pos = touch_state.have_pos
                     touch_state.release_pending = False
 
                 if neighbor_img is None or (neighbor_on_right and dx > TAP_JITTER_PX) or \
@@ -3320,18 +3767,29 @@ def mode_live():
                     if dx < 0:
                         neighbor_on_right = True
                         neighbor_img = render_main((panel_idx + 1) % len(PANEL_NAMES))
+                        drag_strip = build_strip(cur_img, neighbor_img, True)
                     elif dx > 0:
                         neighbor_on_right = False
                         neighbor_img = render_main((panel_idx - 1) % len(PANEL_NAMES))
+                        drag_strip = build_strip(cur_img, neighbor_img, False)
+                    last_dx_drawn = None
 
-                if neighbor_img is not None:
+                if drag_strip is not None:
                     dx_clamped = max(-W, min(W, dx))
-                    write_frame(composite(cur_img, neighbor_img, dx_clamped, neighbor_on_right))
+                    # The finger only moves so fast; redrawing an identical
+                    # offset just burns a frame's worth of RGB565 conversion
+                    # that could have gone to the next real one.
+                    if dx_clamped != last_dx_drawn:
+                        write_frame(strip_frame(drag_strip, dx_clamped, neighbor_on_right))
+                        last_dx_drawn = dx_clamped
 
                 if released or not active:
                     final_dx = release_dx if released else dx
                     final_dy = release_dy if released else dy
-                    is_tap = abs(final_dx) <= TAP_JITTER_PX and abs(final_dy) <= TAP_JITTER_PX
+                    # A release with no position event of its own would be
+                    # hit-tested against the PREVIOUS touch's coordinates.
+                    is_tap = (have_pos and abs(final_dx) <= TAP_JITTER_PX
+                              and abs(final_dy) <= TAP_JITTER_PX)
 
                     if is_tap:
                         name = PANEL_NAMES[panel_idx]
@@ -3381,13 +3839,10 @@ def mode_live():
                             new_view, fx_edit_side = "fx_bottom", "to"
                             picker_scroll_base = 0
                         elif name == "fx" and zone == "update":
-                            flash = cur_img.copy()
-                            fd = ImageDraw.Draw(flash)
-                            fd.rectangle([0, FX_STATUS_Y - 4, W, FX_BUTTON[3] + 4], fill=BG)
-                            centered_text(fd, W / 2, FX_STATUS_Y, "Updating…", font("default_medium", 13), ACCENT["fx"])
-                            write_frame(flash)
-                            fx = fetch_fx(force=True)
-                            last_fx_check = now
+                            fx = run_with_spinner(cur_img, "Updating rates…",
+                                                  lambda: fetch_fx(force=True),
+                                                  ACCENT["fx"]) or fx
+                            refresher.request("fx")
                         elif name == "fx" and zone and zone.startswith("range:"):
                             new_range = zone.split(":", 1)[1]
                             if new_range != fx_range:
@@ -3395,15 +3850,23 @@ def mode_live():
                         elif name == "sim" and zone and zone.startswith("choice:"):
                             choice = zone.split(":", 1)[1]
                             if choice != sim["sim_choice"]:
-                                set_sim_choice(choice)
-                                sim = get_sim_status(cfg)
+                                def _switch_sim(choice=choice):
+                                    set_sim_choice(choice)
+                                    return get_sim_status(cfg)
+
+                                sim = run_with_spinner(cur_img, "Switching SIM…",
+                                                       _switch_sim, ACCENT["sim"]) or sim
                         elif name == "sim" and zone == "attach_toggle":
                             # Network registration only (SMS/calls) --
                             # doesn't compete with a WiFi/ethernet WAN the
                             # way the data toggle below can, so no
                             # optimistic/snap-back dance needed here.
-                            set_network_attach_enabled(not sim["attached"])
-                            sim = get_sim_status(cfg)
+                            def _set_attach(want=not sim["attached"]):
+                                set_network_attach_enabled(want)
+                                return get_sim_status(cfg)
+
+                            sim = run_with_spinner(cur_img, "Applying…", _set_attach,
+                                                   ACCENT["sim"]) or sim
                         elif name == "sim" and zone == "data_toggle":
                             new_state = not sim["data_up"]
                             set_cellular_data_enabled(new_state)
@@ -3421,8 +3884,12 @@ def mode_live():
                                 # the background without second-guessing.
                                 sim_connect_override_until = None
                         elif name == "sim" and zone == "roam_toggle":
-                            set_roaming_enabled(sim["iccid"], not sim["roaming"])
-                            sim = get_sim_status(cfg)
+                            def _set_roam(iccid=sim["iccid"], want=not sim["roaming"]):
+                                set_roaming_enabled(iccid, want)
+                                return get_sim_status(cfg)
+
+                            sim = run_with_spinner(cur_img, "Applying…", _set_roam,
+                                                   ACCENT["sim"]) or sim
                         elif name == "sim" and zone == "wireguard":
                             new_view = "wireguard"
                             wg_peers = get_wireguard_peers()
@@ -3441,28 +3908,37 @@ def mode_live():
                         elif name == "openclash" and zone == "node":
                             new_view = "oc_nodes"
                         elif name == "openclash" and zone == "update_sub":
-                            flash = cur_img.copy()
-                            fd = ImageDraw.Draw(flash)
-                            bx0, by0, bx1, by1 = OC_UPDATE_BUTTON
-                            fd.rectangle([0, by0 - 20, W, by1 + 4], fill=BG)
-                            centered_text(fd, W / 2, by0 - 16, "Updating…", font("default_medium", 12), ACCENT["openclash"])
-                            write_frame(flash)
-                            update_openclash_subscription()
+                            # Was Popen-ed and immediately painted over by the
+                            # next redraw, so the "Updating" flash lasted a
+                            # single frame and there was never any completion
+                            # signal at all.
+                            run_with_spinner(cur_img, "Updating subscription…",
+                                             lambda: update_openclash_subscription(wait=True),
+                                             ACCENT["openclash"])
+                            refresher.request("traf")
                         elif name == "weather" and zone == "city":
                             new_view = "weather_city"
                             picker_scroll_base = 0
                         elif name == "weather" and zone == "update":
-                            flash = cur_img.copy()
-                            fd = ImageDraw.Draw(flash)
-                            fd.rectangle([0, 236, W, WEATHER_UPDATE_BUTTON[3] + 4], fill=BG)
-                            centered_text(fd, W / 2, 246, "Updating…", font("default_medium", 13), ACCENT["weather"])
-                            write_frame(flash)
-                            wx = fetch_weather(cfg["weather_city"], force=True)
-                            aq = fetch_air_quality(cfg["weather_city"], force=True)
-                            last_wx_check = now
+                            def _refresh_weather():
+                                return (fetch_weather(cfg["weather_city"], force=True),
+                                        fetch_air_quality(cfg["weather_city"], force=True))
+
+                            got = run_with_spinner(cur_img, "Updating weather…",
+                                                   _refresh_weather, ACCENT["weather"])
+                            if got:
+                                wx, aq = got[0] or wx, got[1] or aq
                         elif name == "weather" and zone and zone.startswith("day:"):
-                            weather_day_idx = int(zone.split(":", 1)[1])
-                            new_view = "weather_detail"
+                            # panel_weather renders "no data yet" when wx is
+                            # empty, but the three day columns stay tappable
+                            # and the detail view then did wx[0] on an empty
+                            # list -- an uncaught IndexError that took the
+                            # whole process down (and run.sh counts three of
+                            # those as "fall back to the stock UI forever").
+                            day_i = int(zone.split(":", 1)[1])
+                            if day_i < len(wx):
+                                weather_day_idx = day_i
+                                new_view = "weather_detail"
 
                         neighbor_img = None
                         state = "idle"
@@ -3474,18 +3950,25 @@ def mode_live():
                             write_frame(cur_img)
                             last_draw = now
                     else:
-                        if abs(final_dx) > W * 0.3:
+                        # Page on EITHER enough travel or enough speed. The
+                        # old distance-only rule made a quick flick spring
+                        # back, which reads as the gesture being ignored.
+                        flick = abs(release_vx) > FLICK_VELOCITY_PX_S
+                        same_way = (release_vx < 0) == (final_dx < 0)
+                        if abs(final_dx) > W * 0.3 or (flick and same_way and abs(final_dx) > TAP_JITTER_PX):
                             anim_target_dx = -W if final_dx < 0 else W
                             anim_next_idx = (panel_idx + (1 if final_dx < 0 else -1)) % len(PANEL_NAMES)
                         else:
                             anim_target_dx = 0
                             anim_next_idx = panel_idx
                         anim_from_dx = max(-W, min(W, final_dx))
+                        anim_seconds = flick_duration(anim_target_dx - anim_from_dx, release_vx)
                         anim_t0 = now
+                        last_dx_drawn = None
                         state = "animating"
 
             elif state == "animating":
-                t = (now - anim_t0) / ANIM_SECONDS
+                t = (now - anim_t0) / max(0.001, anim_seconds)
                 if t >= 1:
                     if anim_next_idx != panel_idx:
                         panel_idx = anim_next_idx
@@ -3493,20 +3976,23 @@ def mode_live():
                     write_frame(cur_img)
                     last_draw = now
                     neighbor_img = None
+                    drag_strip = None
                     state = "idle"
                 else:
-                    eased = ease_out_cubic(t)
+                    eased = ease_out_quint(t)
                     dx_now = int(anim_from_dx + (anim_target_dx - anim_from_dx) * eased)
-                    if neighbor_img is not None:
-                        write_frame(composite(cur_img, neighbor_img, dx_now, neighbor_on_right))
+                    if drag_strip is not None and dx_now != last_dx_drawn:
+                        write_frame(strip_frame(drag_strip, dx_now, neighbor_on_right))
+                        last_dx_drawn = dx_now
 
         else:  # sub-screen
             if view == "datacap":
-                def _select_datacap(key):
+                def _select_datacap(key, base_img):
                     nonlocal sim
                     cfg["data_cap_mb"] = key
                     save_config(cfg)
-                    sim = get_sim_status(cfg)
+                    sim = run_with_spinner(base_img, "Applying…",
+                                           lambda: get_sim_status(cfg), ACCENT["sim"]) or sim
 
                 items = [(v, cap_label(v)) for v in DATA_CAP_PRESETS]
                 handle_scroll_picker(now, items, lambda s: panel_datacap_picker(cfg, s), _select_datacap)
@@ -3514,11 +4000,15 @@ def mode_live():
                 continue
 
             if view == "oc_nodes":
-                def _select_node(key):
-                    nonlocal traf, last_traf_check
-                    select_openclash_node(traf["group"], key)
-                    traf = get_openclash_traffic_and_node()
-                    last_traf_check = now
+                def _select_node(key, base_img):
+                    nonlocal traf
+
+                    def _apply():
+                        select_openclash_node(traf["group"], key)
+                        return get_openclash_traffic_and_node()
+
+                    traf = run_with_spinner(base_img, "Switching node…", _apply,
+                                            ACCENT["openclash"]) or traf
 
                 items = [(n, n) for n in traf["nodes"]]
                 handle_scroll_picker(now, items, lambda s: panel_node_picker(traf, s), _select_node)
@@ -3526,13 +4016,23 @@ def mode_live():
                 continue
 
             if view == "weather_city":
-                def _select_weather_city(key):
-                    nonlocal wx, aq, last_wx_check
+                def _select_weather_city(key, base_img):
+                    nonlocal wx, aq
                     cfg["weather_city"] = key
                     save_config(cfg)
-                    wx = fetch_weather(key)
-                    aq = fetch_air_quality(key)
-                    last_wx_check = now
+
+                    def _apply():
+                        return fetch_weather(key), fetch_air_quality(key)
+
+                    # Two uncached HTTP calls: this used to freeze on the
+                    # picker for up to 16s with no feedback at all, so a tap
+                    # that HAD registered looked exactly like one that had not.
+                    got = run_with_spinner(base_img, "Loading weather…", _apply,
+                                           ACCENT["weather"])
+                    if got:
+                        wx, aq = got[0] or [], got[1] or []
+                    refresher.request("wx")
+                    refresher.request("aq")
 
                 items = [(name, name) for name, _, _ in WEATHER_CITIES]
                 handle_scroll_picker(now, items, lambda s: panel_weather_picker(cfg, s), _select_weather_city)
@@ -3543,7 +4043,7 @@ def mode_live():
                 slot = "top" if view == "city_top" else "bottom"
                 cfg_key = "clock_top" if view == "city_top" else "clock_bottom"
 
-                def _select_city(key, cfg_key=cfg_key):
+                def _select_city(key, base_img=None, cfg_key=cfg_key):
                     cfg[cfg_key] = key
                     save_config(cfg)
 
@@ -3556,7 +4056,7 @@ def mode_live():
                 slot = "top" if view == "fx_top" else "bottom"
                 cfg_key = f"fx_{slot}_{fx_edit_side}"
 
-                def _select_currency(key, cfg_key=cfg_key):
+                def _select_currency(key, base_img=None, cfg_key=cfg_key):
                     cfg[cfg_key] = key
                     save_config(cfg)
 
@@ -3607,13 +4107,15 @@ def mode_live():
             with touch_state.lock:
                 dx, dy = touch_state.dx, touch_state.dy
                 down_x, down_y = touch_state.down_x, touch_state.down_y
+                have_pos = touch_state.have_pos
                 released = touch_state.release_pending
                 release_dx, release_dy = touch_state.release_dx, touch_state.release_dy
                 touch_state.release_pending = False
 
             if released:
                 final_dx, final_dy = release_dx, release_dy
-                is_tap = abs(final_dx) <= TAP_JITTER_PX and abs(final_dy) <= TAP_JITTER_PX
+                is_tap = (have_pos and abs(final_dx) <= TAP_JITTER_PX
+                          and abs(final_dy) <= TAP_JITTER_PX)
 
                 if view == "confirm" and (is_tap and (hit_back(down_y) or hit_confirm(down_x, down_y) == "no")):
                     view = confirm_return_view
@@ -3625,6 +4127,9 @@ def mode_live():
                     elif confirm_action == "shutdown":
                         shutdown_router()
                         view = "more"
+                    elif confirm_action == "return_stock":
+                        switch_to_stock_ui()
+                        view = "main"
                     elif confirm_action == "repeater_disconnect":
                         repeater_disconnect()
                         time.sleep(0.3)
@@ -3653,6 +4158,7 @@ def mode_live():
                         sub_dirty = True
                     elif action == "connect":
                         repeater_connect(kb_target_ssid, kb_target_bssid, kb_text)
+                        connect_error = None
                         connecting_ssid = kb_target_ssid
                         connecting_since = now
                         last_connect_check = now
@@ -3696,7 +4202,14 @@ def mode_live():
                         save_config(cfg)
                         sub_dirty = True
                     elif action == "return_stock":
-                        switch_to_stock_ui()
+                        confirm_title = "Stock UI"
+                        confirm_message = "Hand the screen back to the GL.iNet UI?"
+                        confirm_yes_label = "Switch"
+                        confirm_danger = False
+                        confirm_action = "return_stock"
+                        confirm_return_view = "more"
+                        view = "confirm"
+                        sub_dirty = True
                     elif action == "reboot":
                         confirm_title = "Reboot"
                         confirm_message = "Reboot the router now?"
@@ -3724,10 +4237,24 @@ def mode_live():
                         wg_active = peer["id"] if turning_on else None
                         sub_dirty = True
                 elif not is_tap and final_dx > W * 0.3:
-                    view = "main"
-                    cur_img = render_main(panel_idx)
-                    write_frame(cur_img)
-                    last_draw = now
+                    # Swiping back used to always land on the main carousel,
+                    # even from screens whose header-tap goes somewhere else
+                    # -- swiping out of a message dumped you past the inbox,
+                    # and swiping a confirm dialog away skipped the screen
+                    # that raised it. Mirror the header-tap destination.
+                    parent = {"sms_detail": "sms",
+                              "keyboard_wifi": "repeater",
+                              "confirm": confirm_return_view or "main"}.get(view, "main")
+                    if view == "keyboard_wifi":
+                        kb_text = ""
+                    if parent == "main":
+                        view = "main"
+                        cur_img = render_main(panel_idx)
+                        write_frame(cur_img)
+                        last_draw = now
+                    else:
+                        view = parent
+                        sub_dirty = True
 
         time.sleep(0.012)
 

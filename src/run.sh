@@ -19,8 +19,14 @@ term_handler() {
 trap term_handler TERM INT
 
 fails=0
+# A run that lasted this long counts as healthy: the crash counter is
+# about "this build cannot start", not "this build has ever crashed".
+# Without the reset, three crashes MONTHS apart still added up and handed
+# the screen back to the stock UI permanently.
+HEALTHY_SECONDS=300
 
 while true; do
+    started=$(date +%s)
     python3 /root/dashboard/dashboard.py &
     child=$!
     wait "$child"
@@ -28,6 +34,11 @@ while true; do
     if [ "$rc" -eq 0 ]; then
         logger -t "$LOG_TAG" "clean stop requested"
         exit 0
+    fi
+    ran_for=$(( $(date +%s) - started ))
+    if [ "$ran_for" -ge "$HEALTHY_SECONDS" ]; then
+        [ "$fails" -gt 0 ] && logger -t "$LOG_TAG" "ran ${ran_for}s before failing, resetting crash count"
+        fails=0
     fi
     fails=$((fails + 1))
     logger -t "$LOG_TAG" "dashboard exited rc=$rc (failure $fails)"

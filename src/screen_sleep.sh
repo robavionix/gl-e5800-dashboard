@@ -32,7 +32,10 @@
 
 BL=/sys/class/backlight/soc:backlight
 FB_BLANK=/sys/class/graphics/fb0/blank
-STATE_FILE=/tmp/dashboard_backlight_saved
+# Persistent, not /tmp: the saved level is the user's chosen brightness,
+# and losing it on every reboot meant the next wake jumped to
+# max_brightness instead of back to whatever they had set.
+STATE_FILE=/root/dashboard/.backlight_saved
 
 case "$1" in
     off)
@@ -51,7 +54,11 @@ case "$1" in
         ;;
     toggle)
         cur=$(cat "$BL/brightness" 2>/dev/null)
-        if [ "$cur" = "0" ]; then
+        # Unknown state (unreadable sysfs) resolves to "on": a dark screen
+        # you cannot turn on is a much worse failure than a lit one you
+        # have to press again. The old test sent an empty $cur down the
+        # "off" branch, so a failed read could only ever blank the screen.
+        if [ -z "$cur" ] || [ "$cur" = "0" ]; then
             "$0" on
         else
             "$0" off
