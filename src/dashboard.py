@@ -19,6 +19,7 @@ import json
 import math
 import os
 import random
+import re
 import signal
 import struct
 import subprocess
@@ -750,13 +751,32 @@ WG_IFACE = "wgclient"
 
 
 def get_wireguard_peers():
+    """One `uci show wireguard` call for the whole list, not one `uci get`
+    per peer just to read its name. With a couple of hand-added peers the
+    difference is invisible; with a few hundred imported servers, the old
+    approach meant a few hundred sequential subprocess spawns just to
+    build this list -- a real, felt delay both on the background
+    refresher's 120s poll and, worse, on the tap that opens this screen,
+    which used to fetch synchronously on the touch-handling thread.
+    `uci show` already dumps every key for the whole package in one pass;
+    the peers' .name lines are pulled straight out of that same output.
+    Each peer is also tagged with a best-guess country (the same
+    heuristic OpenClash node names already go through) so the WireGuard
+    screen can offer quick country-filter chips without a second pass."""
     out = run(["uci", "show", "wireguard"])
-    peers = []
+    sections, names = [], {}
     for line in out.splitlines():
         if line.startswith("wireguard.") and line.endswith("=peers"):
-            section = line[len("wireguard."):-len("=peers")]
-            name = uci_get(f"wireguard.{section}.name") or section
-            peers.append({"id": section, "name": name})
+            sections.append(line[len("wireguard."):-len("=peers")])
+        elif line.startswith("wireguard.") and ".name=" in line:
+            key, _, value = line.partition("=")
+            if key.endswith(".name"):
+                section = key[len("wireguard."):-len(".name")]
+                names[section] = value.strip().strip("'\"")
+    peers = []
+    for section in sections:
+        name = names.get(section) or section
+        peers.append({"id": section, "name": name, "country": guess_country_from_name(name)})
     return peers
 
 
@@ -1389,6 +1409,30 @@ _COUNTRY_NAME_HINTS = [
     ("CANADA", "Canada"), ("CA", "Canada"), ("加拿大", "Canada"),
     ("AUSTRALIA", "Australia"), ("AU", "Australia"), ("澳洲", "Australia"), ("澳大利亚", "Australia"),
     ("AMERICA", "USA"), ("UNITED STATES", "USA"), ("US", "USA"), ("USA", "USA"), ("美国", "USA"), ("美國", "USA"),
+    # Added for the WireGuard quick-filter chips -- a "hundreds of
+    # imported servers" list is exactly the case where these show up
+    # constantly and were previously unrecognized.
+    ("RUSSIA", "Russia"), ("RU", "Russia"), ("俄罗斯", "Russia"), ("俄羅斯", "Russia"),
+    ("NETHERLANDS", "Netherlands"), ("NL", "Netherlands"), ("荷兰", "Netherlands"), ("荷蘭", "Netherlands"),
+    ("INDIA", "India"), ("IN", "India"), ("印度", "India"),
+    ("BRAZIL", "Brazil"), ("BR", "Brazil"), ("巴西", "Brazil"),
+    ("TURKEY", "Turkey"), ("TR", "Turkey"), ("土耳其", "Turkey"),
+    ("ARGENTINA", "Argentina"), ("AR", "Argentina"), ("阿根廷", "Argentina"),
+]
+
+# Word-boundary matching (letters only) instead of a bare substring test:
+# "US" is a plain substring of "RUSSIA" ("R-US-SIA"), so the naive `in`
+# check below used to tag every Russian server as the United States --
+# confirmed live (guess_country_from_name("Russia-01") -> "USA") before
+# this fix, and a false positive this common would have made the
+# WireGuard quick-filter chips actively misleading rather than just
+# occasionally wrong. Boundaries are letters-only, not alnum: server
+# names very commonly glue a code straight onto a trailing number with
+# no separator ("US1", "JP03", "HK-2"), and none of that should be
+# treated as "not a boundary" the way it would if digits also counted.
+_COUNTRY_HINT_PATTERNS = [
+    (re.compile(r"(?<![A-Za-z])" + re.escape(key) + r"(?![A-Za-z])"), country)
+    for key, country in _COUNTRY_NAME_HINTS
 ]
 
 
@@ -1396,8 +1440,8 @@ def guess_country_from_name(name):
     if not name:
         return None
     upper = name.upper()
-    for key, country in _COUNTRY_NAME_HINTS:
-        if key in upper:
+    for pattern, country in _COUNTRY_HINT_PATTERNS:
+        if pattern.search(upper):
             return country
     return None
 
@@ -2722,35 +2766,154 @@ def panel_sms_detail(msg):
 # ---------- WireGuard ----------
 
 WIREGUARD_ROW_H = 44
-WIREGUARD_LIST_TOP = 44
 WIREGUARD_TOGGLE_W, WIREGUARD_TOGGLE_H = 44, 24
 
+# Quick country-filter chips above the list, for jumping straight to a
+# server without scrolling through a list that -- per the report that
+# started this -- can run to hundreds of entries. Reuses the same
+# country-guessing heuristic already used for OpenClash node names
+# (guess_country_from_name), so anything already named with a
+# recognizable country/region code just works with no extra tagging.
+WIREGUARD_CHIP_TOP = 40
+WIREGUARD_CHIP_H = 24
+WIREGUARD_CHIP_GAP = 6
+WIREGUARD_CHIP_ROWS_MAX = 2
+WIREGUARD_LIST_TOP = (WIREGUARD_CHIP_TOP
+                     + WIREGUARD_CHIP_ROWS_MAX * (WIREGUARD_CHIP_H + WIREGUARD_CHIP_GAP) + 6)
+WIREGUARD_LIST_BOTTOM = H - 4
 
-def panel_wireguard(peers, active_id):
+# Short chip labels for the country names guess_country_from_name returns.
+# Falls back to the first two letters of the country name for anything
+# not listed here (keeps a new country added to the hints list above from
+# needing a matching entry here too, at the cost of a possibly-odd
+# abbreviation for it).
+_COUNTRY_SHORT_CODE = {
+    "Hong Kong": "HK", "Taiwan": "TW", "Singapore": "SG", "South Korea": "KR",
+    "Japan": "JP", "UK": "UK", "Germany": "DE", "France": "FR", "China": "CN",
+    "Canada": "CA", "Australia": "AU", "USA": "US", "Russia": "RU",
+    "Netherlands": "NL", "India": "IN", "Brazil": "BR", "Turkey": "TR",
+    "Argentina": "AR",
+}
+
+
+def wireguard_chip_layout(peers):
+    """Single source of truth for chip geometry, shared by the renderer
+    and the hit-tester so they can never drift apart: chips are built
+    from whichever countries are actually present in THIS peer list (most
+    common first, so the chips that matter for a given import are the
+    ones on screen), wrapped left-to-right onto up to
+    WIREGUARD_CHIP_ROWS_MAX rows. A leading "All" chip (country=None)
+    clears any active filter. Returns
+    [(label, country_or_None, x0, y0, x1, y1), ...]."""
+    counts = {}
+    for p in peers:
+        c = p.get("country")
+        if c:
+            counts[c] = counts.get(c, 0) + 1
+    ordered = sorted(counts, key=lambda c: -counts[c])
+    chips = [("All", None)] + [(_COUNTRY_SHORT_CODE.get(c, c[:2].upper()), c) for c in ordered]
+
+    d = ImageDraw.Draw(Image.new("RGB", (1, 1)))
+    f = font("default_bold", 12)
+    x, y, row = 12, WIREGUARD_CHIP_TOP, 0
+    out = []
+    for label, country in chips:
+        w = d.textbbox((0, 0), label, font=f)[2] + 20
+        if x + w > W - 12 and x > 12:
+            row += 1
+            if row >= WIREGUARD_CHIP_ROWS_MAX:
+                break
+            x = 12
+            y += WIREGUARD_CHIP_H + WIREGUARD_CHIP_GAP
+        out.append((label, country, x, y, x + w, y + WIREGUARD_CHIP_H))
+        x += w + WIREGUARD_CHIP_GAP
+    return out
+
+
+def draw_wireguard_chips(d, peers, active_filter):
+    f = font("default_bold", 12)
+    for label, country, x0, y0, x1, y1 in wireguard_chip_layout(peers):
+        selected = country == active_filter
+        if selected:
+            d.rounded_rectangle([x0, y0, x1, y1], radius=(y1 - y0) / 2, fill=ACCENT["sim"])
+            centered_text_box(d, x0, y0, x1, y1, label, f, BG)
+        else:
+            d.rounded_rectangle([x0, y0, x1, y1], radius=(y1 - y0) / 2, outline=(60, 68, 84), width=1)
+            centered_text_box(d, x0, y0, x1, y1, label, f, DIM)
+
+
+def hit_wireguard_chip(peers, x, y):
+    """(True, country) if a chip was tapped -- country is None for "All"
+    -- else (False, None) if the tap missed every chip."""
+    for label, country, x0, y0, x1, y1 in wireguard_chip_layout(peers):
+        if x0 <= x <= x1 and y0 <= y <= y1:
+            return True, country
+    return False, None
+
+
+def wireguard_visible_peers(peers, filter_country):
+    if filter_country is None:
+        return peers
+    return [p for p in peers if p.get("country") == filter_country]
+
+
+def wireguard_scroll_max(n_visible):
+    list_h = WIREGUARD_LIST_BOTTOM - WIREGUARD_LIST_TOP
+    return max(0, n_visible * WIREGUARD_ROW_H - list_h)
+
+
+def panel_wireguard(peers, active_id, scroll_px=0, filter_country=None):
     img, d = new_canvas()
     draw_back_header(d, "WireGuard", ACCENT["sim"])
     if not peers:
         centered_text(d, W / 2, 140, "No WireGuard configs", font("default_medium", 14), DIM)
         centered_text(d, W / 2, 164, "add one in LuCI first", font("default_medium", 13), DIM)
         return img
-    for i, peer in enumerate(peers):
-        y0 = WIREGUARD_LIST_TOP + i * WIREGUARD_ROW_H
+
+    draw_wireguard_chips(d, peers, filter_country)
+    d.line([16, WIREGUARD_LIST_TOP - 6, W - 16, WIREGUARD_LIST_TOP - 6], fill=(40, 44, 54))
+
+    visible = wireguard_visible_peers(peers, filter_country)
+    if not visible:
+        centered_text(d, W / 2, WIREGUARD_LIST_TOP + 40, "No matches", font("default_medium", 13), DIM)
+        return img
+
+    # Off-canvas strip + cull rows outside the visible window (same
+    # mechanics as panel_repeater/panel_scroll_picker): each frame only
+    # actually draws the ~5 rows on screen no matter how long the full
+    # list is, so this scales to hundreds of peers without hundreds of
+    # draw calls per frame.
+    list_h = WIREGUARD_LIST_BOTTOM - WIREGUARD_LIST_TOP
+    list_img = Image.new("RGB", (W, list_h), BG)
+    ld = ImageDraw.Draw(list_img)
+    for i, peer in enumerate(visible):
+        y0 = i * WIREGUARD_ROW_H - scroll_px
+        if y0 + WIREGUARD_ROW_H < 0 or y0 > list_h:
+            continue
         is_on = peer["id"] == active_id
-        name = truncate_to_width(d, peer["name"], font("default_medium", 16), W - 32 - WIREGUARD_TOGGLE_W)
-        d.text((16, y0 + (WIREGUARD_ROW_H - 20) / 2), name, font=font("default_medium", 16), fill=FG)
+        name = truncate_to_width(ld, peer["name"], font("default_medium", 16), W - 32 - WIREGUARD_TOGGLE_W)
+        ld.text((16, y0 + (WIREGUARD_ROW_H - 20) / 2), name, font=font("default_medium", 16), fill=FG)
         tx0 = W - 16 - WIREGUARD_TOGGLE_W
         ty0 = y0 + (WIREGUARD_ROW_H - WIREGUARD_TOGGLE_H) / 2
-        draw_toggle(d, tx0, ty0, is_on, ACCENT["sim"], w=WIREGUARD_TOGGLE_W, h=WIREGUARD_TOGGLE_H)
+        draw_toggle(ld, tx0, ty0, is_on, ACCENT["sim"], w=WIREGUARD_TOGGLE_W, h=WIREGUARD_TOGGLE_H)
         if i > 0:
-            d.line([16, y0, W - 16, y0], fill=(28, 32, 42))
+            ld.line([16, y0, W - 16, y0], fill=(28, 32, 42))
+    img.paste(list_img, (0, WIREGUARD_LIST_TOP))
+
+    content_h = len(visible) * WIREGUARD_ROW_H
+    max_scroll = max(0, content_h - list_h)
+    if max_scroll > 0:
+        thumb_h = max(20, list_h * list_h / content_h)
+        thumb_y = WIREGUARD_LIST_TOP + (scroll_px / max_scroll) * (list_h - thumb_h)
+        d.rectangle([W - 6, thumb_y, W - 2, thumb_y + thumb_h], fill=(70, 76, 90))
     return img
 
 
-def hit_wireguard(y, n_peers):
-    if not (WIREGUARD_LIST_TOP <= y < WIREGUARD_LIST_TOP + n_peers * WIREGUARD_ROW_H):
+def hit_wireguard(y, n_visible, scroll_px=0):
+    if not (WIREGUARD_LIST_TOP <= y < WIREGUARD_LIST_BOTTOM):
         return None
-    idx = int((y - WIREGUARD_LIST_TOP) / WIREGUARD_ROW_H)
-    return idx if 0 <= idx < n_peers else None
+    idx = int((y - WIREGUARD_LIST_TOP + scroll_px) / WIREGUARD_ROW_H)
+    return idx if 0 <= idx < n_visible else None
 
 
 # ---------- Games ----------
@@ -4051,6 +4214,7 @@ def mode_live():
     wx, aq = [], []
     sms_messages = []
     wg_peers, wg_active = [], None
+    wg_filter_country = None
     rep = {"connected": False, "ssid": None, "signal": None, "ip": None}
 
     net_sample, net_down, net_up = None, None, None
@@ -4380,6 +4544,61 @@ def mode_live():
             write_frame(panel_sms(sms_messages, picker_scroll_base))
             sub_dirty = False
 
+    def handle_wireguard_scroll(now):
+        """WireGuard-list sibling of handle_repeater_scroll: same drag/tap
+        scrolling, plus the country chip row above the list. A chip tap is
+        checked before falling through to a row tap since the two areas
+        never overlap but share the same touch-release handling; tapping
+        a chip toggles that country's filter on/off (tapping the same
+        chip again, or "All", clears it) and resets the scroll position,
+        since the previous offset is meaningless against a differently
+        sized filtered list."""
+        nonlocal view, sub_dirty, cur_img, last_draw, picker_scroll_base
+        nonlocal wg_active, wg_filter_country
+        visible = wireguard_visible_peers(wg_peers, wg_filter_country)
+        max_scroll = wireguard_scroll_max(len(visible))
+        with touch_state.lock:
+            active = touch_state.active
+            dy, dx = touch_state.dy, touch_state.dx
+            down_x, down_y = touch_state.down_x, touch_state.down_y
+            have_pos = touch_state.have_pos
+            released = touch_state.release_pending
+            release_dx, release_dy = touch_state.release_dx, touch_state.release_dy
+            touch_state.release_pending = False
+
+        if active and (abs(dy) > TAP_JITTER_PX or abs(dx) > TAP_JITTER_PX):
+            live_scroll = min(max_scroll, max(0, picker_scroll_base - dy))
+            write_frame(panel_wireguard(wg_peers, wg_active, live_scroll, wg_filter_country))
+        elif released:
+            final_dx, final_dy = release_dx, release_dy
+            is_tap = (have_pos and abs(final_dx) <= TAP_JITTER_PX
+                      and abs(final_dy) <= TAP_JITTER_PX)
+            if is_tap and hit_back(down_y):
+                view = "main"
+                cur_img = render_main(panel_idx)
+                write_frame(cur_img)
+                last_draw = now
+            elif is_tap:
+                hit, country = hit_wireguard_chip(wg_peers, down_x, down_y)
+                if hit:
+                    wg_filter_country = None if wg_filter_country == country else country
+                    picker_scroll_base = 0
+                    sub_dirty = True
+                else:
+                    idx = hit_wireguard(down_y, len(visible), picker_scroll_base)
+                    if idx is not None:
+                        peer = visible[idx]
+                        turning_on = wg_active != peer["id"]
+                        set_wireguard_enabled(peer["id"], turning_on)
+                        wg_active = peer["id"] if turning_on else None
+                        sub_dirty = True
+            else:
+                picker_scroll_base = min(max_scroll, max(0, picker_scroll_base - final_dy))
+                write_frame(panel_wireguard(wg_peers, wg_active, picker_scroll_base, wg_filter_country))
+        elif sub_dirty:
+            write_frame(panel_wireguard(wg_peers, wg_active, picker_scroll_base, wg_filter_country))
+            sub_dirty = False
+
     confirm_title = confirm_message = confirm_yes_label = confirm_action = confirm_return_view = ""
     confirm_danger = False
     kb_text = ""
@@ -4617,9 +4836,21 @@ def mode_live():
                             sim = run_with_spinner(cur_img, "Applying…", _set_roam,
                                                    ACCENT["sim"]) or sim
                         elif name == "sim" and zone == "wireguard":
+                            # Wrapped in the spinner like the other slow
+                            # actions: get_wireguard_peers is now a single
+                            # uci call (was one per peer), but "hundreds
+                            # of imported servers" is exactly the scale
+                            # where even one call is worth not silently
+                            # freezing the tap on.
+                            def _load_wireguard():
+                                return get_wireguard_peers(), get_wireguard_active()
+
+                            got = run_with_spinner(cur_img, "Loading…", _load_wireguard, ACCENT["sim"])
+                            if got:
+                                wg_peers, wg_active = got
+                            wg_filter_country = None
+                            picker_scroll_base = 0
                             new_view = "wireguard"
-                            wg_peers = get_wireguard_peers()
-                            wg_active = get_wireguard_active()
                         elif name == "sim" and zone == "data_cap":
                             new_view = "datacap"
                         elif name == "openclash" and zone == "toggle":
@@ -4811,6 +5042,11 @@ def mode_live():
                 time.sleep(0.012)
                 continue
 
+            if view == "wireguard":
+                handle_wireguard_scroll(now)
+                time.sleep(0.012)
+                continue
+
             if view == "game":
                 handle_game(now)
                 time.sleep(0.01)
@@ -4833,8 +5069,6 @@ def mode_live():
                 elif view == "sms_detail":
                     idx = sms_selected_idx if sms_selected_idx < len(sms_messages) else 0
                     img = panel_sms_detail(sms_messages[idx])
-                elif view == "wireguard":
-                    img = panel_wireguard(wg_peers, wg_active)
                 else:
                     img = render_sub(view, cfg, oc, traf)
                 write_frame(img)
@@ -4988,14 +5222,6 @@ def mode_live():
                         confirm_action = "shutdown"
                         confirm_return_view = "more"
                         view = "confirm"
-                        sub_dirty = True
-                elif is_tap and view == "wireguard":
-                    idx = hit_wireguard(down_y, len(wg_peers))
-                    if idx is not None:
-                        peer = wg_peers[idx]
-                        turning_on = wg_active != peer["id"]
-                        set_wireguard_enabled(peer["id"], turning_on)
-                        wg_active = peer["id"] if turning_on else None
                         sub_dirty = True
                 elif not is_tap and final_dx > W * 0.3:
                     # Swiping back used to always land on the main carousel,
