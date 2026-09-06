@@ -1414,7 +1414,14 @@ _COUNTRY_NAME_HINTS = [
     # constantly and were previously unrecognized.
     ("RUSSIA", "Russia"), ("RU", "Russia"), ("俄罗斯", "Russia"), ("俄羅斯", "Russia"),
     ("NETHERLANDS", "Netherlands"), ("NL", "Netherlands"), ("荷兰", "Netherlands"), ("荷蘭", "Netherlands"),
-    ("INDIA", "India"), ("IN", "India"), ("印度", "India"),
+    ("INDIA", "India"), ("印度", "India"),
+    # "IN" deliberately excluded as a bare hint: unlike most other 2-letter
+    # codes here, "in" is a common standalone English word/prefix
+    # ("in-house", "check-in", "opt-in", ...) and matched exactly that
+    # kind of unrelated peer name in testing. The narrower
+    # _ISO2_HOSTNAME_PREFIX check below (a bare code directly followed by
+    # a digit, e.g. "in174.expressvpn.com") still catches India-coded
+    # hostnames without that false-positive risk.
     ("BRAZIL", "Brazil"), ("BR", "Brazil"), ("巴西", "Brazil"),
     ("TURKEY", "Turkey"), ("TR", "Turkey"), ("土耳其", "Turkey"),
     ("ARGENTINA", "Argentina"), ("AR", "Argentina"), ("阿根廷", "Argentina"),
@@ -1436,6 +1443,40 @@ _COUNTRY_HINT_PATTERNS = [
 ]
 
 
+# Common VPN-provider hostname convention (NordVPN, ExpressVPN,
+# Surfshark, ...): a bare ISO 3166-1 alpha-2 code glued directly onto a
+# numeric server id with no separator -- e.g. "ie174.nordvpn.com",
+# "am5.nordvpn.com". Confirmed live: 44 of 284 real imported peers on
+# this device were exactly this pattern with codes not covered by
+# _COUNTRY_NAME_HINTS above (which is aimed at names people actually
+# type, not machine-generated hostnames). Kept as a separate table and a
+# separate, narrower check rather than folding into the hints list:
+# a bare 2-letter code is far more likely to be a coincidental substring
+# of an unrelated word than the fuller hint strings are, so it's only
+# trusted in this specific, low-ambiguity position -- right at the start
+# of the name, immediately before a digit.
+_ISO2_HOSTNAME_PREFIX = {
+    "US": "USA", "GB": "UK", "UK": "UK", "DE": "Germany", "FR": "France",
+    "HK": "Hong Kong", "TW": "Taiwan", "SG": "Singapore", "KR": "South Korea",
+    "JP": "Japan", "CN": "China", "CA": "Canada", "AU": "Australia",
+    "RU": "Russia", "NL": "Netherlands", "IN": "India", "BR": "Brazil",
+    "TR": "Turkey", "AR": "Argentina",
+    "IE": "Ireland", "AM": "Armenia", "ES": "Spain", "IT": "Italy",
+    "SE": "Sweden", "NO": "Norway", "DK": "Denmark", "FI": "Finland",
+    "PL": "Poland", "CH": "Switzerland", "AT": "Austria", "BE": "Belgium",
+    "PT": "Portugal", "GR": "Greece", "CZ": "Czechia", "RO": "Romania",
+    "HU": "Hungary", "UA": "Ukraine", "MX": "Mexico", "CL": "Chile",
+    "CO": "Colombia", "ZA": "South Africa", "EG": "Egypt", "IL": "Israel",
+    "AE": "UAE", "SA": "Saudi Arabia", "TH": "Thailand", "VN": "Vietnam",
+    "MY": "Malaysia", "ID": "Indonesia", "PH": "Philippines",
+    "NZ": "New Zealand", "IS": "Iceland", "LU": "Luxembourg",
+    "MD": "Moldova", "RS": "Serbia", "BG": "Bulgaria", "HR": "Croatia",
+    "SK": "Slovakia", "SI": "Slovenia", "EE": "Estonia", "LV": "Latvia",
+    "LT": "Lithuania",
+}
+_ISO2_PREFIX_RE = re.compile(r"^([A-Za-z]{2})\d")
+
+
 def guess_country_from_name(name):
     if not name:
         return None
@@ -1443,6 +1484,12 @@ def guess_country_from_name(name):
     for pattern, country in _COUNTRY_HINT_PATTERNS:
         if pattern.search(upper):
             return country
+    # Checked after the hint list, not instead of it: an explicit hint
+    # spans more of the name and so is less likely to be a coincidence,
+    # so it wins first when both would apply.
+    m = _ISO2_PREFIX_RE.match(name)
+    if m:
+        return _ISO2_HOSTNAME_PREFIX.get(m.group(1).upper())
     return None
 
 
@@ -1590,6 +1637,31 @@ def _flag_taiwan(d, x, y, w, h):
     d.ellipse([cx - r, cy - r, cx + r, cy + r], fill=(255, 255, 255))
 
 
+def _crescent_and_star(d, cx, cy, r, color):
+    """White circle then a same-colour-as-field circle offset to bite a
+    sliver out of it, plus a small dot -- the same "subtract a circle"
+    trick used for every crescent-and-star flag (Turkey, Singapore, ...),
+    good enough at chip-icon size without a real vector crescent path."""
+    d.ellipse([cx - r, cy - r, cx + r, cy + r], fill=(255, 255, 255))
+    d.ellipse([cx - r + r * 0.4, cy - r, cx + r + r * 0.4, cy + r], fill=color)
+    sr = max(1, r * 0.3)
+    sx, sy = cx + r * 0.9, cy
+    d.ellipse([sx - sr, sy - sr, sx + sr, sy + sr], fill=(255, 255, 255))
+
+
+def _flag_turkey(d, x, y, w, h):
+    red = (227, 10, 23)
+    d.rectangle([x, y, x + w, y + h], fill=red)
+    _crescent_and_star(d, x + w * 0.42, y + h * 0.5, h * 0.3, red)
+
+
+def _flag_singapore(d, x, y, w, h):
+    red = (237, 28, 36)
+    d.rectangle([x, y, x + w, y + h / 2], fill=red)
+    d.rectangle([x, y + h / 2, x + w, y + h], fill=(255, 255, 255))
+    _crescent_and_star(d, x + w * 0.26, y + h * 0.26, h * 0.2, red)
+
+
 FLAG_DRAW = {
     "UK": _flag_uk,
     "China": _flag_china,
@@ -1615,6 +1687,8 @@ FLAG_DRAW = {
     "Romania": lambda d, x, y, w, h: _flag_stripes(d, x, y, w, h, [(0, 43, 127), (252, 209, 22), (206, 43, 55)], True),
     "Slovakia": lambda d, x, y, w, h: _flag_stripes(d, x, y, w, h, [(255, 255, 255), (0, 101, 189), (238, 28, 37)], False),
     "Canada": lambda d, x, y, w, h: _flag_stripes(d, x, y, w, h, [(255, 0, 0), (255, 255, 255), (255, 0, 0)], True),
+    "Turkey": _flag_turkey,
+    "Singapore": _flag_singapore,
 }
 
 
@@ -2778,6 +2852,9 @@ WIREGUARD_CHIP_TOP = 40
 WIREGUARD_CHIP_H = 24
 WIREGUARD_CHIP_GAP = 6
 WIREGUARD_CHIP_ROWS_MAX = 2
+WIREGUARD_CHIP_PAD = 10
+WIREGUARD_FLAG_W, WIREGUARD_FLAG_H = 16, 11
+WIREGUARD_CHIP_ICON_GAP = 4
 WIREGUARD_LIST_TOP = (WIREGUARD_CHIP_TOP
                      + WIREGUARD_CHIP_ROWS_MAX * (WIREGUARD_CHIP_H + WIREGUARD_CHIP_GAP) + 6)
 WIREGUARD_LIST_BOTTOM = H - 4
@@ -2793,6 +2870,22 @@ _COUNTRY_SHORT_CODE = {
     "Canada": "CA", "Australia": "AU", "USA": "US", "Russia": "RU",
     "Netherlands": "NL", "India": "IN", "Brazil": "BR", "Turkey": "TR",
     "Argentina": "AR",
+    # Matches _ISO2_HOSTNAME_PREFIX's country names -- without an explicit
+    # entry here, the fallback below truncates the country's ENGLISH NAME
+    # to two letters, which for e.g. "Ireland" gives "IR" and collides
+    # with Iran's actual code on the same chip row.
+    "Ireland": "IE", "Armenia": "AM", "Spain": "ES", "Italy": "IT",
+    "Sweden": "SE", "Norway": "NO", "Denmark": "DK", "Finland": "FI",
+    "Poland": "PL", "Switzerland": "CH", "Austria": "AT", "Belgium": "BE",
+    "Portugal": "PT", "Greece": "GR", "Czechia": "CZ", "Romania": "RO",
+    "Hungary": "HU", "Ukraine": "UA", "Mexico": "MX", "Chile": "CL",
+    "Colombia": "CO", "South Africa": "ZA", "Egypt": "EG", "Israel": "IL",
+    "UAE": "AE", "Saudi Arabia": "SA", "Thailand": "TH", "Vietnam": "VN",
+    "Malaysia": "MY", "Indonesia": "ID", "Philippines": "PH",
+    "New Zealand": "NZ", "Iceland": "IS", "Luxembourg": "LU",
+    "Moldova": "MD", "Serbia": "RS", "Bulgaria": "BG", "Croatia": "HR",
+    "Slovakia": "SK", "Slovenia": "SI", "Estonia": "EE", "Latvia": "LV",
+    "Lithuania": "LT",
 }
 
 
@@ -2803,8 +2896,13 @@ def wireguard_chip_layout(peers):
     common first, so the chips that matter for a given import are the
     ones on screen), wrapped left-to-right onto up to
     WIREGUARD_CHIP_ROWS_MAX rows. A leading "All" chip (country=None)
-    clears any active filter. Returns
-    [(label, country_or_None, x0, y0, x1, y1), ...]."""
+    clears any active filter. A chip only reserves space for a flag icon
+    when one is actually hand-drawn for that country (FLAG_DRAW) --
+    otherwise it would just be draw_flag's generic "grey box + guessed
+    initials" placeholder sitting right next to this same chip's own,
+    already-correct text label, which would just be a second, possibly
+    different-looking abbreviation for no benefit over the text alone.
+    Returns [(label, country_or_None, x0, y0, x1, y1, has_flag), ...]."""
     counts = {}
     for p in peers:
         c = p.get("country")
@@ -2818,34 +2916,49 @@ def wireguard_chip_layout(peers):
     x, y, row = 12, WIREGUARD_CHIP_TOP, 0
     out = []
     for label, country in chips:
-        w = d.textbbox((0, 0), label, font=f)[2] + 20
+        has_flag = country in FLAG_DRAW
+        text_w = d.textbbox((0, 0), label, font=f)[2]
+        if has_flag:
+            w = WIREGUARD_CHIP_PAD + WIREGUARD_FLAG_W + WIREGUARD_CHIP_ICON_GAP + text_w + WIREGUARD_CHIP_PAD
+        else:
+            w = text_w + 2 * WIREGUARD_CHIP_PAD
         if x + w > W - 12 and x > 12:
             row += 1
             if row >= WIREGUARD_CHIP_ROWS_MAX:
                 break
             x = 12
             y += WIREGUARD_CHIP_H + WIREGUARD_CHIP_GAP
-        out.append((label, country, x, y, x + w, y + WIREGUARD_CHIP_H))
+        out.append((label, country, x, y, x + w, y + WIREGUARD_CHIP_H, has_flag))
         x += w + WIREGUARD_CHIP_GAP
     return out
 
 
 def draw_wireguard_chips(d, peers, active_filter):
     f = font("default_bold", 12)
-    for label, country, x0, y0, x1, y1 in wireguard_chip_layout(peers):
+    for label, country, x0, y0, x1, y1, has_flag in wireguard_chip_layout(peers):
         selected = country == active_filter
+        chip_h = y1 - y0
         if selected:
-            d.rounded_rectangle([x0, y0, x1, y1], radius=(y1 - y0) / 2, fill=ACCENT["sim"])
-            centered_text_box(d, x0, y0, x1, y1, label, f, BG)
+            d.rounded_rectangle([x0, y0, x1, y1], radius=chip_h / 2, fill=ACCENT["sim"])
+            text_color = BG
         else:
-            d.rounded_rectangle([x0, y0, x1, y1], radius=(y1 - y0) / 2, outline=(60, 68, 84), width=1)
-            centered_text_box(d, x0, y0, x1, y1, label, f, DIM)
+            d.rounded_rectangle([x0, y0, x1, y1], radius=chip_h / 2, outline=(60, 68, 84), width=1)
+            text_color = DIM
+        if has_flag:
+            fy = y0 + (chip_h - WIREGUARD_FLAG_H) / 2
+            draw_flag(d, x0 + WIREGUARD_CHIP_PAD, fy, WIREGUARD_FLAG_W, WIREGUARD_FLAG_H, country)
+            tx0 = x0 + WIREGUARD_CHIP_PAD + WIREGUARD_FLAG_W + WIREGUARD_CHIP_ICON_GAP
+            bbox = d.textbbox((0, 0), label, font=f)
+            th = bbox[3] - bbox[1]
+            d.text((tx0, y0 + (chip_h - th) / 2 - bbox[1]), label, font=f, fill=text_color)
+        else:
+            centered_text_box(d, x0, y0, x1, y1, label, f, text_color)
 
 
 def hit_wireguard_chip(peers, x, y):
     """(True, country) if a chip was tapped -- country is None for "All"
     -- else (False, None) if the tap missed every chip."""
-    for label, country, x0, y0, x1, y1 in wireguard_chip_layout(peers):
+    for label, country, x0, y0, x1, y1, has_flag in wireguard_chip_layout(peers):
         if x0 <= x <= x1 and y0 <= y <= y1:
             return True, country
     return False, None
