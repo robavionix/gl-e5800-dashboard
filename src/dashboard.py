@@ -1725,6 +1725,13 @@ def _icon_sms(d, cx, cy, r, color):
 
 SPINNER_SPEED_DPS = 300.0     # degrees/second -- iOS-ish, brisk but calm
 
+# Upper bound for the "Switching to stock UI…" transition animation.
+# toggle.sh's own worst case (wait_gone: six 0.2s polls, then SIGKILL any
+# survivor) is ~1.2s, so this leaves real slack for gl_screen's own
+# startup while still being short enough that the overlay itself never
+# becomes the thing that looks stuck.
+SWITCH_OVERLAY_MAX_S = 3.0
+
 
 def draw_ring_spinner(d, cx, cy, r, phase_deg, accent, width=3, arc_deg=270, segments=18):
     """A rotating arc with a brightness ramp toward its leading end. PIL
@@ -4857,7 +4864,32 @@ def mode_live():
                         shutdown_router()
                         view = "more"
                     elif confirm_action == "return_stock":
+                        # toggle.sh force-kills this very process within
+                        # ~1.2s if it hasn't already exited (wait_gone's
+                        # poll-then-SIGKILL), then starts gl_screen -- so
+                        # the real-world gap is short, but nothing was
+                        # ever drawn to the screen during it before, and
+                        # a silent frozen dashboard for even a couple of
+                        # seconds reads as "did my tap even register?"
+                        # Paint an unmistakable "switching" spinner over
+                        # the confirm dialog instead, for up to
+                        # SWITCH_OVERLAY_MAX_S or until _stop fires
+                        # (procd's own TERM has reached us and there's no
+                        # point animating any further -- this process is
+                        # already being torn down). If the stock UI
+                        # somehow still hasn't taken over by the time the
+                        # window elapses, falling through to the live
+                        # dashboard is an honest fallback rather than
+                        # freezing on "switching" forever.
+                        base = panel_confirm(confirm_title, confirm_message, ACCENT["clock"],
+                                             yes_label=confirm_yes_label, danger=confirm_danger)
                         switch_to_stock_ui()
+                        t0 = time.time()
+                        while time.time() - t0 < SWITCH_OVERLAY_MAX_S and not _stop:
+                            elapsed = time.time() - t0
+                            write_frame(draw_loading_overlay(base, "Switching to stock UI…",
+                                                             elapsed * SPINNER_SPEED_DPS, ACCENT["clock"]))
+                            time.sleep(1.0 / 25)
                         view = "main"
                     elif confirm_action == "repeater_disconnect":
                         repeater_disconnect()
