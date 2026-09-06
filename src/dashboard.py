@@ -18,6 +18,7 @@ Usage:
 import json
 import math
 import os
+import random
 import signal
 import struct
 import subprocess
@@ -36,6 +37,7 @@ FONT_DIR = "/etc/gl_screen/language/ttf"
 STATE_DIR = Path("/root/dashboard")
 FX_CACHE = STATE_DIR / "fx_cache.json"
 CONFIG_FILE = STATE_DIR / "config.json"
+GAME_SCORES_FILE = STATE_DIR / "game_scores.json"
 
 BG = (11, 18, 32)
 FG = (230, 235, 245)
@@ -47,6 +49,7 @@ ACCENT = {
     "openclash": (200, 140, 255),
     "weather": (90, 214, 200),
     "monitor": (235, 120, 160),
+    "games": (255, 210, 90),
 }
 
 MCC_COUNTRY = {
@@ -267,6 +270,27 @@ def save_config(cfg):
         f.flush()
         os.fsync(f.fileno())
     os.replace(tmp, CONFIG_FILE)
+
+
+def load_game_scores():
+    if GAME_SCORES_FILE.exists():
+        try:
+            return json.loads(GAME_SCORES_FILE.read_text())
+        except Exception:
+            pass
+    return {}
+
+
+def save_game_scores(scores):
+    """Same atomic write pattern as save_config -- a half-written high
+    score file would silently reset every game's best score to zero."""
+    STATE_DIR.mkdir(parents=True, exist_ok=True)
+    tmp = GAME_SCORES_FILE.with_suffix(".json.tmp")
+    with open(tmp, "w") as f:
+        json.dump(scores, f)
+        f.flush()
+        os.fsync(f.fileno())
+    os.replace(tmp, GAME_SCORES_FILE)
 
 
 def city_name(tz_id):
@@ -1785,7 +1809,7 @@ def new_canvas():
     return img, ImageDraw.Draw(img)
 
 
-def draw_page_dots(d, active_idx, count=6):
+def draw_page_dots(d, active_idx, count=7):
     total_w = count * 16
     x0 = (W - total_w) // 2
     y = H - 18
@@ -2000,7 +2024,7 @@ WEATHER_CITY_ZONE = (34, 66)
 
 PICKER_TOP, PICKER_BOTTOM = 38, 316
 
-PANEL_NAMES = ["clock", "sim", "monitor", "weather", "fx", "openclash"]
+PANEL_NAMES = ["clock", "sim", "monitor", "weather", "fx", "openclash", "games"]
 
 
 # ---------- main panels ----------
@@ -2722,6 +2746,599 @@ def hit_wireguard(y, n_peers):
     return idx if 0 <= idx < n_peers else None
 
 
+# ---------- Games ----------
+#
+# Reached by tapping into the "games" main panel (7th carousel page, a
+# hub listing all four titles with best scores) -- NOT swipeable
+# themselves. Each game is its own `view == "game"` sub-screen (same
+# family as "more"/"repeater"/"sms": it owns touch completely while
+# active) so none of them fight the main carousel's own swipe-to-page
+# gesture, which several of these games would otherwise collide with
+# (2048's swipe-to-merge most obviously, but even Snake's directional
+# input sits close enough to a swipe to be ambiguous).
+#
+# All four share one on-screen contract: a persistent Exit pill in the
+# chrome bar (top-right, same spot in every game) always returns to the
+# hub -- tapping it never needs to be preceded by finding a header/back
+# gesture first, and it's the same gesture regardless of which game is
+# running or what state it's in (playing, paused, game over).
+#
+# Frame budget: measured live on this hardware -- new_canvas + a handful
+# of shapes/text + RGB565 convert + fb0 write costs ~23ms/frame (~44fps
+# ceiling). All continuous games run at 25fps (40ms), leaving comfortable
+# headroom; Snake only needs to redraw on its own ~130ms movement step,
+# since nothing changes on screen between steps.
+
+GAME_NAMES = ["snake", "flappy", "breakout", "twenty48"]
+GAME_LABELS = {"snake": "Snake", "flappy": "Flappy", "breakout": "Breakout", "twenty48": "2048"}
+
+GAME_TICK_S = 0.04          # 25fps for the continuously-animated games
+SNAKE_STEP_S = 0.13         # grid movement interval
+
+GAME_EXIT_RECT = (170, 4, 234, 30)
+GAMES_HUB_TOP = 48
+GAMES_HUB_ROW_H = 58
+
+
+def draw_game_chrome(d, title, accent, score_text=None):
+    """Shared top bar for every game: title, optional score/best readout,
+    and the persistent Exit pill. Deliberately the same 34px height as
+    every other panel's header (CLOCK_LEFT_ZONE and friends all start
+    their content at y=34) so a game screen doesn't look out of place
+    next to the rest of the dashboard."""
+    d.rectangle([0, 0, W, 34], fill=(16, 22, 34))
+    d.line([0, 34, W, 34], fill=(40, 44, 54))
+    f_title = font("default_bold", 16)
+    d.text((12, 8), title, font=f_title, fill=accent)
+    if score_text:
+        # Anchored right after the title rather than right-aligned at a
+        # fixed x: a fixed anchor overlapped the title whenever the game
+        # name was long (e.g. "Breakout"), since the score's start point
+        # depended only on ITS OWN width, not on where the title ended.
+        # Falls back to a smaller font if the combination still wouldn't
+        # clear the Exit pill (safety net for any future game name).
+        title_w = d.textbbox((0, 0), title, font=f_title)[2]
+        x0 = 12 + title_w + 8
+        f = font("default_medium", 12)
+        sw = d.textbbox((0, 0), score_text, font=f)[2]
+        if x0 + sw > GAME_EXIT_RECT[0] - 6:
+            f = font("default_medium", 10)
+        d.text((x0, 11), score_text, font=f, fill=FG)
+    ex0, ey0, ex1, ey1 = GAME_EXIT_RECT
+    d.rounded_rectangle([ex0, ey0, ex1, ey1], radius=9, fill=(70, 26, 32))
+    centered_text_box(d, ex0, ey0, ex1, ey1, "Exit", font("default_bold", 12), (255, 195, 195))
+
+
+def hit_game_exit(x, y):
+    ex0, ey0, ex1, ey1 = GAME_EXIT_RECT
+    return ex0 <= x <= ex1 and ey0 <= y <= ey1
+
+
+def draw_game_message(d, lines, sub=None):
+    """Centered card for "tap to start" / "game over" -- reused by all
+    four games instead of each hand-rolling its own overlay."""
+    cx, cy = W / 2, 34 + (H - 34) / 2
+    card_w = 208
+    card_h = 64 + len(lines) * 22 + (20 if sub else 0)
+    x0, y0 = cx - card_w / 2, cy - card_h / 2
+    d.rounded_rectangle([x0, y0, x0 + card_w, y0 + card_h], radius=14,
+                        fill=(20, 26, 40), outline=(52, 62, 86))
+    f = font("default_bold", 16)
+    top = y0 + 20
+    for i, line in enumerate(lines):
+        centered_text(d, cx, top + i * 22, line, f, FG)
+    if sub:
+        centered_text(d, cx, y0 + card_h - 26, sub, font("default_medium", 12), DIM)
+
+
+def panel_games(scores):
+    img, d = new_canvas()
+    draw_header(d, "GAMES", ACCENT["games"])
+    for i, key in enumerate(GAME_NAMES):
+        y0 = GAMES_HUB_TOP + i * GAMES_HUB_ROW_H
+        y1 = y0 + GAMES_HUB_ROW_H - 10
+        d.rounded_rectangle([12, y0, W - 12, y1], radius=10, outline=(48, 58, 82), width=1)
+        d.text((24, y0 + 13), GAME_LABELS[key], font=font("default_bold", 16), fill=FG)
+        best = scores.get(key, 0)
+        d.text((24, y0 + 33), "Best: %s" % best, font=font("default_medium", 12), fill=DIM)
+        centered_text(d, W - 28, y0 + (y1 - y0) / 2 - 8, "\u203a", font("default_bold", 20), DIM)
+    draw_page_dots(d, 6)
+    return img
+
+
+def hit_main_games(x, y):
+    for i, key in enumerate(GAME_NAMES):
+        y0 = GAMES_HUB_TOP + i * GAMES_HUB_ROW_H
+        y1 = y0 + GAMES_HUB_ROW_H - 10
+        if 12 <= x <= W - 12 and y0 <= y <= y1:
+            return "play:" + key
+    return None
+
+
+def new_game_state(key):
+    return {
+        "snake": new_snake_state,
+        "flappy": new_flappy_state,
+        "breakout": new_breakout_state,
+        "twenty48": new_2048_state,
+    }[key]()
+
+
+# ---- Snake ----
+# Grid movement, direction chosen by tapping anywhere in the play area:
+# whichever axis the tap sits further from center on wins (tap in the
+# upper strip -> up, right strip -> right, etc). No fixed quadrant
+# rectangles to tune -- this scales cleanly to the actual play area and
+# never has a dead zone.
+
+SNAKE_CELL = 12
+SNAKE_COLS = W // SNAKE_CELL                    # 20
+SNAKE_PLAY_TOP = 34
+SNAKE_ROWS = (H - SNAKE_PLAY_TOP) // SNAKE_CELL  # 23
+
+
+def new_snake_state():
+    cx, cy = SNAKE_COLS // 2, SNAKE_ROWS // 2
+    body = [(cx - 1, cy), (cx - 2, cy), (cx - 3, cy)]
+    state = {"body": body, "dir": (1, 0), "pending_dir": (1, 0), "over": False,
+             "score": 0, "last_step": 0.0}
+    state["food"] = _snake_spawn_food(body)
+    return state
+
+
+def _snake_spawn_food(body):
+    occupied = set(body)
+    free = [(c, r) for c in range(SNAKE_COLS) for r in range(SNAKE_ROWS) if (c, r) not in occupied]
+    return random.choice(free) if free else None
+
+
+def snake_set_direction(state, tap_x, tap_y):
+    if state["over"]:
+        return
+    cx, cy = W / 2, SNAKE_PLAY_TOP + (H - SNAKE_PLAY_TOP) / 2
+    ddx, ddy = tap_x - cx, tap_y - cy
+    want = (1, 0) if ddx > 0 else (-1, 0)
+    if abs(ddy) > abs(ddx):
+        want = (0, 1) if ddy > 0 else (0, -1)
+    cur = state["dir"]
+    if (want[0], want[1]) == (-cur[0], -cur[1]):
+        return  # can't reverse directly into yourself
+    state["pending_dir"] = want
+
+
+def snake_step(state, scores):
+    body = state["body"]
+    state["dir"] = state["pending_dir"]
+    hc, hr = body[0]
+    dc, dr = state["dir"]
+    nc, nr = hc + dc, hr + dr
+    if not (0 <= nc < SNAKE_COLS and 0 <= nr < SNAKE_ROWS) or (nc, nr) in body:
+        state["over"] = True
+        if state["score"] > scores.get("snake", 0):
+            scores["snake"] = state["score"]
+            save_game_scores(scores)
+        return
+    body.insert(0, (nc, nr))
+    if state["food"] is not None and (nc, nr) == state["food"]:
+        state["score"] += 1
+        state["food"] = _snake_spawn_food(body)
+    else:
+        body.pop()
+
+
+def draw_snake(state, scores):
+    img, d = new_canvas()
+    best = scores.get("snake", 0)
+    draw_game_chrome(d, "Snake", ACCENT["games"], "%d  (best %d)" % (state["score"], best))
+    for i, (c, r) in enumerate(state["body"]):
+        x0, y0 = c * SNAKE_CELL, SNAKE_PLAY_TOP + r * SNAKE_CELL
+        color = ACCENT["games"] if i == 0 else (150, 170, 90)
+        d.rounded_rectangle([x0 + 1, y0 + 1, x0 + SNAKE_CELL - 1, y0 + SNAKE_CELL - 1],
+                            radius=3, fill=color)
+    if state["food"] is not None:
+        fc, fr = state["food"]
+        x0, y0 = fc * SNAKE_CELL, SNAKE_PLAY_TOP + fr * SNAKE_CELL
+        d.ellipse([x0 + 2, y0 + 2, x0 + SNAKE_CELL - 2, y0 + SNAKE_CELL - 2], fill=(230, 90, 90))
+    if state["over"]:
+        draw_game_message(d, ["Game Over"], "Tap to restart")
+    return img
+
+
+def tick_snake(state, now, scores, tap, tap_x, tap_y):
+    if state["over"]:
+        if tap:
+            state = new_snake_state()
+        return state, False
+    if tap:
+        snake_set_direction(state, tap_x, tap_y)
+    stepped = False
+    if now - state["last_step"] >= SNAKE_STEP_S:
+        state["last_step"] = now
+        snake_step(state, scores)
+        stepped = True
+    return state, stepped
+
+
+# ---- Flappy ----
+
+FLAPPY_BIRD_X = 60
+FLAPPY_GRAVITY = 640.0
+FLAPPY_FLAP_VY = -230.0
+FLAPPY_PIPE_SPEED = 85.0
+FLAPPY_PIPE_GAP = 100
+FLAPPY_PIPE_W = 32
+FLAPPY_PIPE_SPACING = 150
+FLAPPY_PLAY_TOP = 34
+FLAPPY_BIRD_R = 9
+
+
+def new_flappy_state():
+    return {"bird_y": H / 2, "bird_vy": 0.0, "pipes": [], "score": 0,
+            "started": False, "over": False}
+
+
+def _flappy_spawn_pipe(state, x):
+    top = random.randint(FLAPPY_PLAY_TOP + 30, H - 30 - FLAPPY_PIPE_GAP)
+    state["pipes"].append({"x": x, "gap_y": top, "passed": False})
+
+
+def tick_flappy(state, dt, scores, tap):
+    if state["over"]:
+        if tap:
+            state = new_flappy_state()
+        return state
+    if tap:
+        state["started"] = True
+        state["bird_vy"] = FLAPPY_FLAP_VY
+    if not state["started"]:
+        return state
+
+    state["bird_vy"] += FLAPPY_GRAVITY * dt
+    state["bird_y"] += state["bird_vy"] * dt
+
+    for p in state["pipes"]:
+        p["x"] -= FLAPPY_PIPE_SPEED * dt
+    state["pipes"] = [p for p in state["pipes"] if p["x"] + FLAPPY_PIPE_W > 0]
+    if not state["pipes"] or state["pipes"][-1]["x"] < W - FLAPPY_PIPE_SPACING:
+        _flappy_spawn_pipe(state, W)
+
+    bird_top, bird_bot = state["bird_y"] - FLAPPY_BIRD_R, state["bird_y"] + FLAPPY_BIRD_R
+    hit = bird_top <= FLAPPY_PLAY_TOP or bird_bot >= H
+    for p in state["pipes"]:
+        if p["x"] < FLAPPY_BIRD_X + FLAPPY_BIRD_R and p["x"] + FLAPPY_PIPE_W > FLAPPY_BIRD_X - FLAPPY_BIRD_R:
+            if bird_top < p["gap_y"] or bird_bot > p["gap_y"] + FLAPPY_PIPE_GAP:
+                hit = True
+        if not p["passed"] and p["x"] + FLAPPY_PIPE_W < FLAPPY_BIRD_X:
+            p["passed"] = True
+            state["score"] += 1
+    if hit:
+        state["over"] = True
+        if state["score"] > scores.get("flappy", 0):
+            scores["flappy"] = state["score"]
+            save_game_scores(scores)
+    return state
+
+
+def draw_flappy(state, scores):
+    img, d = new_canvas()
+    best = scores.get("flappy", 0)
+    draw_game_chrome(d, "Flappy", ACCENT["games"], "%d  (best %d)" % (state["score"], best))
+    for p in state["pipes"]:
+        d.rectangle([p["x"], FLAPPY_PLAY_TOP, p["x"] + FLAPPY_PIPE_W, p["gap_y"]], fill=(90, 200, 130))
+        d.rectangle([p["x"], p["gap_y"] + FLAPPY_PIPE_GAP, p["x"] + FLAPPY_PIPE_W, H], fill=(90, 200, 130))
+    bx, by = FLAPPY_BIRD_X, state["bird_y"]
+    d.ellipse([bx - FLAPPY_BIRD_R, by - FLAPPY_BIRD_R, bx + FLAPPY_BIRD_R, by + FLAPPY_BIRD_R],
+              fill=(255, 205, 80))
+    if not state["started"]:
+        draw_game_message(d, ["Flappy"], "Tap to start")
+    elif state["over"]:
+        draw_game_message(d, ["Game Over"], "Tap to restart")
+    return img
+
+
+# ---- Breakout ----
+
+BREAKOUT_PADDLE_W = 50
+BREAKOUT_PADDLE_H = 8
+BREAKOUT_PADDLE_Y = 300
+BREAKOUT_BALL_R = 5
+BREAKOUT_ROWS, BREAKOUT_COLS = 4, 6
+BREAKOUT_BRICK_TOP = 44
+BREAKOUT_BRICK_H = 14
+BREAKOUT_BRICK_GAP = 3
+BREAKOUT_MARGIN = 10
+BREAKOUT_BRICK_W = (W - 2 * BREAKOUT_MARGIN - (BREAKOUT_COLS - 1) * BREAKOUT_BRICK_GAP) / BREAKOUT_COLS
+BREAKOUT_BALL_SPEED = 160.0
+_BREAKOUT_BRICK_COLORS = [(230, 110, 110), (230, 170, 90), (210, 210, 100), (120, 200, 140)]
+
+
+def _breakout_fresh_bricks():
+    return [[True] * BREAKOUT_COLS for _ in range(BREAKOUT_ROWS)]
+
+
+def _breakout_serve(state):
+    state["ball_x"] = state["paddle_x"]
+    state["ball_y"] = BREAKOUT_PADDLE_Y - BREAKOUT_BALL_R - 1
+    state["ball_vx"] = BREAKOUT_BALL_SPEED * 0.4
+    state["ball_vy"] = -BREAKOUT_BALL_SPEED
+    state["started"] = False
+
+
+def new_breakout_state():
+    state = {"paddle_x": W / 2, "bricks": _breakout_fresh_bricks(), "lives": 3,
+             "score": 0, "over": False, "started": False}
+    _breakout_serve(state)
+    return state
+
+
+def tick_breakout(state, dt, scores, tap, drag_x):
+    if state["over"]:
+        if tap:
+            state = new_breakout_state()
+        return state
+    if drag_x is not None:
+        state["paddle_x"] = max(BREAKOUT_PADDLE_W / 2, min(W - BREAKOUT_PADDLE_W / 2, drag_x))
+        if not state["started"]:
+            state["ball_x"] = state["paddle_x"]
+    if tap and not state["started"]:
+        state["started"] = True
+    if not state["started"]:
+        return state
+
+    state["ball_x"] += state["ball_vx"] * dt
+    state["ball_y"] += state["ball_vy"] * dt
+
+    if state["ball_x"] <= BREAKOUT_BALL_R:
+        state["ball_x"] = BREAKOUT_BALL_R
+        state["ball_vx"] = abs(state["ball_vx"])
+    elif state["ball_x"] >= W - BREAKOUT_BALL_R:
+        state["ball_x"] = W - BREAKOUT_BALL_R
+        state["ball_vx"] = -abs(state["ball_vx"])
+    if state["ball_y"] <= FLAPPY_PLAY_TOP + BREAKOUT_BALL_R:
+        state["ball_y"] = FLAPPY_PLAY_TOP + BREAKOUT_BALL_R
+        state["ball_vy"] = abs(state["ball_vy"])
+
+    px, py = state["paddle_x"], BREAKOUT_PADDLE_Y
+    # The upper bound (ball hasn't already passed the paddle's bottom
+    # edge) matters: without it, a ball moving downward is still counted
+    # as "hitting" the paddle no matter how far below it has already
+    # fallen, since ball_y+R >= py stays true forever once the ball is
+    # past that line. A single unusually large dt (or an intentionally
+    # extreme test) could let the ball tunnel yards past the paddle in
+    # one step and still bounce back up as if nothing happened, instead
+    # of correctly falling through and costing a life.
+    if (state["ball_vy"] > 0 and state["ball_y"] + BREAKOUT_BALL_R >= py
+            and state["ball_y"] - BREAKOUT_BALL_R <= py + BREAKOUT_PADDLE_H
+            and abs(state["ball_x"] - px) <= BREAKOUT_PADDLE_W / 2 + BREAKOUT_BALL_R):
+        state["ball_y"] = py - BREAKOUT_BALL_R
+        # Clamp to [-1, 1]: the hit test allows a small margin
+        # (PADDLE_W/2 + BALL_R) beyond the paddle's own half-width, so an
+        # edge hit can push |offset| slightly past 1 -- and speed**2 -
+        # vx**2 going negative turns ball_vy into a *complex* number in
+        # Python ((-1)**0.5 doesn't raise, it returns 1.2e-16+1j), not an
+        # exception, silently poisoning every physics update after it.
+        offset = max(-1.0, min(1.0, (state["ball_x"] - px) / (BREAKOUT_PADDLE_W / 2)))
+        speed = (state["ball_vx"] ** 2 + state["ball_vy"] ** 2) ** 0.5
+        state["ball_vx"] = offset * speed
+        state["ball_vy"] = -max(0.0, speed ** 2 - state["ball_vx"] ** 2) ** 0.5
+
+    bx0, by0 = state["ball_x"] - BREAKOUT_BALL_R, state["ball_y"] - BREAKOUT_BALL_R
+    bx1, by1 = state["ball_x"] + BREAKOUT_BALL_R, state["ball_y"] + BREAKOUT_BALL_R
+    hit_any = False
+    for row in range(BREAKOUT_ROWS):
+        for col in range(BREAKOUT_COLS):
+            if not state["bricks"][row][col]:
+                continue
+            rx0 = BREAKOUT_MARGIN + col * (BREAKOUT_BRICK_W + BREAKOUT_BRICK_GAP)
+            ry0 = BREAKOUT_BRICK_TOP + row * (BREAKOUT_BRICK_H + BREAKOUT_BRICK_GAP)
+            rx1, ry1 = rx0 + BREAKOUT_BRICK_W, ry0 + BREAKOUT_BRICK_H
+            if bx1 >= rx0 and bx0 <= rx1 and by1 >= ry0 and by0 <= ry1:
+                state["bricks"][row][col] = False
+                state["score"] += 10
+                state["ball_vy"] = -state["ball_vy"]
+                hit_any = True
+                break
+        if hit_any:
+            break
+    if hit_any and not any(any(r) for r in state["bricks"]):
+        state["bricks"] = _breakout_fresh_bricks()
+        state["ball_vx"] *= 1.08
+        state["ball_vy"] *= 1.08
+        _breakout_serve(state)
+
+    if state["ball_y"] > H:
+        state["lives"] -= 1
+        if state["lives"] <= 0:
+            state["over"] = True
+            if state["score"] > scores.get("breakout", 0):
+                scores["breakout"] = state["score"]
+                save_game_scores(scores)
+        else:
+            _breakout_serve(state)
+    return state
+
+
+def draw_breakout(state, scores):
+    img, d = new_canvas()
+    best = scores.get("breakout", 0)
+    # Plain ASCII, not a heart glyph: same reasoning as the hand-drawn
+    # flags/weather icons elsewhere in this file -- the bundled font has
+    # no colour emoji, and an unsupported glyph silently renders as a
+    # tofu box instead of failing loudly, so it's easy to ship unnoticed.
+    draw_game_chrome(d, "Breakout", ACCENT["games"],
+                     "%d  x%d  b%d" % (state["score"], state["lives"], best))
+    for row in range(BREAKOUT_ROWS):
+        for col in range(BREAKOUT_COLS):
+            if not state["bricks"][row][col]:
+                continue
+            rx0 = BREAKOUT_MARGIN + col * (BREAKOUT_BRICK_W + BREAKOUT_BRICK_GAP)
+            ry0 = BREAKOUT_BRICK_TOP + row * (BREAKOUT_BRICK_H + BREAKOUT_BRICK_GAP)
+            d.rectangle([rx0, ry0, rx0 + BREAKOUT_BRICK_W, ry0 + BREAKOUT_BRICK_H],
+                       fill=_BREAKOUT_BRICK_COLORS[row % len(_BREAKOUT_BRICK_COLORS)])
+    px = state["paddle_x"]
+    d.rounded_rectangle([px - BREAKOUT_PADDLE_W / 2, BREAKOUT_PADDLE_Y,
+                        px + BREAKOUT_PADDLE_W / 2, BREAKOUT_PADDLE_Y + BREAKOUT_PADDLE_H],
+                        radius=3, fill=ACCENT["games"])
+    bx, by = state["ball_x"], state["ball_y"]
+    d.ellipse([bx - BREAKOUT_BALL_R, by - BREAKOUT_BALL_R, bx + BREAKOUT_BALL_R, by + BREAKOUT_BALL_R],
+              fill=FG)
+    if not state["started"]:
+        draw_game_message(d, ["Breakout"], "Drag to aim, tap to launch")
+    elif state["over"]:
+        draw_game_message(d, ["Game Over"], "Tap to restart")
+    return img
+
+
+# ---- 2048 ----
+
+G2048_COLS = 4
+G2048_CELL = 48
+G2048_GAP = 6
+G2048_BOARD_W = G2048_COLS * G2048_CELL + (G2048_COLS - 1) * G2048_GAP
+G2048_X0 = (W - G2048_BOARD_W) / 2
+G2048_Y0 = 44
+G2048_SWIPE_MIN_PX = 18
+_G2048_TILE_COLORS = {
+    0: (30, 36, 50), 2: (60, 68, 88), 4: (70, 84, 110), 8: (220, 150, 90),
+    16: (225, 130, 80), 32: (230, 110, 80), 64: (235, 90, 70), 128: (220, 195, 100),
+    256: (220, 195, 80), 512: (220, 190, 60), 1024: (220, 180, 40), 2048: (240, 200, 20),
+}
+
+
+def new_2048_state():
+    grid = [[0] * G2048_COLS for _ in range(G2048_COLS)]
+    _g2048_spawn(grid)
+    _g2048_spawn(grid)
+    return {"grid": grid, "score": 0, "over": False}
+
+
+def _g2048_spawn(grid):
+    empties = [(r, c) for r in range(G2048_COLS) for c in range(G2048_COLS) if grid[r][c] == 0]
+    if not empties:
+        return
+    r, c = random.choice(empties)
+    grid[r][c] = 4 if random.random() < 0.1 else 2
+
+
+def _g2048_compress_merge(row):
+    vals = [v for v in row if v != 0]
+    gained = 0
+    out = []
+    i = 0
+    while i < len(vals):
+        if i + 1 < len(vals) and vals[i] == vals[i + 1]:
+            merged = vals[i] * 2
+            out.append(merged)
+            gained += merged
+            i += 2
+        else:
+            out.append(vals[i])
+            i += 1
+    out += [0] * (G2048_COLS - len(out))
+    moved = out != row
+    return out, gained, moved
+
+
+def _g2048_move(grid, direction):
+    """direction: 'left'/'right'/'up'/'down'. Returns (new_grid, gained, moved)."""
+    n = G2048_COLS
+    if direction in ("left", "right"):
+        rows = [list(r) for r in grid]
+        if direction == "right":
+            rows = [list(reversed(r)) for r in rows]
+        gained, moved = 0, False
+        new_rows = []
+        for r in rows:
+            nr, g, m = _g2048_compress_merge(r)
+            new_rows.append(nr)
+            gained += g
+            moved = moved or m
+        if direction == "right":
+            new_rows = [list(reversed(r)) for r in new_rows]
+        return new_rows, gained, moved
+    else:
+        cols = [[grid[r][c] for r in range(n)] for c in range(n)]
+        if direction == "down":
+            cols = [list(reversed(c)) for c in cols]
+        gained, moved = 0, False
+        new_cols = []
+        for c in cols:
+            nc, g, m = _g2048_compress_merge(c)
+            new_cols.append(nc)
+            gained += g
+            moved = moved or m
+        if direction == "down":
+            new_cols = [list(reversed(c)) for c in new_cols]
+        new_grid = [[new_cols[c][r] for c in range(n)] for r in range(n)]
+        return new_grid, gained, moved
+
+
+def _g2048_no_moves_left(grid):
+    n = G2048_COLS
+    for r in range(n):
+        for c in range(n):
+            if grid[r][c] == 0:
+                return False
+            if c + 1 < n and grid[r][c] == grid[r][c + 1]:
+                return False
+            if r + 1 < n and grid[r][c] == grid[r + 1][c]:
+                return False
+    return True
+
+
+def g2048_swipe(state, dx, dy, scores):
+    if state["over"]:
+        return
+    if abs(dx) < G2048_SWIPE_MIN_PX and abs(dy) < G2048_SWIPE_MIN_PX:
+        return
+    direction = ("right" if dx > 0 else "left") if abs(dx) > abs(dy) else \
+                ("down" if dy > 0 else "up")
+    new_grid, gained, moved = _g2048_move(state["grid"], direction)
+    if not moved:
+        return
+    state["grid"] = new_grid
+    state["score"] += gained
+    _g2048_spawn(state["grid"])
+    if state["score"] > scores.get("twenty48", 0):
+        scores["twenty48"] = state["score"]
+        save_game_scores(scores)
+    if _g2048_no_moves_left(state["grid"]):
+        state["over"] = True
+
+
+def draw_2048(state, scores):
+    img, d = new_canvas()
+    best = scores.get("twenty48", 0)
+    draw_game_chrome(d, "2048", ACCENT["games"], "%d  (best %d)" % (state["score"], best))
+    for r in range(G2048_COLS):
+        for c in range(G2048_COLS):
+            v = state["grid"][r][c]
+            x0 = G2048_X0 + c * (G2048_CELL + G2048_GAP)
+            y0 = G2048_Y0 + r * (G2048_CELL + G2048_GAP)
+            color = _G2048_TILE_COLORS.get(v, (240, 200, 20))
+            d.rounded_rectangle([x0, y0, x0 + G2048_CELL, y0 + G2048_CELL], radius=6, fill=color)
+            if v:
+                fsize = 18 if v < 100 else (15 if v < 1000 else 12)
+                fg = (60, 50, 30) if v >= 8 else FG
+                centered_text_box(d, x0, y0, x0 + G2048_CELL, y0 + G2048_CELL,
+                                  str(v), font("default_bold", fsize), fg)
+    hint_y = G2048_Y0 + G2048_BOARD_W + 14
+    centered_text(d, W / 2, hint_y, "Swipe to merge tiles", font("default_medium", 12), DIM)
+    if state["over"]:
+        draw_game_message(d, ["Game Over"], "Tap to restart")
+    return img
+
+
+def tick_2048(state, scores, tap, swipe, dx, dy):
+    if state["over"]:
+        if tap:
+            state = new_2048_state()
+        return state
+    if swipe:
+        g2048_swipe(state, dx, dy, scores)
+    return state
+
+
 # ---------- on-screen keyboard ----------
 
 KB_ROW_Y0 = 76
@@ -3164,7 +3781,13 @@ def mode_preview(outdir):
         ("more", panel_more(wifi24, wifi_band, cfg["clock_style"], get_wifi56_conflict_idx(rep))),
         ("repeater", panel_repeater(rep, rep_networks)),
         ("confirm", panel_confirm("Reboot", "Reboot the router now?", ACCENT["clock"], yes_label="Reboot", danger=True)),
+        ("confirm_long", panel_confirm("Stock UI", "Hand the screen back to the GL.iNet UI?", ACCENT["clock"], yes_label="Switch")),
         ("keyboard", panel_keyboard("Wi-Fi Password", "myPass", "letters", True, ACCENT["clock"])),
+        ("games_hub", panel_games(load_game_scores())),
+        ("game_snake", draw_snake(new_snake_state(), load_game_scores())),
+        ("game_flappy", draw_flappy(new_flappy_state(), load_game_scores())),
+        ("game_breakout", draw_breakout(new_breakout_state(), load_game_scores())),
+        ("game_2048", draw_2048(new_2048_state(), load_game_scores())),
     ]
     cols, pad = 5, 10
     rows = (len(screens) + cols - 1) // cols
@@ -3456,6 +4079,8 @@ def mode_live():
             return panel_openclash(oc, traf, conn_type, cell_signal)
         elif name == "weather":
             return panel_weather(cfg, wx, conn_type, cell_signal)
+        elif name == "games":
+            return panel_games(game_scores)
         else:
             net_iface = net_sample[0] if net_sample else None
             return panel_monitor(net_down, net_up, net_iface, cpu_pct, ram_pct, ram_used_gb, ram_total_gb, temp_c, mon_uptime_min, conn_type, cell_signal)
@@ -3486,6 +4111,77 @@ def mode_live():
     last_connect_check = 0.0
     last_spinner_draw = 0.0
     connect_error = None
+
+    # Games hub + the four games' runtime state
+    game_scores = load_game_scores()
+    active_game = None
+    game_state = {}
+    last_game_frame = 0.0
+
+    def handle_game(now):
+        """Owns touch completely while a game is on screen -- same family
+        as handle_repeater_scroll/handle_sms_scroll. A tap on the
+        persistent Exit pill always wins and returns to the hub before
+        anything is handed to the game itself. Continuous games (Flappy,
+        Breakout) redraw on a fixed GAME_TICK_S cadence using the real
+        elapsed time as dt (not a fixed constant) so a delayed loop
+        iteration doesn't make the game visibly slow down or speed up.
+        Snake and 2048 only redraw when their own state actually changes."""
+        nonlocal view, panel_idx, cur_img, last_draw, sub_dirty
+        nonlocal game_state, last_game_frame
+
+        with touch_state.lock:
+            active = touch_state.active
+            dx = touch_state.dx
+            down_x, down_y = touch_state.down_x, touch_state.down_y
+            have_pos = touch_state.have_pos
+            released = touch_state.release_pending
+            release_dx, release_dy = touch_state.release_dx, touch_state.release_dy
+            touch_state.release_pending = False
+
+        tap, tap_x, tap_y = False, 0, 0
+        swipe, sdx, sdy = False, 0, 0
+        if released:
+            is_tap = have_pos and abs(release_dx) <= TAP_JITTER_PX and abs(release_dy) <= TAP_JITTER_PX
+            if is_tap:
+                if hit_game_exit(down_x, down_y):
+                    view = "main"
+                    panel_idx = PANEL_NAMES.index("games")
+                    cur_img = render_main(panel_idx)
+                    write_frame(cur_img)
+                    last_draw = now
+                    return
+                tap, tap_x, tap_y = True, down_x, down_y
+            else:
+                swipe, sdx, sdy = True, release_dx, release_dy
+
+        drag_x = (down_x + dx) if active and have_pos else None
+        key = active_game
+
+        if key == "snake":
+            game_state, changed = tick_snake(game_state, now, game_scores, tap, tap_x, tap_y)
+            if changed or sub_dirty:
+                write_frame(draw_snake(game_state, game_scores))
+                sub_dirty = False
+        elif key == "flappy":
+            if sub_dirty or now - last_game_frame >= GAME_TICK_S:
+                dt = (now - last_game_frame) if last_game_frame else 0.0
+                game_state = tick_flappy(game_state, dt, game_scores, tap)
+                write_frame(draw_flappy(game_state, game_scores))
+                last_game_frame = now
+                sub_dirty = False
+        elif key == "breakout":
+            if sub_dirty or now - last_game_frame >= GAME_TICK_S:
+                dt = (now - last_game_frame) if last_game_frame else 0.0
+                game_state = tick_breakout(game_state, dt, game_scores, tap, drag_x)
+                write_frame(draw_breakout(game_state, game_scores))
+                last_game_frame = now
+                sub_dirty = False
+        elif key == "twenty48":
+            if tap or swipe or sub_dirty:
+                game_state = tick_2048(game_state, game_scores, tap, swipe, sdx, sdy)
+                write_frame(draw_2048(game_state, game_scores))
+                sub_dirty = False
 
     def start_repeater_scan():
         if scan_state["running"]:
@@ -3825,6 +4521,8 @@ def mode_live():
                             zone = hit_main_openclash(down_x, down_y)
                         elif name == "weather":
                             zone = hit_main_weather(down_x, down_y)
+                        elif name == "games":
+                            zone = hit_main_games(down_x, down_y)
 
                         new_view = None
                         if name == "clock" and zone == "city_left":
@@ -3960,6 +4658,11 @@ def mode_live():
                             if day_i < len(wx):
                                 weather_day_idx = day_i
                                 new_view = "weather_detail"
+                        elif name == "games" and zone and zone.startswith("play:"):
+                            active_game = zone.split(":", 1)[1]
+                            game_state = new_game_state(active_game)
+                            last_game_frame = 0.0
+                            new_view = "game"
 
                         neighbor_img = None
                         state = "idle"
@@ -4099,6 +4802,11 @@ def mode_live():
             if view == "sms":
                 handle_sms_scroll(now)
                 time.sleep(0.012)
+                continue
+
+            if view == "game":
+                handle_game(now)
+                time.sleep(0.01)
                 continue
 
             if sub_dirty:
