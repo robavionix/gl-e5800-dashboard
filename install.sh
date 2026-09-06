@@ -39,5 +39,9 @@ When you're ready to switch the physical screen over:
 
 To go back to the stock GL.iNet UI at any time:
   ssh root@$ROUTER /root/dashboard/toggle.sh off
-  (or triple-press the power button on the device itself)
+  (or on the device: More -> Return to stock UI, or hold the power
+   button ~1s and confirm on screen)
+
+Power button: a quick tap sleeps/wakes the screen, a ~1s hold switches
+between this dashboard and the stock UI.
 EOF

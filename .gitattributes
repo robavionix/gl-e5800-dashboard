@@ -1,0 +1,16 @@
+# Everything in this repo is deployed to an OpenWrt router and run there.
+# A Windows checkout with core.autocrlf=true would rewrite these to CRLF,
+# and a shell script whose shebang line ends in \r fails on the device with
+# a bare "bad interpreter" -- so pin the line endings rather than leaving
+# it to whatever each clone happens to be configured with.
+*.sh    text eol=lf
+*.py    text eol=lf
+*.yaml  text eol=lf
+*.md    text eol=lf
+*.txt   text eol=lf
+
+# init.d services and the opkg maintainer scripts have no extension
+init.d/*             text eol=lf
+packages/control/*   text eol=lf
+
+*.png   binary

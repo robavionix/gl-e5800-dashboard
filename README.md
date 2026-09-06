@@ -140,34 +140,51 @@ switch (5G / Off / 6G — this hardware shares one antenna path between the
 connected, whichever band conflicts with its upstream AP's band is grayed
 out and untappable, with a "Matches repeater band" note, instead of
 letting you pick a combination that can't work. Also: an Analog/Digital
-clock-style switch, a **Return to Stock UI** button (switches back
-immediately, no confirm dialog — same effect as the power-button hold
-gesture, just more discoverable/reliable), and confirm-gated **Reboot**
-and **Shutdown** buttons side by side.
+clock-style switch, a **Return to Stock UI** button (confirm-gated,
+same as the power-button hold gesture but more discoverable), and
+confirm-gated **Reboot** and **Shutdown** buttons side by side.
 
 **On-screen keyboard** — built because this screen has no physical or
 pop-up keyboard. Two layers (letters/symbols), persistent caps toggle.
 
 ## Interaction
 
-- **Swipe** left/right between the 6 main panels — real finger-tracking with
-  an eased iOS-style snap/cancel animation, not a hard cut.
+- **Swipe** left/right between the 6 main panels — real finger-tracking,
+  then a velocity-aware snap: a page commits on either enough travel (30%
+  of the width) *or* enough release speed, so a quick flick pages instead
+  of springing back. The settle animation takes its duration from the
+  finger's own speed and eases out, and frames are composited by cropping
+  a pre-built two-panel strip so the drag stays smooth on this SoC.
 - **Tap** into a panel for detail screens (pick a city, pick a currency, set
   a data cap, configure OpenClash's node, etc). Tap the header or swipe
-  right to go back.
-- **Hold the power button ~1-2.5s** to switch between this dashboard and the
-  stock GL.iNet screen at any time (round-trip tested at ~0.3-1.5s). Or use
-  **More → Return to Stock UI** for the same switch without touching the
-  power button at all.
+  right to go back — swiping back lands on the screen that opened the
+  current one, matching where the header tap goes.
+- **Anything slow shows a spinner**, not a frozen screen: user-initiated
+  actions that have to wait on the network or on ubus (force-refresh, pick
+  a weather city, apply a data cap, switch SIM, update an OpenClash
+  subscription) dim the screen you tapped from and spin over it until they
+  finish. Everything periodic — rates, weather, air quality, SMS, SIM
+  state, signal — is fetched on a background thread and never blocks
+  drawing or touch at all.
 - **Quick-tap the power button** to sleep/wake the screen — real backlight
   control, not a fake black frame. Classified by press *duration* on
   release (tap vs. hold), not by counting presses — an earlier tap-counting
   design (single tap = sleep, triple tap = switch UI) turned out to be
   fragile against contact bounce, where one physical tap could register as
-  two raw press/release edges; duration-based detection sidesteps that
-  since each press/release pair is handled the instant it completes.
-  Holding past ~2.5s is left alone entirely and falls through to the
-  hardware's own long-press-to-poweroff path.
+  two raw press/release edges. A tap is only final after ~0.22s of quiet,
+  which is unavoidable: measured bounce bursts run to ~195ms while genuine
+  taps run 68-200ms, so the two ranges overlap and acting on the first
+  release edge would sometimes fire a tap in the middle of a hold.
+- **Hold the power button ~1s** to switch between this dashboard and the
+  stock GL.iNet screen. When the dashboard is up, the hold fires the moment
+  it passes 1s — under your finger, not after you let go — and the
+  dashboard asks for confirmation on screen before handing the display
+  over, so a misread hold can't cost you the whole UI. From the stock UI
+  there is nothing of ours on screen to ask with, so that direction
+  switches directly on release and still ignores holds past ~2.5s, leaving
+  those to the hardware's own long-press-to-poweroff path.
+- **More → Return to Stock UI** does the same switch without the power
+  button at all.
 
 ## Requirements
 

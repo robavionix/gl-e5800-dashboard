@@ -1,7 +1,8 @@
 #!/bin/sh /etc/rc.common
-# Watches the power button for a triple-tap to toggle the custom screen
-# dashboard vs the stock GL.iNet UI. Independent of citydash/gl_screen so
-# the triple-tap works regardless of which one is currently showing.
+# Watches the power button: a quick tap sleeps/wakes the screen, a ~1s
+# hold switches between the custom dashboard and the stock GL.iNet UI.
+# Independent of citydash/gl_screen so the gesture works regardless of
+# which one is currently showing.
 
 START=96
 USE_PROCD=1
