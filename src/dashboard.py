@@ -791,12 +791,22 @@ def get_sim_status(cfg):
         if iccid:
             roaming = bool(ubus_call("cellular.sim", "get_config", {"iccid": iccid}).get("roaming", False))
 
-    prio = ubus_call("cellular.modem", "get_slot_priority_config", {"bus": "cpu"}).get("slot_priority", [1, 2])
     # "sim_choice" reflects the UI's 2-way pick. SIM2 was removed from the
     # picker: it and eSIM both live on slot 2 on this hardware and both just
     # reorder slot priority to prefer slot 2, so there was no way to
     # actually select one over the other -- SIM2 was dead weight in the UI.
-    sim_choice = "sim1" if prio and prio[0] == 1 else "esim"
+    #
+    # This MUST be derived from `slot` (current_sim_slot -- what the modem
+    # is actually running right now), not from get_slot_priority_config's
+    # slot_priority list. Confirmed live on this device: priority is only
+    # a *requested* preference and can read [1, 2] while the modem is
+    # already sitting on slot 2 (its own backhaul logic reordering things,
+    # or a switch still settling) -- the two genuinely diverge, and every
+    # OTHER field on this screen (country, phone, iccid) already reads off
+    # `slot`. Reading the toggle off priority instead showed "SIM1"
+    # selected while the flag, phone number and data cap right next to it
+    # were all slot 2's (eSIM) -- a self-contradicting screen.
+    sim_choice = "sim1" if slot == "1" else "esim"
 
     data_iface = ubus_call("network.interface.modem_cpu", "status")
     data_up = bool(data_iface.get("up"))
@@ -2397,7 +2407,18 @@ CONFIRM_NO_RECT = (30, 236, 210, 272)
 def panel_confirm(title, message, accent, yes_label="Yes", danger=False):
     img, d = new_canvas()
     draw_back_header(d, title, accent)
-    centered_text(d, W / 2, 110, message, font("default_medium", 15), FG)
+    # centered_text draws a single line with no wrapping -- a message
+    # longer than "Reboot the router now?" (the button was written and
+    # tested against) ran off both edges of the 240px screen instead of
+    # wrapping, e.g. "Hand the screen back to the GL.iNet UI?". Wrap it
+    # and stack the lines centered in the space above the Yes/Cancel
+    # buttons instead of assuming everything fits on one line.
+    f_msg = font("default_medium", 15)
+    lines = wrap_text_to_lines(d, message, f_msg, W - 32)
+    line_h = 20
+    y0 = 110 - (len(lines) - 1) * line_h / 2
+    for i, line in enumerate(lines):
+        centered_text(d, W / 2, y0 + i * line_h, line, f_msg, FG)
 
     yx0, yy0, yx1, yy1 = CONFIRM_YES_RECT
     yes_color = (200, 80, 80) if danger else accent
