@@ -4435,7 +4435,19 @@ def mode_live():
     refresher.add("sms", get_sms_messages, 15)
     refresher.add("rep", get_repeater_status, 30)
     refresher.add("wg_peers", get_wireguard_peers, 120)
-    refresher.add("wg_active", get_wireguard_active, 30)
+    # Shorter than the other 20-30s polls here on purpose: this is a
+    # "connected right now?" indicator shown directly on the SIM page,
+    # not tucked behind a tap -- and unlike the actions this dashboard
+    # itself performs (which wait-and-confirm immediately), a connect or
+    # disconnect made from the stock GL.iNet app, or a tunnel that just
+    # dropped on its own, only ever reaches this dashboard through this
+    # poll. Reported live: disconnecting via the stock app and switching
+    # straight to this dashboard's SIM page showed the previous session's
+    # peer as still connected -- which was correct behaviour for a 30s-
+    # stale poll, not a logic bug (get_wireguard_active() itself already
+    # returns the right answer the moment it's called), but 30s reads as
+    # broken for a status a user checks right after acting on it elsewhere.
+    refresher.add("wg_active", get_wireguard_active, 5)
     refresher.add("cell", _get_active_cell_info, 20)
     refresher.start()
 
