@@ -738,16 +738,55 @@ def get_sms_messages():
 
 # ---------- WireGuard ----------
 
-# GL.iNet stores each added WireGuard peer as its own `wireguard.peer_NNNN`
-# UCI section (name, keys, endpoint, allowed_ips -- all of it), separate
-# from the actual `network` interface that carries traffic. Confirmed live
-# by reading /lib/netifd/proto/wgclient.sh and the wireguard hotplug
-# script: bringing a peer online just means creating a `network.wgclient`
-# interface with `proto=wgclient` and `config=<peer section name>` --
-# everything else (keys, endpoint, allowed_ips) is pulled live from that
-# wireguard.<config> section by the proto script itself at ifup time, so
-# nothing secret needs to be duplicated into `network`.
-WG_IFACE = "wgclient"
+# The wgclient/ifup mechanism below this comment used to be the whole
+# story -- reading /lib/netifd/proto/wgclient.sh alone, it looks complete:
+# create a `network.wgclient` interface with proto=wgclient and
+# config=<peer section>, and the proto script pulls keys/endpoint/
+# allowed_ips live from that wireguard.<peer> section at ifup time.
+#
+# That is true for a peer added by hand in LuCI. It is NOT true for any
+# of the 284 peers a real device importing NordVPN's server list ended up
+# with -- confirmed live, by diffing this router's uci config before and
+# after two real connections made from the stock GL.iNet app (Japan, then
+# Switzerland). Those peers carry only host_id/group_id/location; there
+# is no public_key or endpoint anywhere for netifd to work with, and
+# /etc/wireguard/profile/ (where a resolved peer's real config gets
+# written) had never even been created. Tapping one of these in the old
+# implementation wrote network.wgclient.config and called `ifup` exactly
+# as intended -- and the interface sat at pending:true, up:false forever,
+# because there was nothing there for it to actually connect with.
+#
+# The real mechanism (confirmed by watching what changed after the app's
+# own connects, then independently reproduced from a cold SSH session for
+# a peer never touched through the app at all -- up:true within ~8s):
+# GL.iNet's own "AutoVPN" policy-routing feature owns this. There is one
+# `route_policy` section of type "rule" (named "Primary Tunnel" by
+# default) that carries the live VPN route; connecting a specific peer
+# means writing that RULE's group_id/peer_id (the bare numeric id, e.g.
+# "2116" for wireguard.peer_2116) and enabled=1, then restarting the
+# separate `vpn-client` service. That service (its rtp2.sh) is what
+# authenticates against the group's stored token, fetches the real key
+# material, writes network.wgclientN itself, and brings the tunnel up --
+# none of which this dashboard needs to (or safely could) replicate
+# itself. Turning the connection off is the same rule with enabled=0.
+def _wg_policy_rule_id():
+    """The route_policy section that actually carries the VPN connection.
+    Matched by section TYPE ("=rule"), not a hardcoded name or the
+    `@rule[0]` positional index some earlier exploration used directly --
+    both work on this hardware today (there's exactly one), but matching
+    by type is what survives the stock app adding a second rule later
+    without silently starting to write the wrong one. Route_policy also
+    has `=default`/`=rule_process`/`=policy` sections that must NOT match
+    here; only a bare "=rule" line does."""
+    out = run(["uci", "show", "route_policy"])
+    for line in out.splitlines():
+        if line.endswith("=rule"):
+            return line.split("=", 1)[0][len("route_policy."):]
+    return None
+
+
+WG_CONNECT_TIMEOUT = 20.0
+WG_CONNECT_POLL = 0.5
 
 
 def get_wireguard_peers():
@@ -781,23 +820,70 @@ def get_wireguard_peers():
 
 
 def get_wireguard_active():
-    """None if the wgclient interface doesn't exist or isn't up, else the
-    wireguard.peer_NNNN id it's currently configured to carry."""
-    config = uci_get(f"network.{WG_IFACE}.config")
-    if not config:
+    """Which peer (if any) the AutoVPN policy rule is actually carrying
+    right now, as a "peer_NNNN" id matching get_wireguard_peers()'s
+    format -- or None if the rule is disabled, unconfigured, or its
+    interface genuinely isn't up (mid-connect, or the connect failed).
+    Reads route_policy + the rule's own `via` interface, not
+    network.wgclient (see the section comment above for why that was
+    never the right place to look for any of these peers)."""
+    rule = _wg_policy_rule_id()
+    if not rule:
         return None
-    status = ubus_call(f"network.interface.{WG_IFACE}", "status")
-    return config if status.get("up") else None
+    if uci_get(f"route_policy.{rule}.enabled") != "1":
+        return None
+    peer_num = uci_get(f"route_policy.{rule}.peer_id")
+    if not peer_num:
+        return None
+    via = uci_get(f"route_policy.{rule}.via") or "wgclient1"
+    status = ubus_call(f"network.interface.{via}", "status")
+    return f"peer_{peer_num}" if status.get("up") else None
 
 
 def set_wireguard_enabled(peer_id, enabled):
+    """Writes the AutoVPN policy rule and kicks vpn-client -- see the
+    section comment above for how this was confirmed. Only issues the
+    request; connecting for real takes several seconds (auth against the
+    group's stored token, key fetch, handshake -- confirmed live at
+    ~8s for a peer that had never been connected to before), so a caller
+    that needs to know whether it actually worked has to follow up with
+    wait_for_wireguard_state() rather than trusting this call's return
+    alone. Returns False without doing anything if the policy rule or
+    the peer's own group_id can't be found, rather than restarting
+    vpn-client into a state it can't actually resolve."""
+    rule = _wg_policy_rule_id()
+    if not rule:
+        return False
     if enabled:
-        uci_set(f"network.{WG_IFACE}", "interface")
-        uci_set(f"network.{WG_IFACE}.proto", "wgclient")
-        uci_set(f"network.{WG_IFACE}.config", peer_id)
-        subprocess.Popen(["ifup", WG_IFACE])
+        numeric_id = peer_id[len("peer_"):] if peer_id.startswith("peer_") else peer_id
+        group_id = uci_get(f"wireguard.{peer_id}.group_id")
+        if not group_id:
+            return False
+        uci_set(f"route_policy.{rule}.via_type", "wireguard")
+        uci_set(f"route_policy.{rule}.group_id", group_id)
+        uci_set(f"route_policy.{rule}.peer_id", numeric_id)
+        uci_set(f"route_policy.{rule}.enabled", "1")
     else:
-        subprocess.Popen(["ifdown", WG_IFACE])
+        uci_set(f"route_policy.{rule}.enabled", "0")
+    subprocess.Popen(["/etc/init.d/vpn-client", "restart"])
+    return True
+
+
+def wait_for_wireguard_state(want_peer_id, timeout=WG_CONNECT_TIMEOUT):
+    """Blocks -- meant to run on run_with_spinner's worker thread, not the
+    render loop -- polling the real interface state until it matches what
+    was just requested, or timeout. There is no single call that means
+    "done" here, only "check again": connecting is a multi-second,
+    multi-step process (auth, key fetch, handshake) with no synchronous
+    completion signal. want_peer_id=None waits for the connection to
+    actually drop, not just for the uci write to land."""
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        active = get_wireguard_active()
+        if active == want_peer_id:
+            return active
+        time.sleep(WG_CONNECT_POLL)
+    return get_wireguard_active()
 
 
 _DEMO_SMS_MESSAGES = [
@@ -1056,6 +1142,25 @@ def request_wifi_reload():
 def set_wifi_radio_state(iface, enabled):
     uci_set(f"wireless.{iface}.disabled", "0" if enabled else "1")
     request_wifi_reload()
+
+
+def wait_for_wifi_reload(timeout=15.0, poll=0.2):
+    """Blocks until request_wifi_reload's coalesced background worker has
+    actually finished (or timeout) -- not a check that the radio is
+    genuinely broadcasting the new state (no such signal was verified for
+    this hardware), but a real improvement over the previous behaviour:
+    the 2.4GHz/5G/6G toggles used to flip their displayed state the
+    instant the tap landed, while `/sbin/wifi reload` was still running
+    for ~8-10s in the background -- so the UI could show "off" for
+    several seconds while the radio was, in fact, still broadcasting."""
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        with _wifi_reload_lock:
+            running = _wifi_reload_state["running"] or _wifi_reload_state["pending"]
+        if not running:
+            return True
+        time.sleep(poll)
+    return False
 
 
 def get_wifi_band_state():
@@ -1364,6 +1469,24 @@ def set_openclash_enabled(enabled):
         return
     uci_set("openclash.config.enable", "1" if enabled else "0")
     subprocess.Popen(["/etc/init.d/openclash", "start" if enabled else "stop"])
+
+
+def wait_for_openclash_state(want_enabled, timeout=15.0, poll=0.5):
+    """Blocks polling whether the mihomo API is actually responding
+    (get_openclash_traffic_and_node()'s "running" flag -- already used
+    elsewhere in this file as the real signal for "openclash is actually
+    up", as opposed to uci's config.enable which just says what it's
+    SUPPOSED to be) until it matches what was requested, or timeout. The
+    toggle used to flip the instant the tap landed, reading uci's own
+    value straight back -- which is exactly what was just written, so it
+    always "matched" immediately, whether or not the service had
+    actually started or stopped yet."""
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        if get_openclash_traffic_and_node()["running"] == want_enabled:
+            return want_enabled
+        time.sleep(poll)
+    return get_openclash_traffic_and_node()["running"]
 
 
 def set_openclash_mode(mode):
@@ -4702,8 +4825,27 @@ def mode_live():
                     if idx is not None:
                         peer = visible[idx]
                         turning_on = wg_active != peer["id"]
-                        set_wireguard_enabled(peer["id"], turning_on)
-                        wg_active = peer["id"] if turning_on else None
+                        target = peer["id"] if turning_on else None
+                        name = peer["name"]
+                        short_name = name if len(name) <= 22 else name[:21] + "…"
+                        label = ("Connecting to %s…" % short_name) if turning_on else "Disconnecting…"
+                        base_img = panel_wireguard(wg_peers, wg_active, picker_scroll_base, wg_filter_country)
+
+                        # Connecting for real takes several seconds (the
+                        # AutoVPN service has to authenticate against
+                        # NordVPN's stored token, fetch a key, handshake --
+                        # confirmed live at ~8s), so this waits for the
+                        # actual interface state to confirm the target
+                        # before the toggle claims success. wg_active ends
+                        # up as whatever's REALLY connected, not what was
+                        # tapped for -- if it timed out without ever
+                        # reaching the target, the toggle honestly reverts
+                        # rather than sitting on a state that isn't real.
+                        def _apply_wg(peer_id=peer["id"], turning_on=turning_on, target=target):
+                            set_wireguard_enabled(peer_id, turning_on)
+                            return wait_for_wireguard_state(target)
+
+                        wg_active = run_with_spinner(base_img, label, _apply_wg, ACCENT["sim"])
                         sub_dirty = True
             else:
                 picker_scroll_base = min(max_scroll, max(0, picker_scroll_base - final_dy))
@@ -4967,8 +5109,22 @@ def mode_live():
                         elif name == "sim" and zone == "data_cap":
                             new_view = "datacap"
                         elif name == "openclash" and zone == "toggle":
-                            set_openclash_enabled(not oc["enabled"])
-                            oc = get_openclash_status()
+                            # Used to flip instantly by reading uci's own
+                            # config.enable straight back -- which always
+                            # "confirms" whatever was just written to it,
+                            # regardless of whether the openclash service
+                            # itself had actually started or stopped.
+                            # Waits for the mihomo API to actually respond
+                            # (or stop responding) instead.
+                            want = not oc["enabled"]
+
+                            def _apply_oc(want=want):
+                                set_openclash_enabled(want)
+                                wait_for_openclash_state(want)
+                                return get_openclash_status()
+
+                            oc = run_with_spinner(cur_img, "Enabling…" if want else "Disabling…",
+                                                  _apply_oc, ACCENT["openclash"]) or oc
                         elif name == "openclash" and zone == "mode_global" and oc["mode"] != "global":
                             set_openclash_mode("global")
                             oc = get_openclash_status()
@@ -5285,21 +5441,38 @@ def mode_live():
                     last_draw = now
                 elif is_tap and view == "more":
                     action = hit_more(down_x, down_y, get_wifi56_conflict_idx(rep))
+                    # `more` is a sub-screen, not part of the main carousel
+                    # -- cur_img holds whatever the carousel last showed,
+                    # not this screen, so the spinner's dimmed background
+                    # needs its own fresh render (same as the scroll
+                    # pickers' on_select(key, base_img) pattern).
+                    more_img = panel_more(wifi24, wifi_band, cfg["clock_style"], get_wifi56_conflict_idx(rep))
                     if action == "wifi24":
-                        wifi24 = not wifi24
-                        set_wifi_radio_state("wifi2g", wifi24)
+                        # request_wifi_reload's ~8-10s reload used to be
+                        # totally invisible: the toggle flipped the
+                        # instant the tap landed and never looked back,
+                        # so it could show "off" for several seconds while
+                        # the radio was, in fact, still broadcasting.
+                        want = not wifi24
+
+                        def _apply_wifi24(want=want):
+                            set_wifi_radio_state("wifi2g", want)
+                            wait_for_wifi_reload()
+                            return get_wifi_radio_state("wifi2g")
+
+                        result = run_with_spinner(more_img, "Applying…", _apply_wifi24, ACCENT["clock"])
+                        wifi24 = result if result is not None else want
                         sub_dirty = True
-                    elif action == "wifi_5g" and wifi_band != "5g":
-                        wifi_band = "5g"
-                        set_wifi_band_state(wifi_band)
-                        sub_dirty = True
-                    elif action == "wifi_off" and wifi_band != "off":
-                        wifi_band = "off"
-                        set_wifi_band_state(wifi_band)
-                        sub_dirty = True
-                    elif action == "wifi_6g" and wifi_band != "6g":
-                        wifi_band = "6g"
-                        set_wifi_band_state(wifi_band)
+                    elif action in ("wifi_5g", "wifi_off", "wifi_6g") and wifi_band != action[len("wifi_"):]:
+                        want_band = action[len("wifi_"):]
+
+                        def _apply_band(want_band=want_band):
+                            set_wifi_band_state(want_band)
+                            wait_for_wifi_reload()
+                            return get_wifi_band_state()
+
+                        result = run_with_spinner(more_img, "Applying…", _apply_band, ACCENT["clock"])
+                        wifi_band = result if result is not None else want_band
                         sub_dirty = True
                     elif action == "clock_analog" and cfg["clock_style"] != "analog":
                         cfg["clock_style"] = "analog"
