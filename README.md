@@ -164,7 +164,9 @@ screen just sitting there with no feedback while the handshake happens.
 
 **More** (from the Home tile) — a 2.4GHz toggle and a 5GHz/6GHz three-way
 switch (5G / Off / 6G — this hardware shares one antenna path between the
-5G and 6G radios, so only one can be active). If the repeater is
+5G and 6G radios, so only one can be active). Both go through GL.iNet's
+own Wi-Fi RPC, the same call the web UI's switches make, so the web page
+and stock screen always agree with what you set here. If the repeater is
 connected, whichever band conflicts with its upstream AP's band is grayed
 out and untappable, with a "Matches repeater band" note, instead of
 letting you pick a combination that can't work. Also: an Analog/Digital
@@ -385,6 +387,21 @@ There's no settings UI for these — edit directly:
   toggles now confirm first and verify under a spinner instead, with no
   deferred state left to go wrong. Roaming is also parsed tolerantly now
   -- a string `"0"` would have read as *on* under a plain `bool()`.
+- **Text truncation was quadratic, and it made the whole UI sluggish.**
+  `truncate_to_width` dropped one character at a time and re-measured the
+  whole string on each step. The Home tile truncates the latest SMS body,
+  and a long message (hundreds of CJK characters, where each measurement
+  is ~2ms) made one Home render take ~360ms -- every second, since Home
+  shows seconds -- and the Messages list ~4.3s per frame. Profiled live
+  with cProfile: the main thread sat at ~47% of a core doing nothing but
+  that. It's now a binary search, cached per (text, font, width): Home
+  ~39ms, Messages ~35ms, output identical. Also found in the same
+  profile and fixed: the idle loop re-read all refresher values and
+  re-derived the header's connection type on every ~12ms pass (now only
+  when the refresher publishes something new), and `/proc/net/route` was
+  parsed ~36 times a second (now cached for 2s). Idle main-thread CPU:
+  ~47% -> ~12% of one core, most of what's left being the once-a-second
+  redraw.
 - **PIL's `arc()` is aliased, and arcs need a shared centre.** The
   Repeater Wi-Fi icon's three arcs each derived their centre from their
   own bounding box and had ~2px gaps between 3px strokes, so they drifted
@@ -401,19 +418,33 @@ There's no settings UI for these — edit directly:
   keys for up to its full 2h TTL. The cache-freshness check now also
   requires the new fields to be present, so old-format entries refetch
   once and self-heal rather than looking like a real "no data" case.
-- **`/sbin/wifi reload` takes ~8-10s and serializes on its own file lock**
-  (`/data/vendor/wifi/wifilock`) — firing one per toggle tap let calls pile
-  up faster than they drained during testing, leaving a backlog where the
-  UCI config and the actual broadcasting radio state fell out of sync.
-  `request_wifi_reload()` coalesces any reload requested while one is
-  already in flight into a single trailing reload rather than stacking a
-  new subprocess per request. The 2.4GHz toggle and the 5G/Off/6G switch in
-  More both go through this helper — any new control that touches
-  `wireless.*` should too.
-- **5GHz and 6GHz share one antenna path** on this hardware, so the 5G/6G
-  control in More is a three-way switch (5G / Off / 6G), never both at
-  once — and gets a segment grayed out whenever it would conflict with
-  the repeater's own upstream band (`get_wifi56_conflict_idx`).
+- **Wi-Fi on/off must go through GL's own RPC, not raw `uci` + reload.**
+  The More toggles used to write `wireless.<iface>.disabled` and run
+  `/sbin/wifi reload`. The radios did switch, but the stock screen and web
+  page were reported still showing that Wi-Fi as on. They now call the
+  same `wifi.set_config {init, iface_name, enabled[, usemode]}` the web
+  UI's switch sends (read out of `gl-sdk4-ui-wireless`), by loading
+  `/usr/lib/oui-httpd/rpc/wifi` in a plain `lua` process with the few
+  OpenResty pieces it touches stubbed out (`ngx.timer.at` run inline,
+  `ngx.pipe` via `io.popen`, its ubus proxy socket replaced by a direct
+  ubus connection) -- no web login or stored password involved. Traced
+  live, that path runs `/sbin/wifi multi_up|multi_down <radio> <ifname>`
+  for just the one interface (~5-12s) instead of reloading every radio.
+  The raw `uci` + coalesced `request_wifi_reload()` path is kept only as a
+  fallback for firmware without that RPC module (`/sbin/wifi reload`
+  takes ~8-10s and serializes on `/data/vendor/wifi/wifilock`, which is
+  why those reloads are coalesced rather than stacked).
+- **5GHz and 6GHz are one network with a "use mode", not two networks.**
+  They share one antenna path, and GL models them as a single
+  "5 GHz / 6 GHz" network (`band_mutex: 5G+6G`) plus
+  `wireless.autoparam.usemode` (auto / 5g / 6g) choosing which band
+  carries it. With the pair on, `get_config` reports *both* wifi5g and
+  wifi6g enabled while only the use-mode band beacons -- which is why
+  toggling the two sections independently left the web UI describing
+  something else. More's 5G / 6G segments now enable the pair with
+  `usemode` set to that band, and Off disables the pair. A segment is
+  grayed out when it would conflict with the repeater's own upstream band
+  (`get_wifi56_conflict_idx`).
 - **SIM2 vs eSIM**: this hardware shares one physical slot (slot 2) between
   a physical nano-SIM and the eSIM profile. There's no confirmed-safe
   documented `ubus` call to distinguish "activate eSIM profile" from

@@ -379,6 +379,10 @@ class Refresher:
         self._values = {}
         self._jobs = []          # [name, fn, interval, next_at]
         self._wake = threading.Event()
+        # Bumped whenever any value is published, so the render loop can
+        # skip re-reading (and re-deriving from) every value on each ~12ms
+        # pass when nothing has changed -- most jobs run every 5-30s.
+        self.version = 0
 
     def add(self, name, fn, interval, initial=None, run_now=True):
         with self.lock:
@@ -396,6 +400,7 @@ class Refresher:
         get() can't hand back the older periodic result in its place."""
         with self.lock:
             self._values[name] = value
+            self.version += 1
 
     def request(self, name):
         """Ask for one job to run as soon as the worker next wakes."""
@@ -422,6 +427,7 @@ class Refresher:
                     if value is not None:
                         with self.lock:
                             self._values[name] = value
+                            self.version += 1
                 else:
                     sleep_for = min(sleep_for, next_at - now)
             self._wake.wait(max(0.05, sleep_for))
@@ -1252,9 +1258,105 @@ def request_wifi_reload():
     threading.Thread(target=_wifi_reload_worker, daemon=True).start()
 
 
-def set_wifi_radio_state(iface, enabled):
+# GL.iNet's own Wi-Fi RPC -- the exact code path the web UI's per-network
+# on/off switch runs (`wifi.set_config {init, iface_name, enabled}`,
+# confirmed from gl-sdk4-ui-wireless) -- executed outside nginx. The module
+# expects OpenResty, so the few ngx pieces it touches are stubbed: its
+# ubus proxy socket becomes a direct ubus connection, ngx.timer.at (used to
+# defer the apply until after the HTTP reply) runs inline, and ngx.pipe
+# runs commands through io.popen. Traced live, enabling wifi2g this way
+# runs `/sbin/wifi multi_up wifi0 wlan0` (~9s) and disabling it
+# `/sbin/wifi multi_down wifi0 wlan0` (~5s) -- per-interface, where the
+# old raw-uci path reloaded every radio.
+_GL_WIFI_RPC = "/usr/lib/oui-httpd/rpc/wifi"
+_GL_WIFI_LUA = r'''
+local cjson = require "cjson"
+local ubus = require "ubus"
+local noop = function() end
+ngx = setmetatable({
+    log = noop, ERR = 1, WARN = 2, NOTICE = 3, INFO = 4, DEBUG = 5,
+    timer = { at = function(_, fn, ...) fn(false, ...) return true end },
+    sleep = function(s) os.execute("sleep " .. tonumber(s)) end,
+    pipe = { spawn = function(cmd)
+        if type(cmd) == "table" then
+            local q = {}
+            for _, a in ipairs(cmd) do q[#q + 1] = "'" .. tostring(a):gsub("'", "'\\''") .. "'" end
+            cmd = table.concat(q, " ")
+        end
+        local h = io.popen(cmd .. " 2>&1")
+        local out = h:read("*a") or ""
+        h:close()
+        local done = false
+        local proc = {
+            set_timeouts = noop, shutdown = noop,
+            wait = function() return true, "exit", 0 end,
+            stdout_read_all = function() if done then return "" end done = true return out end,
+            stdout_read_line = function() return nil, "closed" end,
+            stderr_read_all = function() return "" end,
+            write = function() return 0 end,
+            kill = function() return true end,
+            pid = function() return 0 end,
+        }
+        return setmetatable(proc, { __index = function() return noop end })
+    end },
+}, { __index = function() return noop end })
+package.loaded["oui.ubus"] = {
+    call = function(object, method, params)
+        local conn = ubus.connect()
+        local res, err = conn:call(object, method, params or {})
+        conn:close()
+        return res, err
+    end,
+    send = function(...) local conn = ubus.connect() conn:send(...) conn:close() end,
+    objects = function() local conn = ubus.connect() local o = conn:objects() conn:close() return o end,
+}
+local m = dofile(arg[1])
+local ok, res = pcall(m[arg[2]], cjson.decode(arg[3]))
+if not ok then io.stderr:write(tostring(res) .. "\n") os.exit(1) end
+io.write("\n", cjson.encode(res or {}), "\n")
+'''
+
+
+def gl_wifi_call(method, params, timeout=90):
+    """(ok, result) from GL's own wifi RPC; ok False if it couldn't run
+    (module missing on another firmware, Lua error) or returned an error."""
+    if not os.path.exists(_GL_WIFI_RPC):
+        return False, None
+    try:
+        out = subprocess.run(["lua", "-", _GL_WIFI_RPC, method, json.dumps(params)],
+                             input=_GL_WIFI_LUA, capture_output=True, text=True, timeout=timeout)
+    except Exception:
+        return False, None
+    if out.returncode != 0:
+        return False, None
+    try:
+        res = json.loads(out.stdout.strip().splitlines()[-1])
+    except Exception:
+        res = {}
+    if isinstance(res, dict) and res.get("err_msg"):
+        return False, res
+    return True, res
+
+
+def set_wifi_iface_enabled(iface, enabled):
+    """Turn one AP network (wifi2g / wifi5g / wifi6g) on or off the way
+    the web UI does. Writing `wireless.<iface>.disabled` + `wifi reload`
+    ourselves (the old approach) did change the radio, but it's not the
+    path GL's own UI and web page are built around -- after using it, the
+    stock screen and web page were reported still showing that Wi-Fi as
+    on. Going through GL's RPC makes a dashboard toggle indistinguishable
+    from one made in the web UI. Falls back to the raw uci path only if
+    the RPC can't be run."""
+    ok, _ = gl_wifi_call("set_config", {"init": True, "iface_name": iface, "enabled": bool(enabled)})
+    if ok:
+        return True
     uci_set(f"wireless.{iface}.disabled", "0" if enabled else "1")
     request_wifi_reload()
+    return False
+
+
+def set_wifi_radio_state(iface, enabled):
+    set_wifi_iface_enabled(iface, enabled)
 
 
 def wait_for_wifi_reload(timeout=15.0, poll=0.2):
@@ -1279,7 +1381,10 @@ def wait_for_wifi_reload(timeout=15.0, poll=0.2):
 def get_wifi_band_state():
     """5G and 6G share a single antenna path on this hardware and can only
     have one active at a time -- returns "5g"/"6g" for whichever AP
-    interface is currently enabled, or "off" if neither is."""
+    interface is currently enabled, or "off" if neither is. Read from uci
+    (instant, safe on the touch thread): with the pair on, GL leaves only
+    the use-mode band's section enabled there, even though its own
+    get_config reports both."""
     if get_wifi_radio_state("wifi5g"):
         return "5g"
     if get_wifi_radio_state("wifi6g"):
@@ -1288,6 +1393,26 @@ def get_wifi_band_state():
 
 
 def set_wifi_band_state(band):
+    """5G / Off / 6G in GL's own terms. The firmware doesn't model 5G and
+    6G as two independent networks: they're one "5 GHz / 6 GHz" network
+    (band_mutex 5G+6G -- one shared antenna path) with a separate *use
+    mode* (auto / 5g / 6g, wireless.autoparam.usemode) choosing which band
+    carries it. The web UI shows that pair as a single card, and turning
+    it on marks both wifi5g and wifi6g enabled in get_config while only
+    the use-mode band actually beacons (confirmed live). So:
+    5G/6G = enable the pair with usemode set to that band; Off = disable
+    it. Toggling wifi5g/wifi6g separately left GL's use mode untouched and
+    the web/stock UI describing a different setup from the one on air."""
+    if band == "off":
+        cur = get_wifi_band_state()
+        if cur == "off":
+            return
+        params = {"init": True, "iface_name": f"wifi{cur}", "enabled": False}
+    else:
+        params = {"init": True, "iface_name": f"wifi{band}", "enabled": True, "usemode": band}
+    ok, _ = gl_wifi_call("set_config", params)
+    if ok:
+        return
     uci_set("wireless.wifi5g.disabled", "0" if band == "5g" else "1")
     uci_set("wireless.wifi6g.disabled", "0" if band == "6g" else "1")
     request_wifi_reload()
@@ -1358,7 +1483,15 @@ def get_wan_iface():
     modem rmnet_data0 as failover) so the active WAN interface isn't fixed --
     br-lan is just the local LAN bridge and stays near-zero unless another
     device is actively using this router's own AP, which made the old
-    hardcoded br-lan reading look permanently decorative."""
+    hardcoded br-lan reading look permanently decorative.
+
+    Cached for 2s: mode_live's idle branch reaches this through
+    get_wan_conn_type on every ~12ms loop pass (911 reads of
+    /proc/net/route in a 25s profile), for a value that changes on a WAN
+    failover, not per frame."""
+    now = time.time()
+    if now - _wan_iface_cache["ts"] < _WAN_IFACE_TTL:
+        return _wan_iface_cache["val"]
     best_iface, best_metric = None, None
     try:
         with open("/proc/net/route") as f:
@@ -1372,7 +1505,13 @@ def get_wan_iface():
                     best_iface, best_metric = parts[0], metric
     except Exception:
         pass
+    _wan_iface_cache["ts"] = now
+    _wan_iface_cache["val"] = best_iface
     return best_iface
+
+
+_wan_iface_cache = {"ts": -1e9, "val": None}
+_WAN_IFACE_TTL = 2.0
 
 
 def has_competing_wan():
@@ -2662,15 +2801,41 @@ def centered_text_box(d, x0, y0, x1, y1, text, f, fill):
     d.text((tx, ty), text, font=f, fill=fill)
 
 
+_truncate_cache = {}
+_TRUNCATE_CACHE_MAX = 512
+
+
 def truncate_to_width(d, text, f, max_w):
-    if d.textbbox((0, 0), text, font=f)[2] <= max_w:
-        return text
-    while len(text) > 1:
-        text = text[:-1]
-        candidate = text + "…"
-        if d.textbbox((0, 0), candidate, font=f)[2] <= max_w:
-            return candidate
-    return text[:1] + "…"
+    """Longest prefix of `text` that fits in max_w with an ellipsis.
+
+    Binary search over the prefix length, cached per (text, font, width).
+    It used to drop one character at a time and re-measure the whole
+    string on each step -- quadratic in the text, and the Home tile passes
+    it the latest SMS body, which can be hundreds of CJK characters.
+    Profiled live: 124ms per call, 34% of a core with the dashboard just
+    sitting on Home (it redraws every second), which is what made swiping
+    feel sluggish. Measuring with the font directly (what textbbox does at
+    the origin) keeps `d` out of the cache key."""
+    key = (text, f, max_w)
+    hit = _truncate_cache.get(key)
+    if hit is not None:
+        return hit
+    width = lambda s: f.getbbox(s)[2]
+    if width(text) <= max_w:
+        out = text
+    else:
+        lo, hi = 1, len(text) - 1            # lo always fits (or is the floor)
+        while lo < hi:
+            mid = (lo + hi + 1) // 2
+            if width(text[:mid] + "…") <= max_w:
+                lo = mid
+            else:
+                hi = mid - 1
+        out = text[:lo] + "…"
+    if len(_truncate_cache) >= _TRUNCATE_CACHE_MAX:
+        _truncate_cache.clear()
+    _truncate_cache[key] = out
+    return out
 
 
 def wrap_text_to_lines(d, text, f, max_w):
@@ -5794,6 +5959,7 @@ def mode_live():
     picker_scroll_base = 0.0
     fx_edit_side = "from"
     last_switch_req_check = 0.0
+    refresher_seen = -1
 
     def sim_toggle_confirm(zone):
         """Every SIM toggle asks first -- each one can cut this router's
@@ -5921,23 +6087,32 @@ def mode_live():
 
         if view == "main":
             if state == "idle":
-                # Pull whatever the background refresher has ready. These
-                # are plain dict reads -- no I/O on this thread.
-                fx = refresher.get("fx", fx)
-                sim = refresher.get("sim", sim)
-                oc = refresher.get("oc", oc)
-                traf = refresher.get("traf", traf)
-                wx = refresher.get("wx", wx)
-                aq = refresher.get("aq", aq)
-                sms_messages = refresher.get("sms", sms_messages)
-                rep = refresher.get("rep", rep)
-                wg_peers = refresher.get("wg_peers", wg_peers)
-                wg_active = refresher.get("wg_active", wg_active)
-                _cell = refresher.get("cell")
-                if _cell is not None:
-                    cell_info = _cell
-                    conn_type = get_wan_conn_type(_cell)
-                    cell_signal = get_cell_signal(_cell)
+                # Pull whatever the background refresher has ready -- only
+                # when it has published something new. This used to re-read
+                # all eleven values and re-derive the header's connection
+                # type/signal on every ~12ms pass (18k refresher reads and
+                # 1.6k derivations in a 25s profile) for data that changes
+                # every 5-30s. As a side effect, a value this loop set
+                # itself (e.g. OpenClash mode right after a tap) is no
+                # longer overwritten by the refresher's older copy on the
+                # very next pass.
+                if refresher.version != refresher_seen:
+                    refresher_seen = refresher.version
+                    fx = refresher.get("fx", fx)
+                    sim = refresher.get("sim", sim)
+                    oc = refresher.get("oc", oc)
+                    traf = refresher.get("traf", traf)
+                    wx = refresher.get("wx", wx)
+                    aq = refresher.get("aq", aq)
+                    sms_messages = refresher.get("sms", sms_messages)
+                    rep = refresher.get("rep", rep)
+                    wg_peers = refresher.get("wg_peers", wg_peers)
+                    wg_active = refresher.get("wg_active", wg_active)
+                    _cell = refresher.get("cell")
+                    if _cell is not None:
+                        cell_info = _cell
+                        conn_type = get_wan_conn_type(_cell)
+                        cell_signal = get_cell_signal(_cell)
                 if now - last_mon_check > 2:
                     net_sample, net_down, net_up = sample_bandwidth(net_sample)
                     cpu_sample, cpu_pct = sample_cpu(cpu_sample)
