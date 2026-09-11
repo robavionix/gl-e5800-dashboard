@@ -9,8 +9,17 @@ LuCI's **System → Software → Upload Package...** with no SSH at all.
 ```
 
 No OpenWrt SDK or cross-toolchain needed -- everything shipped is pure
-Python/shell, nothing to compile. Needs a plain POSIX `tar` (tested with
-both macOS's `bsdtar` and Linux's GNU tar).
+Python/shell, nothing to compile. Works with macOS's `bsdtar` and with GNU
+tar (Linux, or Git Bash on Windows).
+
+**bsdtar and GNU tar spell the flags differently.** The script originally
+passed bsdtar's `--format=gnutar --uid=0 --gid=0 --uname=root
+--gname=root` unconditionally, which GNU tar rejects outright
+(`gnutar: Invalid archive format` -- GNU calls that format `gnu`, and has
+no `--uid`/`--uname`, only `--owner`/`--group`). `build.sh` now detects
+which tar it has and uses `--format=gnu --owner=root:0 --group=root:0`
+for GNU tar. The resulting archive is the same either way: same member
+order, root-owned, 755 scripts / 644 `control`, LF line endings.
 
 `Architecture: all` is used deliberately (see `control/control`) since
 there's no compiled code -- this isn't tied to `aarch64_cortex-a53`
