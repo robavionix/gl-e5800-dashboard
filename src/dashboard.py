@@ -1016,12 +1016,27 @@ def get_sim_status(cfg):
     # whether cell_info currently reports any serving carrier at all (see
     # _get_active_cell_info).
     attached = is_cell_attached()
+    # What the Cellular toggle shows: GL's own airplane-mode flag, the one
+    # the stock screen's switch reads -- not inferred from registration
+    # (no signal is not the same thing as switched off).
+    airplane = get_airplane_mode()
 
     return {
         "slot": slot, "country": country, "phone": phone, "traffic_mb": traffic_mb,
         "cap_mb": cfg.get("data_cap_mb"), "sim_choice": sim_choice, "data_up": data_up,
         "iccid": iccid, "attached": attached, "roaming": roaming, "carrier": carrier,
+        "airplane": airplane,
     }
+
+
+def get_airplane_mode():
+    """GL's airplane-mode flag via its own `system.get_airplane_mode` RPC
+    (what the stock screen's Airplane Mode switch uses; backed by
+    glconfig.general.airplane_mode). Falls back to reading that uci key."""
+    ok, res = gl_lua_rpc(_GL_SYSTEM_RPC, "get_airplane_mode", {}, timeout=15)
+    if ok and isinstance(res, dict) and "enable" in res:
+        return _as_bool(res["enable"])
+    return _as_bool(uci_get("glconfig.general.airplane_mode", "0"))
 
 
 def is_cell_attached():
@@ -1054,32 +1069,60 @@ def set_sim_choice(choice):
          json.dumps({"bus": "cpu", "slot_priority": [target_slot, other]})])
 
 
+def _current_slot():
+    try:
+        return int(ubus_call("cellular.modem", "status", {"bus": "cpu"}).get("current_sim_slot", 1))
+    except (TypeError, ValueError):
+        return 1
+
+
 def set_cellular_data_enabled(enabled):
-    subprocess.Popen(["ifup" if enabled else "ifdown", "modem_cpu"])
+    """The web UI's own cellular "dial" switch (handleDialEnableChange in
+    gl-sdk4-ui-internet): modem.set_connect / modem.disconnect {bus, slot}
+    through GL's RPC, so cellular_manager knows it was switched off on
+    purpose. A bare `ifdown modem_cpu` (the old approach) only told netifd,
+    behind the back of the daemon that owns dialing. Falls back to
+    ifup/ifdown if the RPC can't be run."""
+    ok, _ = gl_c_rpc("modem", "set_connect" if enabled else "disconnect",
+                     {"bus": "cpu", "slot": _current_slot()})
+    if not ok:
+        subprocess.Popen(["ifup" if enabled else "ifdown", "modem_cpu"])
 
 
 def set_network_attach_enabled(enabled):
-    """Toggle the modem's network registration (SMS/calls) independent of
-    the cellular DATA session (data_up / set_cellular_data_enabled) --
-    airplane-mode style: enabled=True registers with the network,
-    enabled=False fully detaches (no signal, no SMS/calls). This is the
-    "attach without necessarily using cellular for data" mode -- can stay
-    registered while a WiFi repeater/ethernet handles actual internet
-    traffic. NOTE: cellular.modem has no paired getter for this, so
-    get_sim_status infers current "attached" state from whether cell_info
-    is populated at all, rather than tracking a separate flag."""
-    run(["ubus", "call", "cellular.modem", "set_airplane_mode",
-         json.dumps({"enable": not enabled})])
+    """The Cellular toggle -- airplane mode, inverted: enabled=False puts
+    the modem in airplane mode (no signal, SMS, calls or data at all).
+    Goes through GL's own `system.set_airplane_mode` RPC, the call behind
+    the stock screen's Airplane Mode switch: besides the
+    `cellular.modem set_airplane_mode` ubus call (all the old code did),
+    it records the state in glconfig.general.airplane_mode, which is what
+    the stock screen and web UI read -- without that they kept showing
+    cellular as on. Falls back to the bare ubus call."""
+    ok, _ = gl_lua_rpc(_GL_SYSTEM_RPC, "set_airplane_mode", {"enable": not enabled}, timeout=30)
+    if not ok:
+        run(["ubus", "call", "cellular.modem", "set_airplane_mode",
+             json.dumps({"enable": not enabled})])
 
 
 def set_roaming_enabled(iccid, enabled):
-    """Data roaming permission for a given SIM, via cellular.sim's
-    get_config/set_config -- a per-iccid config table (auth/apn/roaming/
-    etc), not a standalone flag, so this reads the current table and
-    writes it back with only 'roaming' changed rather than clobbering the
-    rest (apn, pincode, auth...) with a partial object."""
+    """Data roaming for the active SIM the way the web UI's cellular
+    settings apply it (gl-sdk4-ui-internet handleApply): read the SIM's
+    whole config with modem.get_sim_config, change only `roaming`, write
+    it back with modem.set_sim_config, then modem.set_connect so the
+    session picks it up -- but only if data is currently on, since
+    set_connect would otherwise switch data on as a side effect. Falls
+    back to cellular.sim get_config/set_config over ubus."""
     if not iccid:
         return
+    slot = _current_slot()
+    ok, cur = gl_c_rpc("modem", "get_sim_config", {"bus": "cpu", "slot": slot, "iccid": iccid})
+    if ok and isinstance(cur, dict) and cur:
+        cur = dict(cur, roaming=bool(enabled))
+        ok, _ = gl_c_rpc("modem", "set_sim_config", dict(cur, bus="cpu", slot=slot, iccid=iccid))
+        if ok:
+            if is_cell_data_up():
+                gl_c_rpc("modem", "set_connect", {"bus": "cpu", "slot": slot})
+            return
     cur = ubus_call("cellular.sim", "get_config", {"iccid": iccid})
     if not cur:
         return
@@ -1102,6 +1145,9 @@ SIM_ROAM_TIMEOUT = 8.0
 # this long: this router's multi-WAN manager can silently undo a manual
 # cellular change a moment after it lands (see has_competing_wan).
 SIM_DATA_SETTLE = 2.0
+# How long a roaming change's re-dial may take to actually drop the data
+# session before we start waiting for it to come back.
+SIM_REDIAL_START = 6.0
 
 
 def _wait_until(check, timeout, poll=SIM_VERIFY_POLL):
@@ -1317,13 +1363,15 @@ io.write("\n", cjson.encode(res or {}), "\n")
 '''
 
 
-def gl_wifi_call(method, params, timeout=90):
-    """(ok, result) from GL's own wifi RPC; ok False if it couldn't run
-    (module missing on another firmware, Lua error) or returned an error."""
-    if not os.path.exists(_GL_WIFI_RPC):
+def gl_lua_rpc(module_path, method, params, timeout=90):
+    """(ok, result) from one of GL's Lua RPC modules (the web UI's own
+    backend: /usr/lib/oui-httpd/rpc/<name>), run outside nginx with the
+    stubs in _GL_WIFI_LUA. ok is False if it couldn't run (module missing
+    on another firmware, Lua error) or returned an err_msg."""
+    if not os.path.exists(module_path):
         return False, None
     try:
-        out = subprocess.run(["lua", "-", _GL_WIFI_RPC, method, json.dumps(params)],
+        out = subprocess.run(["lua", "-", module_path, method, json.dumps(params)],
                              input=_GL_WIFI_LUA, capture_output=True, text=True, timeout=timeout)
     except Exception:
         return False, None
@@ -1336,6 +1384,40 @@ def gl_wifi_call(method, params, timeout=90):
     if isinstance(res, dict) and res.get("err_msg"):
         return False, res
     return True, res
+
+
+def gl_wifi_call(method, params, timeout=90):
+    return gl_lua_rpc(_GL_WIFI_RPC, method, params, timeout)
+
+
+_GL_SYSTEM_RPC = "/usr/lib/oui-httpd/rpc/system"
+_GLC = "/www/cgi-bin/glc"
+
+
+def gl_c_rpc(obj, method, args, timeout=60):
+    """(ok, result) from one of GL's C RPC modules (rpc/<obj>.so, e.g.
+    modem) -- run the way nginx runs them: POST {object, method, args} to
+    the /www/cgi-bin/glc CGI. Invoked directly as a CGI process here, so
+    no web login is involved. glc needs REQUEST_URI=/rpc (it segfaults
+    without it) and answers "Content-type: ...\\n\\n<code> <json>", code 0
+    meaning success."""
+    if not (os.path.exists(_GLC) and os.path.exists(f"/usr/lib/oui-httpd/rpc/{obj}.so")):
+        return False, None
+    body = json.dumps({"object": obj, "method": method, "args": args})
+    env = dict(os.environ, REQUEST_METHOD="POST", REQUEST_URI="/rpc",
+               CONTENT_TYPE="application/json", CONTENT_LENGTH=str(len(body.encode())))
+    try:
+        out = subprocess.run([_GLC], input=body, env=env, capture_output=True, text=True, timeout=timeout)
+    except Exception:
+        return False, None
+    payload = out.stdout.split("\n\n", 1)[-1].strip()
+    code, _, rest = payload.partition(" ")
+    if code != "0":
+        return False, rest or None
+    try:
+        return True, json.loads(rest) if rest.strip() else {}
+    except Exception:
+        return True, {}
 
 
 def set_wifi_iface_enabled(iface, enabled):
@@ -1462,6 +1544,57 @@ def shutdown_router():
     subprocess.Popen(["/sbin/poweroff"])
 
 
+# Longest the "Shutting down…/Restarting…" screen keeps spinning while
+# waiting for the system to actually start taking services down (which is
+# when procd's TERM reaches this process). If that never happens the
+# command didn't take, and the UI comes back instead of spinning forever.
+POWER_SCREEN_MAX_S = 180.0
+
+
+def panel_power(kind, phase_deg=0.0, elapsed=None, final=False):
+    """Full-screen feedback for Reboot / Shutdown. Going straight back to
+    the More page after /sbin/reboot or /sbin/poweroff (the old
+    behaviour) left the screen sitting there, untouched, for the ~10-30s
+    the system takes to stop -- it looked frozen. `final` is the last
+    frame, drawn once this process is being stopped: it stays on the
+    panel through the rest of the shutdown."""
+    img, d = new_canvas()
+    reboot = kind == "reboot"
+    accent = ACCENT["clock"] if reboot else (220, 95, 95)
+    cx, cy = W // 2, 132
+    if final:
+        # static ring, no motion: nothing will redraw it again
+        d.ellipse([cx - 28, cy - 28, cx + 28, cy + 28], outline=_mix(BG, accent, 0.5), width=4)
+        if reboot:
+            _draw_arrow_circle(d, cx, cy, accent)
+        else:
+            _draw_power_glyph(d, cx, cy, accent)
+        title = "Restarting…" if reboot else "Powering off"
+        sub = "Back in about a minute" if reboot else "The screen will go dark"
+    else:
+        draw_ring_spinner(d, cx, cy, 28, phase_deg, accent, width=4)
+        title = "Restarting…" if reboot else "Shutting down…"
+        sub = "Please wait" + (f" · {int(elapsed)}s" if elapsed is not None else "")
+    centered_text(d, W / 2, cy + 48, title, font("default_bold", 20), FG)
+    centered_text(d, W / 2, cy + 76, sub, font("default_medium", 13), DIM)
+    if not reboot:
+        centered_text(d, W / 2, cy + 96, "Don't unplug until it's off", font("default_medium", 11), DIM)
+    return img
+
+
+def _draw_power_glyph(d, cx, cy, color):
+    r = 12
+    d.arc([cx - r, cy - r, cx + r, cy + r], start=300, end=240, fill=color, width=3)
+    d.line([cx, cy - r - 3, cx, cy - 2], fill=color, width=3)
+
+
+def _draw_arrow_circle(d, cx, cy, color):
+    r = 12
+    d.arc([cx - r, cy - r, cx + r, cy + r], start=320, end=260, fill=color, width=3)
+    tip = (cx + r * math.cos(math.radians(320)), cy + r * math.sin(math.radians(320)))
+    d.polygon([(tip[0] + 5, tip[1] - 2), (tip[0] - 4, tip[1] - 5), (tip[0] - 1, tip[1] + 5)], fill=color)
+
+
 def switch_to_stock_ui():
     # Non-blocking AND detached: toggle.sh off stops citydash (this very
     # process), so it has to outlive us. Popen alone leaves it in our
@@ -1554,9 +1687,14 @@ def _parse_cell_signal(raw):
     carriers = []
     for s in sorted(raw.get("signal") or [], key=lambda s: _cell_int(s.get("ca")) or 0):
         band = _cell_int(s.get("band"))
-        if band is None:
-            continue
         ntype = _cell_int(s.get("network_type"))
+        # In airplane mode (or with no service) cell_info isn't empty: it
+        # keeps one placeholder entry with band 0, network_type 0 and
+        # rsrp -32768 -- confirmed live. Counting that as a carrier ("B0")
+        # made the modem look registered, kept the header's signal bars
+        # up and made airplane mode look like it never took.
+        if not band or not ntype:
+            continue
         nr = ntype in _CELL_NR_TYPES
         try:
             mhz = float(s.get("bandwidth"))
@@ -1996,11 +2134,31 @@ def openclash_installed():
     return os.path.exists("/etc/init.d/openclash")
 
 
+def openclash_status_empty(installed=False):
+    return {"installed": installed, "enabled": False, "running": False, "busy": False, "mode": "rule"}
+
+
 def get_openclash_status():
-    installed = openclash_installed()
-    enabled = installed and uci_get("openclash.config.enable") == "1"
-    mode = (uci_get("openclash.config.proxy_mode") if installed else None) or "rule"
-    return {"installed": installed, "enabled": enabled, "mode": mode}
+    """`enabled` is only what uci says OpenClash *should* be doing; the
+    toggle shows `running` -- the clash core process actually existing,
+    the same test LuCI's own status uses (`pidof clash`). `busy` is the
+    init script still mid-start/stop (LuCI's is_start()). Showing uci's
+    flag was why the toggle could read "on" with nothing running (a start
+    that failed) or disagree with the node/traffic rows below it."""
+    if not openclash_installed():
+        return openclash_status_empty()
+    return {
+        "installed": True,
+        "enabled": uci_get("openclash.config.enable") == "1",
+        "running": run_checked(["pidof", "clash"])[0],
+        "busy": run_checked(["pgrep", "-f", "/etc/init.d/openclash"])[0],
+        "mode": uci_get("openclash.config.proxy_mode") or "rule",
+    }
+
+
+def openclash_api_ok():
+    base, headers = _mihomo_api()
+    return run_checked(["curl", "-s", "-o", "/dev/null", "-m", "2"] + headers + [f"{base}/version"])[0]
 
 
 def set_openclash_enabled(enabled):
@@ -2010,22 +2168,54 @@ def set_openclash_enabled(enabled):
     subprocess.Popen(["/etc/init.d/openclash", "start" if enabled else "stop"])
 
 
-def wait_for_openclash_state(want_enabled, timeout=15.0, poll=0.5):
-    """Blocks polling whether the mihomo API is actually responding
-    (get_openclash_traffic_and_node()'s "running" flag -- already used
-    elsewhere in this file as the real signal for "openclash is actually
-    up", as opposed to uci's config.enable which just says what it's
-    SUPPOSED to be) until it matches what was requested, or timeout. The
-    toggle used to flip the instant the tap landed, reading uci's own
-    value straight back -- which is exactly what was just written, so it
-    always "matched" immediately, whether or not the service had
-    actually started or stopped yet."""
+OPENCLASH_START_TIMEOUT = 120.0
+OPENCLASH_STOP_TIMEOUT = 60.0
+
+
+def openclash_fully(want_on):
+    """True once OpenClash has *finished* getting to the wanted state.
+    Timed live: a start has the core up at ~5s and the API answering at
+    ~6s, but the init script keeps going (firewall/DNS setup) until ~11s;
+    a stop takes ~6s. So "on" = core up + API answering + init done, and
+    "off" = core gone + init done -- not just the first sign of life."""
+    st = get_openclash_status()
+    if st["busy"]:
+        return False
+    if want_on:
+        return st["running"] and openclash_api_ok()
+    return not st["running"]
+
+
+def wait_for_openclash_state(want_on, timeout=None, poll=1.0):
+    """Blocks (run it under run_with_spinner) until openclash_fully(want_on)
+    or timeout; returns whether it got there. Generous timeouts on
+    purpose: a start can also fetch subscriptions and rebuild rules, and
+    reporting failure early while it's still coming up is exactly the
+    "shows off while actually on" confusion this replaced."""
+    timeout = timeout or (OPENCLASH_START_TIMEOUT if want_on else OPENCLASH_STOP_TIMEOUT)
     deadline = time.time() + timeout
-    while time.time() < deadline:
-        if get_openclash_traffic_and_node()["running"] == want_enabled:
-            return want_enabled
+    while time.time() < deadline and not _stop:
+        if openclash_fully(want_on):
+            return True
         time.sleep(poll)
-    return get_openclash_traffic_and_node()["running"]
+    return openclash_fully(want_on)
+
+
+def flush_openclash_dns():
+    """What LuCI's "Flush DNS Cache" button does (action_flush_dns_cache
+    in luci-app-openclash): POST the core's /cache/fakeip/flush and
+    /cache/dns/flush. Both answer 204 No Content on success. Returns
+    None on success, else a short reason."""
+    if not run_checked(["pidof", "clash"])[0]:
+        return "OpenClash isn't running"
+    base, headers = _mihomo_api()
+    for path in ("/cache/fakeip/flush", "/cache/dns/flush"):
+        ok, code = run_checked(["curl", "-s", "-o", "/dev/null", "-w", "%{http_code}", "-m", "3",
+                                "--retry", "2", "-X", "POST", "-H", "Content-Type: application/json"]
+                               + headers + [base + path])
+        if not ok or not code.startswith("2"):
+            return f"Flush failed ({path.split('/')[2]}: {code or 'no answer'})"
+    return None
 
 
 def set_openclash_mode(mode):
@@ -2634,11 +2824,14 @@ def new_canvas():
 
 
 def draw_page_dots(d, active_idx, count=7):
-    total_w = count * 16
-    x0 = (W - total_w) // 2
+    """Dot centres are 16px apart, so the row spans (count - 1) * 16
+    between the first and last centre -- centring on that, not on
+    count * 16, which put the whole row 8px left of the screen's middle."""
+    step = 16
+    x0 = W / 2 - (count - 1) * step / 2
     y = H - 18
     for i in range(count):
-        x = x0 + i * 16
+        x = x0 + i * step
         r = 4 if i == active_idx else 3
         color = FG if i == active_idx else DIM
         d.ellipse([x - r, y - r, x + r, y + r], fill=color)
@@ -2666,50 +2859,87 @@ def draw_signal_bars(d, x0, y_base, bars, color, dim_color, bar_w=3, gap=2, max_
         d.rectangle([bx0, y_base - bh, bx0 + bar_w, y_base], fill=fill)
 
 
-def _draw_battery_icon(d, x1, y0, pct, color, low_color):
-    """Phone-style battery, 20x10 body + nub, right edge at x1, filled
-    in proportion to pct."""
-    bx0, bx1, by1 = x1 - 22, x1 - 2, y0 + 10
-    d.rectangle([bx0, y0, bx1, by1], outline=color, width=1)
-    d.rectangle([bx1 + 1, y0 + 3, x1, by1 - 3], fill=color)
-    inner_w = (bx1 - 2) - (bx0 + 2)
-    fill_w = round(inner_w * pct / 100)
-    if fill_w > 0:
-        d.rectangle([bx0 + 2, y0 + 2, bx0 + 2 + fill_w, by1 - 2],
-                    fill=low_color if pct <= 15 else color)
+BATTERY_BODY_W, BATTERY_BODY_H, BATTERY_NUB_W = 27, 15, 3
+BATTERY_ICON_W = BATTERY_BODY_W + BATTERY_NUB_W
 
 
-def _draw_bolt(d, x0, y0, color):
-    d.polygon([(x0 + 3.5, y0), (x0, y0 + 6.2), (x0 + 2.8, y0 + 6.2), (x0 + 2, y0 + 11),
-               (x0 + 6, y0 + 4.6), (x0 + 3.2, y0 + 4.6)], fill=color)
+def _draw_battery_icon(d, x1, cy, pct, ink, paper, low_color):
+    """Phone-style battery with the percentage written *inside* it, right
+    edge at x1, vertically centred on cy. `ink` is the header's text
+    colour, `paper` the header's own colour.
+
+    The number is two-tone: where it sits over the filled part it's drawn
+    in `paper` (or white over the red low-battery fill), where it sits
+    over the empty part in `ink` -- so it stays readable at any level
+    without a separate "97%" label next to the icon, which is what used
+    to get squeezed out on pages with long titles."""
+    bx1 = x1 - BATTERY_NUB_W
+    bx0 = bx1 - BATTERY_BODY_W
+    by0 = int(cy - BATTERY_BODY_H / 2)
+    by1 = by0 + BATTERY_BODY_H
+    d.rounded_rectangle([bx0, by0, bx1, by1], radius=3, outline=ink, width=1)
+    d.rounded_rectangle([bx1 + 1, cy - 3, x1, cy + 3], radius=1, fill=ink)
+    ix0, iy0, ix1, iy1 = bx0 + 2, by0 + 2, bx1 - 2, by1 - 2
+    low = pct <= 15
+    fill_x = ix0 + round((ix1 - ix0) * pct / 100)
+    if fill_x > ix0:
+        d.rectangle([ix0, iy0, fill_x, iy1], fill=low_color if low else ink)
+
+    txt = str(pct)
+    f = font("default_bold", 11 if pct < 100 else 10)
+    w, h = bx1 - bx0 + 1, by1 - by0 + 1
+    mask = Image.new("L", (w, h), 0)
+    md = ImageDraw.Draw(mask)
+    tb = md.textbbox((0, 0), txt, font=f)
+    md.text(((w - (tb[2] - tb[0])) / 2 - tb[0], (h - (tb[3] - tb[1])) / 2 - tb[1]),
+            txt, font=f, fill=255)
+    split = fill_x - bx0 + 1                     # mask x where the fill ends
+    over_fill, over_empty = mask.copy(), mask
+    ImageDraw.Draw(over_fill).rectangle([split, 0, w, h], fill=0)
+    ImageDraw.Draw(over_empty).rectangle([0, 0, split - 1, h], fill=0)
+    d._image.paste((255, 255, 255) if low else paper, (bx0, by0), over_fill)
+    d._image.paste(ink, (bx0, by0), over_empty)
+
+
+def _draw_bolt(d, x0, cy, color):
+    """Charging bolt, 7x13, vertically centred on cy."""
+    y0 = cy - 6.5
+    d.polygon([(x0 + 4.2, y0), (x0, y0 + 7.3), (x0 + 3.2, y0 + 7.3), (x0 + 2.4, y0 + 13),
+               (x0 + 7, y0 + 5.4), (x0 + 3.8, y0 + 5.4)], fill=color)
+
+
+HEADER_H = 34
+HEADER_MID = HEADER_H // 2
+HEADER_BAR_W, HEADER_BAR_GAP, HEADER_BAR_H = 4, 2, 14
+
+
+def _header_text(d, x_right, text, f, color):
+    """Right-aligned at x_right, vertically centred in the header."""
+    tb = d.textbbox((0, 0), text, font=f)
+    d.text((x_right - (tb[2] - tb[0]) - tb[0], HEADER_MID - (tb[3] + tb[1]) / 2), text, font=f, fill=color)
 
 
 def draw_header(d, label, accent, conn_type=None, cell_signal=None):
-    d.rectangle([0, 0, W, 34], fill=accent)
+    d.rectangle([0, 0, W, HEADER_H], fill=accent)
     f_title = font("default_bold", 18)
     d.text((14, 8), label, font=f_title, fill=BG)
 
-    # Status items, right to left: battery | WAN type | cellular tech +
-    # bars. Measured up front against the room the title leaves, and the
-    # least important dropped first until they fit -- the % text, then
-    # the tech label beside the bars, then the bars. "OPENCLASH" +
-    # "Repeater" + "5G" + bars + battery genuinely does not fit in 240px.
-    f_pct = font("default_medium", 12)
-    f_conn = font("default_medium", 12)
-    f_rat = font("default_medium", 11)
-    bars_w = 4 * 3 + 3 * 2
+    # Status items, right to left: battery (with its % inside) | WAN type
+    # | cellular tech + bars -- all centred on the header's midline, in a
+    # fixed-height 34px bar. Measured up front against the room the title
+    # leaves; if they don't fit, the tech label beside the bars goes
+    # first, then the bars. The battery and the WAN type always stay.
+    f_conn = font("default_medium", 13)
+    f_rat = font("default_medium", 12)
+    bars_w = 4 * HEADER_BAR_W + 3 * HEADER_BAR_GAP
     battery = get_battery()
-    pct_txt = f"{battery[0]}%" if battery else None
     rat = cell_signal[1] if cell_signal and cell_signal[1] != conn_type else None
-    show = {"pct": bool(battery), "rat": bool(rat), "bars": bool(cell_signal)}
+    show = {"rat": bool(rat), "bars": bool(cell_signal)}
 
     def needed():
         parts = []                       # (width, gap to the next item left)
         if battery:
-            w = 22 + (9 if battery[1] else 0)
-            if show["pct"]:
-                w += 3 + d.textlength(pct_txt, font=f_pct)
-            parts.append((w, 9))
+            parts.append((BATTERY_ICON_W + (10 if battery[1] else 0), 9))
         if conn_type:
             parts.append((d.textlength(conn_type, font=f_conn), 8))
         if show["rat"]:
@@ -2718,38 +2948,35 @@ def draw_header(d, label, accent, conn_type=None, cell_signal=None):
             parts.append((bars_w, 0))
         return sum(w + g for w, g in parts) - (parts[-1][1] if parts else 0)
 
-    room = (W - 14) - (14 + d.textlength(label, font=f_title) + 8)
-    for item in ("pct", "rat", "bars"):
+    room = (W - 12) - (14 + d.textlength(label, font=f_title) + 12)
+    for item in ("rat", "bars"):
         if needed() <= room:
             break
         show[item] = False
+    if needed() > room:
+        f_conn = font("default_medium", 11)    # e.g. "OPENCLASH" + "Repeater"
 
-    right_x = W - 14
+    right_x = W - 12
     if battery:
         pct, plugged = battery
-        _draw_battery_icon(d, right_x, 12, pct, BG, (190, 30, 30))
-        right_x -= 22 + 3
+        _draw_battery_icon(d, right_x, HEADER_MID, pct, BG, accent, (190, 30, 30))
+        right_x -= BATTERY_ICON_W + 3
         if plugged:
-            _draw_bolt(d, right_x - 6, 11.5, BG)
-            right_x -= 9
-        if show["pct"]:
-            tw = d.textlength(pct_txt, font=f_pct)
-            d.text((right_x - tw, 10), pct_txt, font=f_pct, fill=BG)
-            right_x -= tw + 4
+            _draw_bolt(d, right_x - 7, HEADER_MID, BG)
+            right_x -= 10
         right_x -= 6
 
     if conn_type:
-        tw = d.textlength(conn_type, font=f_conn)
-        d.text((right_x - tw, 10), conn_type, font=f_conn, fill=BG)
-        right_x -= tw + 8
+        _header_text(d, right_x, conn_type, f_conn, BG)
+        right_x -= d.textlength(conn_type, font=f_conn) + 8
 
     if show["rat"]:
-        tw2 = d.textlength(rat, font=f_rat)
-        d.text((right_x - tw2, 11), rat, font=f_rat, fill=BG)
-        right_x -= tw2 + 4
+        _header_text(d, right_x, rat, f_rat, BG)
+        right_x -= d.textlength(rat, font=f_rat) + 4
     if show["bars"]:
         dim = _mix(BG, accent, 0.55)
-        draw_signal_bars(d, right_x - bars_w, 23, cell_signal[0], BG, dim)
+        draw_signal_bars(d, right_x - bars_w, HEADER_MID + HEADER_BAR_H / 2, cell_signal[0], BG, dim,
+                         bar_w=HEADER_BAR_W, gap=HEADER_BAR_GAP, max_h=HEADER_BAR_H)
 
 
 def draw_back_header(d, label, accent):
@@ -2942,7 +3169,8 @@ SIM_TOGGLE_LABEL_Y = 164
 OC_TOGGLE_RECT = (172, 38, 218, 60)
 OC_MODE_SEG_RECT = (16, 100, 224, 128)
 OC_NODE_ZONE = (146, 192)
-OC_UPDATE_BUTTON = (24, 252, 216, 272)
+OC_FLUSH_BUTTON = (16, 250, 116, 280)
+OC_UPDATE_BUTTON = (124, 250, W - 16, 280)
 
 WEATHER_CITY_ZONE = (34, 66)
 
@@ -3063,14 +3291,42 @@ SIM_WIREGUARD_TILE = (16, 248, W - 16, 286)
 
 
 _NR_CHIP = ACCENT["clock"]
+AIRPLANE_COLOR = (230, 170, 90)
 
 
-def _draw_signal_card(d, cell, carrier):
+def _icon_airplane(d, cx, cy, s, color):
+    """Top-down airliner pointing up, ~2s tall, anti-aliased -- drawn, not
+    a glyph: the bundled fonts box "✈"."""
+    x0, y0 = cx - s - 2, cy - s - 2
+    size = int(2 * s) + 5
+
+    def paint(m, k):
+        ox, oy = (cx - int(round(x0))) * k, (cy - int(round(y0))) * k
+        u = s * k
+
+        def P(x, y):
+            return (ox + x * u, oy + y * u)
+        m.polygon([P(-0.12, -0.85), P(0.12, -0.85), P(0.14, -0.2), P(0.95, 0.25), P(0.95, 0.4),
+                   P(0.14, 0.18), P(0.12, 0.62), P(0.4, 0.85), P(0.4, 0.97), P(0, 0.88),
+                   P(-0.4, 0.97), P(-0.4, 0.85), P(-0.12, 0.62), P(-0.14, 0.18), P(-0.95, 0.4),
+                   P(-0.95, 0.25), P(-0.14, -0.2)], fill=255)
+        m.ellipse([ox - 0.12 * u, oy - 1.0 * u, ox + 0.12 * u, oy - 0.7 * u], fill=255)
+
+    _draw_aa(d, x0, y0, size, size, color, paint)
+
+
+def _draw_signal_card(d, cell, carrier, airplane=False):
     """Top-right status card: network type (4G / 4G+ / 5G NSA), signal
-    bars + primary-carrier RSRP, and the serving carrier's name."""
+    bars + primary-carrier RSRP, and the serving carrier's name -- or,
+    with cellular switched off, an unmissable airplane-mode state."""
     x0, y0, x1, y1 = SIM_SIGNAL_CARD
     d.rounded_rectangle([x0, y0, x1, y1], radius=10, fill=(22, 28, 40), outline=(42, 48, 60), width=1)
     ix0, ix1 = x0 + 7, x1 - 7
+    if airplane:
+        _icon_airplane(d, (x0 + x1) / 2, y0 + 22, 13, AIRPLANE_COLOR)
+        centered_text(d, (x0 + x1) / 2, y0 + 41, "Airplane", font("default_bold", 12), AIRPLANE_COLOR)
+        centered_text(d, (x0 + x1) / 2, y0 + 55, "mode", font("default_bold", 12), AIRPLANE_COLOR)
+        return
     label = cell_network_label(cell)
     if not label:
         centered_text(d, (x0 + x1) / 2, y0 + 20, "No", font("default_bold", 14), DIM)
@@ -3083,21 +3339,29 @@ def _draw_signal_card(d, cell, carrier):
         hw = d.textlength(head, font=f_head)
         d.text((ix0 + hw + 3, y0 + 11), detail, font=font("default_bold", 10), fill=_NR_CHIP)
 
+    # Bars on the left, RSRP on the right with its unit stacked under the
+    # number. "-118dBm" on one line is 44px next to 22px of bars in a
+    # 60px-wide card -- it used to be drawn on top of the bars.
     sig = get_cell_signal(cell)
     bars = sig[0] if sig else 0
-    draw_signal_bars(d, ix0, y0 + 46, bars, ACCENT["sim"], (60, 65, 80), bar_w=4, gap=2, max_h=14)
+    bars_base = y0 + 43
+    draw_signal_bars(d, ix0, bars_base, bars, ACCENT["sim"], (60, 65, 80), bar_w=4, gap=2, max_h=14)
     rsrp = cell.get("rsrp")
     if isinstance(rsrp, int):
-        f_rsrp = font("default_medium", 10)
-        txt = f"{rsrp}dBm"
-        d.text((ix1 - d.textlength(txt, font=f_rsrp), y0 + 35), txt, font=f_rsrp, fill=DIM)
+        f_num, f_unit = font("default_bold", 11), font("default_medium", 8)
+        num = str(rsrp)
+        nb = d.textbbox((0, 0), num, font=f_num)
+        d.text((ix1 - (nb[2] - nb[0]) - nb[0], bars_base - 7 - (nb[3] + nb[1]) / 2), num, font=f_num, fill=FG)
+        ub = d.textbbox((0, 0), "dBm", font=f_unit)
+        d.text((ix1 - (ub[2] - ub[0]) - ub[0], bars_base + 2 - ub[1]), "dBm", font=f_unit, fill=DIM)
 
     name = carrier or "—"
     f_car = font("default_bold", 13)
     if d.textlength(name, font=f_car) > ix1 - ix0:
         f_car = font("default_bold", 10)
     name = truncate_to_width(d, name, f_car, ix1 - ix0)
-    d.text((ix0, y0 + 52), name, font=f_car, fill=FG if carrier else DIM)
+    cb = d.textbbox((0, 0), name, font=f_car)
+    d.text((ix0, y1 - 6 - cb[3]), name, font=f_car, fill=FG if carrier else DIM)
 
 
 def _draw_band_row(d, cell):
@@ -3179,15 +3443,19 @@ def panel_sim(cfg, sim, conn_type=None, cell_signal=None, wg_peers=None, wg_acti
     d.text((50, 57 if f_country.size == 20 else 60),
            truncate_to_width(d, country, f_country, ax0 - 54), font=f_country, fill=FG)
 
-    centered_text(d, (ax0 + ax1) / 2, 44, "Net", font("default_medium", 10), DIM)
-    draw_toggle(d, ax0, ay0, sim["attached"], ACCENT["sim"], w=ax1 - ax0, h=ay1 - ay0)
+    # "Cellular", not "Net": this is the whole cellular radio (off =
+    # airplane mode -- no signal, SMS, calls or data), not just internet.
+    airplane = sim.get("airplane", False)
+    centered_text(d, (ax0 + ax1) / 2, 44, "Cellular", font("default_medium", 10),
+                  AIRPLANE_COLOR if airplane else DIM)
+    draw_toggle(d, ax0, ay0, not airplane, ACCENT["sim"], w=ax1 - ax0, h=ay1 - ay0)
 
     cx0, cy0, cx1, cy1 = SIM_CHOICE_RECT
     sel_idx = SIM_CHOICE_KEYS.index(sim["sim_choice"])
     draw_segmented(d, cx0, cy0, cx1 - cx0, cy1 - cy0, SIM_CHOICE_LABELS, sel_idx, ACCENT["sim"], fsize=11)
 
-    _draw_signal_card(d, cell or {}, sim.get("carrier"))
-    _draw_band_row(d, cell)
+    _draw_signal_card(d, cell or {}, sim.get("carrier"), airplane)
+    _draw_band_row(d, {} if airplane else cell)
 
     d.line([16, 152, W - 16, 152], fill=DIM)
 
@@ -3196,11 +3464,18 @@ def panel_sim(cfg, sim, conn_type=None, cell_signal=None, wg_peers=None, wg_acti
     d.text((16, 180), format_data_used(used), font=font("default_mono_medium", 20), fill=FG)
 
     f_lbl = font("default_medium", 10)
+    # With cellular off, Data and Roam can't do anything: grey them out
+    # and replace their two labels with one that says why.
+    if airplane:
+        centered_text(d, (SIM_DATA_TOGGLE_RECT[0] + SIM_ROAM_TOGGLE_RECT[2]) / 2, SIM_TOGGLE_LABEL_Y,
+                      "Cellular is off", f_lbl, AIRPLANE_COLOR)
     for rect, label, on in ((SIM_DATA_TOGGLE_RECT, "Data", sim["data_up"]),
                             (SIM_ROAM_TOGGLE_RECT, "Roam", sim["roaming"])):
         tx0, ty0, tx1, ty1 = rect
-        centered_text(d, (tx0 + tx1) / 2, SIM_TOGGLE_LABEL_Y, label, f_lbl, DIM)
-        draw_toggle(d, tx0, ty0, on, ACCENT["sim"], w=tx1 - tx0, h=ty1 - ty0)
+        if not airplane:
+            centered_text(d, (tx0 + tx1) / 2, SIM_TOGGLE_LABEL_Y, label, f_lbl, DIM)
+        draw_toggle(d, tx0, ty0, on and not airplane, (70, 76, 92) if airplane else ACCENT["sim"],
+                    w=tx1 - tx0, h=ty1 - ty0)
 
     bx0, by0, bx1, by1 = 16, 206, W - 16, 222
     d.rounded_rectangle([bx0, by0, bx1, by1], radius=8, outline=DIM, width=1)
@@ -3248,9 +3523,11 @@ def panel_openclash(oc, traf, conn_type=None, cell_signal=None):
         draw_page_dots(d, 5)
         return img
 
-    d.text((16, 44), "Enabled", font=font("default_medium", 16), fill=FG)
+    d.text((16, 39), "OpenClash", font=font("default_medium", 16), fill=FG)
+    status, status_color = openclash_status_text(oc)
+    d.text((16, 58), status, font=font("default_medium", 11), fill=status_color)
     tx0, ty0, tx1, ty1 = OC_TOGGLE_RECT
-    draw_toggle(d, tx0, ty0, oc["enabled"], ACCENT["openclash"], w=tx1 - tx0, h=ty1 - ty0)
+    draw_toggle(d, tx0, ty0, openclash_toggle_on(oc), ACCENT["openclash"], w=tx1 - tx0, h=ty1 - ty0)
 
     d.line([16, 72, W - 16, 72], fill=(40, 44, 54))
 
@@ -3284,11 +3561,38 @@ def panel_openclash(oc, traf, conn_type=None, cell_signal=None):
     else:
         d.text((16, 220), "—", font=font("default_mono_medium", 15), fill=DIM)
 
+    # Flush DNS is the one people reach for most (a stale fake-IP/DNS
+    # answer is the usual "site won't load through the proxy" fix), so it
+    # gets the filled button; greyed out when there's no core to flush.
+    fx0, fy0, fx1, fy1 = OC_FLUSH_BUTTON
+    if oc.get("running"):
+        d.rounded_rectangle([fx0, fy0, fx1, fy1], radius=(fy1 - fy0) / 2, fill=ACCENT["openclash"])
+        centered_text_box(d, fx0, fy0, fx1, fy1, "Flush DNS", font("default_bold", 13), BG)
+    else:
+        d.rounded_rectangle([fx0, fy0, fx1, fy1], radius=(fy1 - fy0) / 2, fill=(40, 44, 56))
+        centered_text_box(d, fx0, fy0, fx1, fy1, "Flush DNS", font("default_bold", 13), DIM)
     bx0, by0, bx1, by1 = OC_UPDATE_BUTTON
     d.rounded_rectangle([bx0, by0, bx1, by1], radius=(by1 - by0) / 2, outline=ACCENT["openclash"], width=2)
-    centered_text_box(d, bx0, by0, bx1, by1, "Update Subscription", font("default_medium", 12), ACCENT["openclash"])
+    centered_text_box(d, bx0, by0, bx1, by1, "Update Sub", font("default_medium", 13), ACCENT["openclash"])
     draw_page_dots(d, 5)
     return img
+
+
+def openclash_toggle_on(oc):
+    return bool(oc.get("running"))
+
+
+def openclash_status_text(oc):
+    """One line under the OpenClash label saying what's really going on,
+    since the toggle alone can't show "enabled but the core isn't up"."""
+    running, busy, enabled = oc.get("running"), oc.get("busy"), oc.get("enabled")
+    if busy:
+        return ("Stopping…" if running and not enabled else "Starting…"), DIM
+    if running:
+        return ("Running" if enabled else "Running (disabled in config)"), ACCENT["openclash"]
+    if enabled:
+        return "Enabled, but not running", (230, 170, 90)
+    return "Stopped", DIM
 
 
 MONITOR_CPU_BAR = (16, 144, W - 16, 158)
@@ -5072,8 +5376,11 @@ def hit_main_openclash(x, y):
         return "mode_global" if x < (sx0 + sx1) / 2 else "mode_rule"
     if OC_NODE_ZONE[0] <= y < OC_NODE_ZONE[1]:
         return "node"
+    fx0, fy0, fx1, fy1 = OC_FLUSH_BUTTON
+    if fx0 - 6 <= x <= fx1 + 3 and fy0 - 6 <= y <= fy1 + 6:
+        return "flush_dns"
     bx0, by0, bx1, by1 = OC_UPDATE_BUTTON
-    if bx0 - 6 <= x <= bx1 + 6 and by0 - 6 <= y <= by1 + 6:
+    if bx0 - 3 <= x <= bx1 + 6 and by0 - 6 <= y <= by1 + 6:
         return "update_sub"
     return None
 
@@ -5448,7 +5755,9 @@ def mode_live():
     refresher = Refresher()
     refresher.add("fx", fetch_fx, 300)
     refresher.add("sim", lambda: get_sim_status(cfg), 30)
-    refresher.add("oc", get_openclash_status, 30)
+    # 10s: the toggle now shows whether the core is actually running, and
+    # OpenClash also gets started/stopped from LuCI or the GL app.
+    refresher.add("oc", get_openclash_status, 10)
     refresher.add("traf", get_openclash_traffic_and_node, 20)
     refresher.add("wx", lambda: fetch_weather(cfg["weather_city"]), 1800)
     refresher.add("aq", lambda: fetch_air_quality(cfg["weather_city"]), 1800)
@@ -5478,8 +5787,8 @@ def mode_live():
     fx = fetch_fx()
     sim = {"slot": "1", "country": None, "phone": "", "traffic_mb": None,
            "cap_mb": cfg.get("data_cap_mb"), "sim_choice": "sim1", "data_up": False,
-           "iccid": None, "attached": False, "roaming": False, "carrier": None}
-    oc = {"installed": openclash_installed(), "enabled": False, "mode": "rule"}
+           "iccid": None, "attached": False, "roaming": False, "carrier": None, "airplane": False}
+    oc = openclash_status_empty(openclash_installed())
     traf = openclash_traffic_empty()
     wx, aq = [], []
     sms_messages = []
@@ -5952,6 +6261,79 @@ def mode_live():
     def is_sim_toggle_action(action):
         return action.partition(":")[0] in SIM_TOGGLE_ZONES
 
+    def is_openclash_action(action):
+        return action.startswith("oc_")
+
+    def confirm_accent():
+        if is_sim_toggle_action(confirm_action):
+            return ACCENT["sim"]
+        if is_openclash_action(confirm_action):
+            return ACCENT["openclash"]
+        return ACCENT["clock"]
+
+    def openclash_confirm(zone):
+        """Both OpenClash actions ask first: starting/stopping it reroutes
+        every device's traffic, and a DNS flush drops cached answers for
+        everyone. Returns a notice instead when there's nothing to do."""
+        nonlocal confirm_title, confirm_message, confirm_yes_label, confirm_action
+        nonlocal confirm_return_view, confirm_danger
+        if zone == "toggle":
+            want = not openclash_toggle_on(oc)
+            confirm_title = "OpenClash"
+            if want:
+                confirm_message = "Start OpenClash? All traffic will go through the proxy once it's up."
+                confirm_yes_label = "Start"
+            else:
+                confirm_message = "Stop OpenClash? Traffic will go direct, without the proxy."
+                confirm_yes_label = "Stop"
+            confirm_action = f"oc_toggle:{'on' if want else 'off'}"
+            confirm_danger = not want
+        else:
+            if not oc.get("running"):
+                return "OpenClash isn't running -- nothing to flush"
+            confirm_title = "Flush DNS"
+            confirm_message = "Flush OpenClash's DNS and fake-IP cache? Open connections may briefly reconnect."
+            confirm_yes_label = "Flush"
+            confirm_action = "oc_flush"
+            confirm_danger = False
+        confirm_return_view = "main"
+        return None
+
+    def run_openclash_action(action):
+        """Runs a confirmed OpenClash action under a spinner over the
+        OpenClash page and publishes the freshly read state. Returns the
+        notice to show (failure, or a flush confirmation)."""
+        nonlocal oc, traf
+        started = time.time()
+        base = render_main(PANEL_NAMES.index("openclash"))
+        if action == "oc_flush":
+            err = run_with_spinner(base, "Flushing DNS cache…", flush_openclash_dns,
+                                   ACCENT["openclash"], min_visible=0.8)
+            return err or "DNS cache flushed"
+        want = action.endswith(":on")
+        verb = "Starting" if want else "Stopping"
+
+        def work():
+            set_openclash_enabled(want)
+            ok = wait_for_openclash_state(want)
+            return ok, get_openclash_status(), get_openclash_traffic_and_node()
+
+        got = run_with_spinner(base, lambda: f"{verb} OpenClash… {int(time.time() - started)}s",
+                               work, ACCENT["openclash"], min_visible=0.8)
+        if not got:
+            return "Couldn't read OpenClash's state back"
+        ok, oc, traf = got
+        # Publish, so the refresher's older copies can't flip the toggle
+        # back on the next pass -- the "turned it off and it jumped back
+        # on" report.
+        refresher.put("oc", oc)
+        refresher.put("traf", traf)
+        if ok:
+            return None
+        limit = int(OPENCLASH_START_TIMEOUT if want else OPENCLASH_STOP_TIMEOUT)
+        return (f"OpenClash didn't come up within {limit}s -- check its log in LuCI" if want
+                else f"OpenClash still running after {limit}s")
+
     kb_text = ""
     kb_layer = "letters"
     kb_caps = False
@@ -5973,18 +6355,22 @@ def mode_live():
         cellular_is_wan = not has_competing_wan() and bool(get_wan_iface())
         offline_note = (" Internet runs over cellular right now, so the router will go offline."
                         if cellular_is_wan else "")
+        airplane = sim.get("airplane", False)
         if zone == "attach_toggle":
-            want = not sim["attached"]
-            title = "Cellular network"
+            want = airplane                 # toggle shows "cellular on" = not airplane
+            title = "Cellular"
             if want:
-                msg, yes = "Turn the cellular network on? The modem leaves airplane mode.", "Turn on"
+                msg, yes = "Turn cellular back on? The modem leaves airplane mode and registers again.", "Turn on"
             else:
-                msg = "Turn the cellular network off? No SMS, calls or data." + offline_note
+                msg = ("Turn off ALL cellular? Airplane mode: no signal, no SMS, no calls, no mobile data."
+                       + offline_note)
                 yes = "Turn off"
         elif zone == "data_toggle":
+            if airplane:
+                return "Cellular is off -- turn Cellular on first"
             want = not sim["data_up"]
             if want and not sim["attached"]:
-                return "Turn Net on first -- no network to start data on"
+                return "No network registered yet -- can't start data"
             title = "Mobile data"
             if want:
                 msg, yes = "Turn mobile data on for this SIM?", "Turn on"
@@ -5992,6 +6378,8 @@ def mode_live():
                 msg = "Turn mobile data off? SMS and calls still work." + offline_note
                 yes = "Turn off"
         else:
+            if airplane:
+                return "Cellular is off -- turn Cellular on first"
             if not sim.get("iccid"):
                 return "No active SIM to change roaming for"
             want = not sim["roaming"]
@@ -6021,8 +6409,10 @@ def mode_live():
         def work():
             if zone == "attach_toggle":
                 set_network_attach_enabled(want)
-                stage["text"] = "Registering" if want else "Detaching"
-                ok = _wait_until(lambda: is_cell_attached() == want,
+                stage["text"] = "Registering" if want else "Switching off"
+                # Done = GL's airplane flag says so AND the modem agrees:
+                # registered again (on) / no serving cell left (off).
+                ok = _wait_until(lambda: get_airplane_mode() == (not want) and is_cell_attached() == want,
                                  SIM_ATTACH_TIMEOUT if want else SIM_DETACH_TIMEOUT)
             elif zone == "data_toggle":
                 set_cellular_data_enabled(want)
@@ -6033,7 +6423,24 @@ def mode_live():
                     time.sleep(SIM_DATA_SETTLE)
                     ok = is_cell_data_up() == want
             else:
+                data_was_up = is_cell_data_up()
                 ok = apply_roaming(iccid, want)
+                # The official apply re-dials (set_connect) so the session
+                # picks the new roaming setting up; data drops for a while.
+                # Don't call it done until it's back.
+                # Timed live: the session drops ~2s after the apply and is
+                # back 8-15s later -- so first let it drop (checking "up"
+                # straight away passed before the re-dial even started),
+                # then wait for it to return and hold.
+                if ok and data_was_up:
+                    stage["text"] = "Reconnecting data"
+                    _wait_until(lambda: not is_cell_data_up(), SIM_REDIAL_START, poll=0.5)
+                    ok = _wait_until(is_cell_data_up, SIM_DATA_TIMEOUT + 15)
+                    if ok:
+                        time.sleep(SIM_DATA_SETTLE)
+                        ok = is_cell_data_up()
+                    if not ok:
+                        stage["fail"] = "Roaming saved, but data hasn't reconnected yet"
             return ok, get_sim_status(cfg)
 
         def label():
@@ -6052,13 +6459,13 @@ def mode_live():
         if ok:
             return None
         if zone == "attach_toggle":
-            return ("Not registered yet -- still searching for a network" if want
-                    else "Still registered -- airplane mode didn't take")
+            return ("Cellular is on but not registered yet -- still searching" if want
+                    else "Cellular still registered -- airplane mode didn't take")
         if zone == "data_toggle":
             if want:
                 return "Data didn't come up" + (" (WAN manager reverted it)" if has_competing_wan() else "")
             return "Data is still up -- the change didn't take"
-        return "Roaming setting didn't save"
+        return stage.get("fail") or "Roaming setting didn't save"
 
     while not _stop:
         now = time.time()
@@ -6264,29 +6671,20 @@ def mode_live():
                             new_view = "wireguard"
                         elif name == "sim" and zone == "data_cap":
                             new_view = "datacap"
-                        elif name == "openclash" and zone == "toggle":
-                            # Used to flip instantly by reading uci's own
-                            # config.enable straight back -- which always
-                            # "confirms" whatever was just written to it,
-                            # regardless of whether the openclash service
-                            # itself had actually started or stopped.
-                            # Waits for the mihomo API to actually respond
-                            # (or stop responding) instead.
-                            want = not oc["enabled"]
-
-                            def _apply_oc(want=want):
-                                set_openclash_enabled(want)
-                                wait_for_openclash_state(want)
-                                return get_openclash_status()
-
-                            oc = run_with_spinner(cur_img, "Enabling…" if want else "Disabling…",
-                                                  _apply_oc, ACCENT["openclash"]) or oc
+                        elif name == "openclash" and zone in ("toggle", "flush_dns"):
+                            blocked = openclash_confirm(zone)
+                            if blocked:
+                                show_notice(blocked)
+                            else:
+                                new_view = "confirm"
                         elif name == "openclash" and zone == "mode_global" and oc["mode"] != "global":
                             set_openclash_mode("global")
                             oc = get_openclash_status()
+                            refresher.put("oc", oc)
                         elif name == "openclash" and zone == "mode_rule" and oc["mode"] != "rule":
                             set_openclash_mode("rule")
                             oc = get_openclash_status()
+                            refresher.put("oc", oc)
                         elif name == "openclash" and zone == "node":
                             new_view = "oc_nodes"
                         elif name == "openclash" and zone == "update_sub":
@@ -6298,6 +6696,7 @@ def mode_live():
                                              lambda: update_openclash_subscription(wait=True),
                                              ACCENT["openclash"])
                             refresher.request("traf")
+                            refresher.request("oc")
                         elif name == "weather" and zone == "city":
                             new_view = "weather_city"
                             picker_scroll_base = 0
@@ -6488,8 +6887,7 @@ def mode_live():
                 if view == "more":
                     img = panel_more(wifi24, wifi_band, cfg["clock_style"], get_wifi56_conflict_idx(rep))
                 elif view == "confirm":
-                    accent = ACCENT["sim"] if is_sim_toggle_action(confirm_action) else ACCENT["clock"]
-                    img = panel_confirm(confirm_title, confirm_message, accent,
+                    img = panel_confirm(confirm_title, confirm_message, confirm_accent(),
                                         yes_label=confirm_yes_label, danger=confirm_danger)
                 elif view == "keyboard_wifi":
                     img = panel_keyboard("Wi-Fi Password", kb_text, kb_layer, kb_caps,
@@ -6528,19 +6926,31 @@ def mode_live():
                         write_frame(cur_img)
                         last_draw = now
                 elif view == "confirm" and is_tap and hit_confirm(down_x, down_y) == "yes":
-                    if is_sim_toggle_action(confirm_action):
-                        failed = run_sim_toggle(confirm_action)
-                        if failed:
-                            show_notice(failed)
+                    if is_sim_toggle_action(confirm_action) or is_openclash_action(confirm_action):
+                        apply_fn = run_sim_toggle if is_sim_toggle_action(confirm_action) else run_openclash_action
+                        message = apply_fn(confirm_action)
+                        if message:
+                            show_notice(message)
                         view = "main"
                         cur_img = render_main(panel_idx)
                         write_frame(cur_img)
                         last_draw = time.time()
-                    elif confirm_action == "reboot":
-                        reboot_router()
-                        view = "more"
-                    elif confirm_action == "shutdown":
-                        shutdown_router()
+                    elif confirm_action in ("reboot", "shutdown"):
+                        kind = confirm_action
+                        (reboot_router if kind == "reboot" else shutdown_router)()
+                        t0 = time.time()
+                        while time.time() - t0 < POWER_SCREEN_MAX_S and not _stop:
+                            elapsed = time.time() - t0
+                            write_frame(panel_power(kind, elapsed * SPINNER_SPEED_DPS, elapsed))
+                            with touch_state.lock:
+                                touch_state.release_pending = False   # nothing to tap now
+                            time.sleep(1.0 / 20)
+                        if _stop:
+                            # procd is taking services down: leave a calm
+                            # final frame on the panel and let the loop exit.
+                            write_frame(panel_power(kind, final=True))
+                        else:
+                            show_notice("Reboot didn't start" if kind == "reboot" else "Shutdown didn't start")
                         view = "more"
                     elif confirm_action == "return_stock":
                         # toggle.sh force-kills this very process within

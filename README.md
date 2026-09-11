@@ -57,9 +57,9 @@ and primary-carrier RSRP, and the serving carrier's name. Under the SIM1 /
 eSIM switch, a row of chips shows **every band the modem is connected on
 right now** — primary carrier filled, secondaries outlined, 5G NR bands
 in blue — with a carrier-aggregation summary (e.g. *5 bands · 160 MHz*).
-Three toggles: **Net** (network registration — off is airplane mode),
-**Data** (the cellular data session) and **Roam** (data roaming for this
-SIM), plus a data-usage bar against a cap you set (500 MB up to 1000 GB)
+Three toggles: **Cellular** (the whole cellular radio — off is airplane
+mode, and the page says so), **Data** (the cellular data session) and
+**Roam** (data roaming for this SIM), all through GL.iNet's own RPCs, plus a data-usage bar against a cap you set (500 MB up to 1000 GB)
 and a **WireGuard** button. (SIM2 was removed from the switch: it and eSIM
 share the same physical slot on this hardware and behaved identically.)
 
@@ -89,10 +89,12 @@ app. The spinner waits until the tunnel is actually up.
 
 Every panel's colored header also shows, phone-status-bar style: cellular
 signal bars + radio tech (4G/4G+/5G), the active WAN connection type
-(Repeater/Ethernet/4G/5G), and **battery level with a charging bolt**
-(read from the fuel gauge in `/sys/class/power_supply`). When a long
-panel title leaves too little room, the least important items drop out
-first (the %, then the tech label, then the bars).
+(Repeater/Ethernet/4G/5G), and a **battery with its percentage written
+inside it** plus a charging bolt (read from the fuel gauge in
+`/sys/class/power_supply`). The header stays 34px tall; everything in it
+is centred on its midline. When a long panel title leaves too little
+room, the tech label beside the bars goes first, then the bars, then the
+WAN label shrinks a size -- the battery and its number always stay.
 
 **Monitor** — bandwidth (down/up Mbps on whichever interface currently holds
 the default route, so it keeps tracking the right link through a WAN
@@ -132,10 +134,13 @@ target currency), plus a real historical line chart per row (week/month/
 year, pulled from [Frankfurter](https://frankfurter.dev), ECB reference
 rates).
 
-**OpenClash** — on/off, Global/Rule mode, current node (flag + guessed
+**OpenClash** — on/off (showing whether the core is *actually running*,
+with a status line: Running / Starting… / Stopped / Enabled, but not
+running), Global/Rule mode, current node (flag + guessed
 country from the node name, including common Chinese keywords like 香港/
 日本/新加坡) with a tap-to-switch, scrollable node list, session traffic,
-and an **Update Subscription** button (runs the same script LuCI's own
+a **Flush DNS** button (same as LuCI's "Flush DNS Cache": flushes the
+core's DNS and fake-IP caches), and an **Update Sub** button (runs the same script LuCI's own
 subscription page does — re-fetches every configured subscription,
 reloads if changed) — all read from Mihomo's local REST API. Node names
 render in the device's bundled CJK font, so Chinese subscription/node
@@ -387,6 +392,76 @@ There's no settings UI for these — edit directly:
   toggles now confirm first and verify under a spinner instead, with no
   deferred state left to go wrong. Roaming is also parsed tolerantly now
   -- a string `"0"` would have read as *on* under a plain `bool()`.
+- **The SIM toggles now go through GL's own RPCs, like the Wi-Fi ones.**
+  Confirmed from the web UI and stock screen before switching:
+  **Cellular** (airplane mode) = `system.set_airplane_mode {enable}` /
+  `get_airplane_mode` -- the stock screen's switch. The old bare
+  `cellular.modem set_airplane_mode` ubus call never wrote
+  `glconfig.general.airplane_mode`, which the stock screen reads.
+  **Data** = `modem.set_connect` / `modem.disconnect {bus, slot}` -- the
+  web UI's dial switch; unlike the old `ifdown modem_cpu`, it tells
+  cellular_manager (tested: stays down, nothing re-dials it).
+  **Roam** = `modem.get_sim_config` -> `modem.set_sim_config` (only
+  `roaming` changed) -> `modem.set_connect`, as the web UI applies it;
+  that re-dial drops data ~2s later for ~8-15s, so the spinner waits for
+  the drop *and* the reconnect. `modem` is a C module (`rpc/modem.so`),
+  called by running `/www/cgi-bin/glc` as a CGI (`REQUEST_URI=/rpc` is
+  required -- it segfaults without); `system` is Lua, run like `wifi`.
+  All of it on the router itself, no web login. Tested end to end with a
+  self-restoring script (this PC's internet runs through the router).
+- **Airplane mode doesn't empty cell_info.** It keeps one placeholder
+  entry (band 0, network_type 0, rsrp -32768), which the parser counted
+  as a carrier: the modem looked registered, header signal bars stayed
+  up, and turning cellular off could never verify. Placeholder entries
+  are skipped now. Reliable airplane indicators, for reference:
+  `cellular.modem status`.status 3 (0 normally), `cellular.sim status`
+  slot status 5 (6 when registered).
+- **Reboot / Shutdown looked frozen.** After the confirm, the code ran
+  `/sbin/reboot` or `/sbin/poweroff` and went straight back to the More
+  page, which then just sat there for the ~10-30s the system takes to
+  stop. Now a full-screen spinner ("Shutting down… 7s" / "Restarting…")
+  runs until procd's SIGTERM reaches the dashboard -- the point where
+  the system really is going down -- and a static final frame ("Powering
+  off" / "Restarting… back in about a minute") is left on the panel. If
+  no SIGTERM arrives within 3 minutes the command didn't take, and the
+  More page comes back with a notice instead of spinning forever.
+- **The RSRP reading was drawn on top of the signal bars.** In the 60px
+  status card, "-118dBm" (44px) plus the bars (22px) doesn't fit on one
+  line. The number now sits right-aligned beside the bars with the "dBm"
+  unit stacked under it, and the carrier name moved to the card's bottom
+  line.
+- **"Net" didn't say what it switches off.** Renamed **Cellular**; with it
+  off the status card shows an airplane icon and "Airplane mode", Data
+  and Roam are greyed with "Cellular is off", and the confirmation reads
+  "Turn off ALL cellular? … no signal, no SMS, no calls, no mobile data".
+- **The OpenClash toggle showed config, not reality -- and got
+  overwritten.** It displayed uci's `openclash.config.enable` (what
+  OpenClash *should* be doing), so a start that failed still read "on".
+  Worse, after a tap the page held the fresh state only until the
+  background refresher's next publish, which handed back its own older
+  copy (up to 30s stale) -- the toggle "jumped back". It now shows
+  whether the clash core is actually running (`pidof clash`, the same
+  test LuCI uses) plus the init script's start/stop-in-progress state;
+  a tap asks for confirmation, then waits until OpenClash has *finished*
+  (core up + API answering + init script done for a start -- timed live
+  at ~10s; core gone + init done for a stop, ~6s; allowed up to 120s /
+  60s) and publishes the result into the refresher so nothing older can
+  replace it. The Global/Rule switch had the same overwrite problem and
+  gets the same fix. Refresh interval 30s -> 10s, since OpenClash is
+  also started/stopped from LuCI and the GL app.
+- **Flush DNS asks first and needs a running core.** It POSTs the core's
+  `/cache/fakeip/flush` and `/cache/dns/flush` (both answer 204), exactly
+  what LuCI's button does; with no core running the button is greyed out
+  and a tap just says so.
+- **Page dots were 8px left of centre.** The row was centred on
+  `count * 16` instead of the `(count - 1) * 16` between the first and
+  last dot centres.
+- **The battery % got squeezed out or sat outside the icon.** It was a
+  separate label, the first thing dropped when a long title left no
+  room. The number now lives inside a larger battery (27x15), drawn
+  two-tone so it stays readable over both the filled and the empty part
+  (white over the red low-battery fill); the header's other icons and
+  text got a size bigger too, without making the 34px header taller.
 - **Text truncation was quadratic, and it made the whole UI sluggish.**
   `truncate_to_width` dropped one character at a time and re-measured the
   whole string on each step. The Home tile truncates the latest SMS body,
