@@ -245,6 +245,52 @@ def is_screen_asleep():
     return val
 
 
+POWER_SUPPLY_DIR = "/sys/class/power_supply"
+_battery_cache = {"ts": -1e9, "val": None}
+_BATTERY_TTL = 15.0
+
+
+def _read_sys(path):
+    try:
+        with open(path) as f:
+            return f.read().strip()
+    except Exception:
+        return None
+
+
+def get_battery():
+    """(percent, plugged_in) or None when there's no battery to report.
+
+    Read from sysfs, not a ubus object -- the GL-E5800 exposes none for
+    this: the fuel gauge is a `type=Battery` supply (cw221X-bat, with
+    `capacity`) and the charger a separate `type=USB` supply whose
+    `online` is 1 while a cable is in. Matched by type rather than by
+    those driver names so a board revision with a different gauge chip
+    still works. Cached like is_screen_asleep: draw_header runs on every
+    frame of every panel, a battery level doesn't move in 15s."""
+    now = time.time()
+    if now - _battery_cache["ts"] < _BATTERY_TTL:
+        return _battery_cache["val"]
+    pct, plugged = None, False
+    try:
+        for name in os.listdir(POWER_SUPPLY_DIR):
+            base = os.path.join(POWER_SUPPLY_DIR, name)
+            typ = _read_sys(os.path.join(base, "type"))
+            if typ == "Battery" and _read_sys(os.path.join(base, "present")) != "0":
+                try:
+                    pct = max(0, min(100, int(_read_sys(os.path.join(base, "capacity")))))
+                except (TypeError, ValueError):
+                    pass
+            elif typ in ("USB", "Mains") and _read_sys(os.path.join(base, "online")) == "1":
+                plugged = True
+    except Exception:
+        pass
+    val = (pct, plugged) if pct is not None else None
+    _battery_cache["ts"] = now
+    _battery_cache["val"] = val
+    return val
+
+
 # ---------- config ----------
 
 def load_config():
@@ -343,6 +389,13 @@ class Refresher:
         with self.lock:
             val = self._values.get(name)
         return default if val is None else val
+
+    def put(self, name, value):
+        """Publish a value fetched outside the worker (e.g. the fresh SIM
+        state a verified toggle just read), so the render loop's next
+        get() can't hand back the older periodic result in its place."""
+        with self.lock:
+            self._values[name] = value
 
     def request(self, name):
         """Ask for one job to run as soon as the worker next wakes."""
@@ -914,12 +967,19 @@ def get_sim_status(cfg):
     phone = None
     iccid = None
     roaming = False
+    carrier = None
     if active:
         country = MCC_COUNTRY.get(active.get("mcc", ""), f"MCC {active.get('mcc', '?')}")
         phone = active.get("phone_number") or ""
         iccid = active.get("iccid")
         if iccid:
-            roaming = bool(ubus_call("cellular.sim", "get_config", {"iccid": iccid}).get("roaming", False))
+            roaming = get_roaming_config(iccid)
+        # The serving network's name, not the SIM's home operator -- a
+        # China Unicom SIM roaming in the UK reads "EE" here (confirmed
+        # live), which is the one worth showing next to the signal.
+        for s in ubus_call("cellular.sim", "status", {"bus": "cpu"}).get("sims", []):
+            if str(s.get("slot")) == slot:
+                carrier = (s.get("carrier") or s.get("name") or "").strip() or None
 
     # "sim_choice" reflects the UI's 2-way pick. SIM2 was removed from the
     # picker: it and eSIM both live on slot 2 on this hardware and both just
@@ -945,15 +1005,38 @@ def get_sim_status(cfg):
     # be registered with the network without the data interface being up
     # at all, which is exactly the "receives SMS but not using cellular
     # for data" mode this is meant to represent. No direct ubus getter for
-    # registration state, so it's inferred from whether cell_info is
-    # currently populated at all (see _get_active_cell_info).
-    attached = bool(_get_active_cell_info().get("mode"))
+    # registration or airplane mode (cellular.modem only has a setter --
+    # cellular_manager keeps the flag internally), so it's inferred from
+    # whether cell_info currently reports any serving carrier at all (see
+    # _get_active_cell_info).
+    attached = is_cell_attached()
 
     return {
         "slot": slot, "country": country, "phone": phone, "traffic_mb": traffic_mb,
         "cap_mb": cfg.get("data_cap_mb"), "sim_choice": sim_choice, "data_up": data_up,
-        "iccid": iccid, "attached": attached, "roaming": roaming,
+        "iccid": iccid, "attached": attached, "roaming": roaming, "carrier": carrier,
     }
+
+
+def is_cell_attached():
+    return bool(_get_active_cell_info().get("mode"))
+
+
+def is_cell_data_up():
+    return bool(ubus_call("network.interface.modem_cpu", "status").get("up"))
+
+
+def _as_bool(v):
+    """cellular.sim's config values arrive as JSON booleans on 4.10.0, but
+    a string "0" would read as True under plain bool() -- and a roaming
+    toggle stuck showing ON is exactly the wrong way to be wrong."""
+    if isinstance(v, str):
+        return v.strip().lower() in ("1", "true", "yes", "on")
+    return bool(v)
+
+
+def get_roaming_config(iccid):
+    return _as_bool(ubus_call("cellular.sim", "get_config", {"iccid": iccid}).get("roaming", False))
 
 
 def set_sim_choice(choice):
@@ -997,6 +1080,36 @@ def set_roaming_enabled(iccid, enabled):
     cur["roaming"] = enabled
     run(["ubus", "call", "cellular.sim", "set_config",
          json.dumps({"iccid": iccid, "data": cur})])
+
+
+# Apply-then-verify for the three SIM toggles. Each setter only *asks*
+# for a change; these poll the real state until it matches (or time out)
+# so the toggle the user comes back to shows what the modem is actually
+# doing, not what was tapped. Registration after leaving airplane mode is
+# a full network search + attach, hence the long attach timeout.
+SIM_VERIFY_POLL = 1.0
+SIM_ATTACH_TIMEOUT = 40.0
+SIM_DETACH_TIMEOUT = 15.0
+SIM_DATA_TIMEOUT = 30.0
+SIM_ROAM_TIMEOUT = 8.0
+# Once the data session reaches the wanted state it has to STAY there
+# this long: this router's multi-WAN manager can silently undo a manual
+# cellular change a moment after it lands (see has_competing_wan).
+SIM_DATA_SETTLE = 2.0
+
+
+def _wait_until(check, timeout, poll=SIM_VERIFY_POLL):
+    deadline = time.time() + timeout
+    while time.time() < deadline and not _stop:
+        if check():
+            return True
+        time.sleep(poll)
+    return check()
+
+
+def apply_roaming(iccid, want):
+    set_roaming_enabled(iccid, want)
+    return _wait_until(lambda: get_roaming_config(iccid) == want, SIM_ROAM_TIMEOUT, poll=0.5)
 
 
 # ---------- repeater (station/WiFi-extender mode) ----------
@@ -1274,21 +1387,115 @@ def has_competing_wan():
     return bool(iface) and not ("rmnet" in iface or "modem" in iface)
 
 
+# Per-carrier network_type codes in `cellular.network cell_info`. The
+# stock web UI (gl-sdk4-ui-cellular-detail, firmware 4.10.0) maps the
+# top-level code with two tables that disagree on 5 vs 51 (NSA vs SA), so
+# NSA/SA is decided here from the carrier mix instead: an NR carrier
+# alongside an LTE anchor is NSA (EN-DC), NR on its own is SA. Confirmed
+# live: code 51 arrived with an LTE B3 anchor + three LTE SCCs + n78.
+_CELL_NR_TYPES = {5, 51}
+_CELL_LTE_TYPES = {4, 41}
+_CELL_INVALID = -32768
+
+
+def _cell_int(v):
+    try:
+        v = int(v)
+    except (TypeError, ValueError):
+        return None
+    return None if v == _CELL_INVALID else v
+
+
+def _parse_cell_signal(raw):
+    """Normalises firmware 4.10's `cellular.network cell_info` reply --
+    a `signal` list with one entry per aggregated carrier, `ca` 0 being
+    the primary -- into the dict shape the rest of this file reads:
+    `mode` (non-empty only while registered), primary `rsrp`/`strength`,
+    and `carriers` for the band/CA display."""
+    carriers = []
+    for s in sorted(raw.get("signal") or [], key=lambda s: _cell_int(s.get("ca")) or 0):
+        band = _cell_int(s.get("band"))
+        if band is None:
+            continue
+        ntype = _cell_int(s.get("network_type"))
+        nr = ntype in _CELL_NR_TYPES
+        try:
+            mhz = float(s.get("bandwidth"))
+        except (TypeError, ValueError):
+            mhz = None
+        carriers.append({
+            "band": f"n{band}" if nr else f"B{band}",
+            "nr": nr,
+            "lte": ntype in _CELL_LTE_TYPES,
+            "mhz": mhz if mhz and mhz > 0 else None,
+            "rsrp": _cell_int(s.get("rsrp")),
+            "strength": _cell_int(s.get("strength")),
+        })
+    if not carriers:
+        return {}
+    n_nr = sum(1 for c in carriers if c["nr"])
+    n_lte = sum(1 for c in carriers if c["lte"])
+    if n_nr and n_lte:
+        mode = "NR5G-NSA"
+    elif n_nr:
+        mode = "NR5G-SA"
+    elif n_lte:
+        mode = "LTE"
+    else:
+        mode = {1: "GSM", 2: "WCDMA", 3: "WCDMA"}.get(_cell_int(raw.get("network_type")), "Cellular")
+    primary = carriers[0]
+    return {"mode": mode, "rsrp": primary["rsrp"], "strength": primary["strength"],
+            "carriers": carriers}
+
+
 def _get_active_cell_info():
-    """cell_info dict (mode/rsrp/etc) for the currently-active SIM slot, or
-    {} if unavailable. Shared by get_wan_conn_type/get_cell_signal so they
-    don't each make their own redundant ubus round trip."""
+    """cell_info dict (mode/rsrp/strength/carriers) for the currently-active
+    SIM slot, or {} when not registered. Shared by get_wan_conn_type/
+    get_cell_signal/get_sim_status so they don't each make their own
+    redundant ubus round trip.
+
+    Firmware 4.10.0 moved this out of `cellular.network info` (whose
+    networks[] no longer carry a cell_info at all -- confirmed live) into
+    its own `cellular.network cell_info` method. Reading only the old
+    location left `mode` permanently empty on 4.10: no header signal bars,
+    a WAN label stuck at "Cellular", and the Net toggle always drawn off.
+    The old location is still tried as a fallback for 4.8.x."""
     modem = ubus_call("cellular.modem", "status", {"bus": "cpu"})
     try:
         slot = int(modem.get("current_sim_slot", 1))
     except (TypeError, ValueError):
         slot = 1
+    raw = ubus_call("cellular.network", "cell_info", {"bus": "cpu", "slot": slot})
+    if "signal" in raw:
+        return _parse_cell_signal(raw)
     net = ubus_call("cellular.network", "info", {"bus": "cpu", "slot": slot})
     for n in net.get("networks", []):
         cell = n.get("cell_info") or {}
         if cell.get("mode"):
             return cell
     return {}
+
+
+def cell_network_label(cell):
+    """(headline, detail) for the SIM page's network-type readout, e.g.
+    ("5G", "NSA"), ("4G+", "LTE-A"), ("4G", "LTE") -- the same 4G / 4G+ /
+    5G vocabulary a phone status bar uses. None when not registered."""
+    mode = (cell or {}).get("mode", "")
+    if not mode:
+        return None
+    mode_u = mode.upper()
+    carriers = cell.get("carriers") or []
+    if "NR" in mode_u:
+        return "5G", "SA" if "SA" in mode_u and "NSA" not in mode_u else "NSA"
+    if "LTE" in mode_u:
+        if sum(1 for c in carriers if c.get("lte")) > 1:
+            return "4G+", "LTE-A"
+        return "4G", "LTE"
+    if "WCDMA" in mode_u or "UMTS" in mode_u:
+        return "3G", "WCDMA"
+    if "GSM" in mode_u:
+        return "2G", "GSM"
+    return "4G", mode
 
 
 def get_wan_conn_type(cell_info=None):
@@ -1307,27 +1514,30 @@ def get_wan_conn_type(cell_info=None):
     if iface.startswith("eth"):
         return "Ethernet"
     if "rmnet" in iface or "modem" in iface:
-        mode_u = (cell_info or _get_active_cell_info()).get("mode", "").upper()
-        if "NR" in mode_u:
-            return "5G"
-        if mode_u:
-            return "4G"
-        return "Cellular"
+        label = cell_network_label(cell_info if cell_info is not None else _get_active_cell_info())
+        return label[0] if label else "Cellular"
     return None
 
 
 def get_cell_signal(cell_info=None):
-    """(bars 0-4, "4G"/"5G") for the active SIM's current cellular signal,
-    derived from RSRP (dBm); None if not registered/no signal at all --
+    """(bars 0-4, "4G"/"4G+"/"5G") for the active SIM's current cellular
+    signal -- the modem's own level where it reports one, else derived
+    from RSRP (dBm); None if not registered/no signal at all --
     matches ordinary phone status-bar behavior of hiding the cellular
     indicator entirely when there's nothing to show. Independent of
     whether cellular is actually the active WAN (get_wan_conn_type) --
     this reflects the modem's own registration/signal, the same way a
     phone shows signal bars regardless of whether you're on WiFi."""
     cell = cell_info if cell_info is not None else _get_active_cell_info()
-    mode = cell.get("mode", "")
-    if not mode:
+    label = cell_network_label(cell)
+    if not label:
         return None
+    rat = label[0]
+    # The modem's own 0-4 level (4.10's cell_info) is what the stock UI
+    # draws, so prefer it over re-deriving bars from RSRP here.
+    strength = cell.get("strength")
+    if isinstance(strength, int) and 0 <= strength <= 4:
+        return strength, rat
     try:
         rsrp = int(cell.get("rsrp"))
     except (TypeError, ValueError):
@@ -1342,7 +1552,6 @@ def get_cell_signal(cell_info=None):
         bars = 1
     else:
         bars = 0
-    rat = "5G" if "NR" in mode.upper() else "4G"
     return bars, rat
 
 
@@ -1451,6 +1660,197 @@ def get_temp_c():
             return int(f.read().strip()) / 1000
     except Exception:
         return None
+
+
+# ---------- speed test ----------
+
+# Cloudflare's speed-test endpoints (the ones speed.cloudflare.com itself
+# uses): __down streams N bytes, __up accepts a POST body and discards it
+# -- chunked uploads included, confirmed from this router with curl -T -.
+SPEEDTEST_DOWN_URL = "https://speed.cloudflare.com/__down?bytes={}"
+SPEEDTEST_UP_URL = "https://speed.cloudflare.com/__up"
+SPEEDTEST_STREAMS = 4           # parallel connections per direction
+SPEEDTEST_PHASE_S = 6.0         # length of each of download / upload
+SPEEDTEST_RAMP_S = 1.0          # excluded from the result: TCP slow start
+SPEEDTEST_DOWN_CAP = 250 * 10**6   # hard stop, bytes -- this is mobile data
+SPEEDTEST_UP_CAP = 80 * 10**6
+SPEEDTEST_CHUNK = 256 * 1024
+
+
+class SpeedTest:
+    """Download then upload over SPEEDTEST_STREAMS parallel curl processes,
+    run on its own thread so the screen keeps animating.
+
+    Throughput is counted from the bytes these streams themselves move
+    (piped through this process), NOT from the WAN interface's counters:
+    those include every LAN client's traffic too -- measured live, a 5 MB
+    test download moved the rmnet_data0 counter by 6.5 MB. curl does the
+    TLS; Python only counts and discards, so it's never the bottleneck.
+
+    The result is the average over the phase minus its first
+    SPEEDTEST_RAMP_S. For upload the count is of bytes handed to curl, so
+    pipe/socket buffering makes it run ahead at the start -- the same
+    ramp cut is what keeps that out of the number."""
+
+    def __init__(self):
+        self.lock = threading.Lock()
+        self._cancel = threading.Event()
+        self._thread = None
+        self._reset()
+
+    def _reset(self):
+        self.phase = "idle"         # idle | download | upload | done | error | cancelled
+        self.live_mbps = 0.0
+        self.progress = 0.0         # 0..1 through the current phase
+        self.down_mbps = None
+        self.up_mbps = None
+        self.bytes_used = 0
+        self.error = None
+        self.via = None
+
+    @property
+    def running(self):
+        return self._thread is not None and self._thread.is_alive()
+
+    def start(self):
+        if self.running:
+            return
+        with self.lock:
+            self._reset()
+            self.phase = "download"
+            self.via = get_wan_conn_type() or get_wan_iface()
+        self._cancel.clear()
+        self._thread = threading.Thread(target=self._run, daemon=True)
+        self._thread.start()
+
+    def cancel(self):
+        if self.running:
+            self._cancel.set()
+
+    def snapshot(self):
+        with self.lock:
+            return {"phase": self.phase, "live": self.live_mbps, "progress": self.progress,
+                    "down": self.down_mbps, "up": self.up_mbps, "bytes": self.bytes_used,
+                    "error": self.error, "via": self.via}
+
+    def _run(self):
+        try:
+            down = self._phase("download")
+            with self.lock:
+                self.down_mbps = down
+            if self._cancel.is_set() or _stop:
+                raise _SpeedTestCancelled()
+            with self.lock:
+                self.phase, self.live_mbps, self.progress = "upload", 0.0, 0.0
+            up = self._phase("upload")
+            with self.lock:
+                self.up_mbps = up
+                self.phase, self.live_mbps = "done", 0.0
+        except _SpeedTestCancelled:
+            with self.lock:
+                self.phase, self.live_mbps = "cancelled", 0.0
+        except Exception as e:
+            with self.lock:
+                self.phase, self.live_mbps, self.error = "error", 0.0, str(e) or "Test failed"
+
+    def _phase(self, kind):
+        download = kind == "download"
+        cap = SPEEDTEST_DOWN_CAP if download else SPEEDTEST_UP_CAP
+        count = [0]
+        count_lock = threading.Lock()
+        stop = threading.Event()
+        procs = []
+
+        def add(n):
+            with count_lock:
+                count[0] += n
+
+        def reader(p):
+            try:
+                while not stop.is_set():
+                    chunk = p.stdout.read(SPEEDTEST_CHUNK)
+                    if not chunk:
+                        break
+                    add(len(chunk))
+            except Exception:
+                pass
+
+        payload = os.urandom(SPEEDTEST_CHUNK)   # incompressible
+
+        def writer(p):
+            try:
+                while not stop.is_set():
+                    add(p.stdin.write(payload) or 0)   # raw pipe: may be partial
+            except Exception:
+                pass                             # curl killed / pipe closed
+
+        max_time = str(int(SPEEDTEST_PHASE_S + 6))
+        per_stream = cap // SPEEDTEST_STREAMS + 1
+        for _ in range(SPEEDTEST_STREAMS):
+            if download:
+                cmd = ["curl", "-s", "--max-time", max_time, "-o", "-",
+                       SPEEDTEST_DOWN_URL.format(per_stream)]
+                p = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, bufsize=0)
+                target = reader
+            else:
+                cmd = ["curl", "-s", "--max-time", max_time, "-o", "/dev/null", "-X", "POST",
+                       "-T", "-", "-H", "Content-Type: application/octet-stream", SPEEDTEST_UP_URL]
+                p = subprocess.Popen(cmd, stdin=subprocess.PIPE, stdout=subprocess.DEVNULL,
+                                     stderr=subprocess.DEVNULL, bufsize=0)
+                target = writer
+            procs.append(p)
+            threading.Thread(target=target, args=(p,), daemon=True).start()
+
+        t0 = time.time()
+        samples = [(t0, 0)]
+        ramp = None
+        try:
+            while True:
+                time.sleep(0.2)
+                now = time.time()
+                with count_lock:
+                    total = count[0]
+                samples.append((now, total))
+                elapsed = now - t0
+                if ramp is None and elapsed >= SPEEDTEST_RAMP_S:
+                    ramp = (now, total)
+                # live figure: rate over roughly the last second
+                past = next((s for s in samples if s[0] >= now - 1.0), samples[0])
+                live = (total - past[1]) * 8 / max(0.05, now - past[0]) / 1e6
+                with self.lock:
+                    self.live_mbps = live
+                    self.progress = min(1.0, elapsed / SPEEDTEST_PHASE_S)
+                if (elapsed >= SPEEDTEST_PHASE_S or total >= cap or self._cancel.is_set() or _stop
+                        or all(p.poll() is not None for p in procs)):
+                    break
+        finally:
+            stop.set()
+            for p in procs:
+                try:
+                    p.kill()
+                except Exception:
+                    pass
+            for p in procs:
+                try:
+                    p.wait(timeout=2)
+                except Exception:
+                    pass
+            with count_lock:
+                total = count[0]
+            with self.lock:
+                self.bytes_used += total
+
+        if self._cancel.is_set() or _stop:
+            raise _SpeedTestCancelled()
+        end_t, end_b = samples[-1]
+        if end_b == 0:
+            raise RuntimeError("No connection to the test server")
+        start_t, start_b = ramp if ramp and end_t - ramp[0] >= 0.5 else samples[0]
+        return (end_b - start_b) * 8 / max(0.05, end_t - start_t) / 1e6
+
+
+class _SpeedTestCancelled(Exception):
+    pass
 
 
 def openclash_installed():
@@ -1928,12 +2328,46 @@ def draw_digital_clock(d, cx, cy, dt, accent):
     centered_text(d, cx, cy + 14, dt.strftime(":%S"), f_sec, accent)
 
 
+def _draw_aa(d, x0, y0, w, h, color, draw_fn, scale=4):
+    """Anti-aliased shapes: draw_fn(mask_draw, scale) paints white onto a
+    `scale`x supersampled mask covering (x0, y0, w, h), which is then
+    downsampled and used to paste `color`. PIL's own arcs/ellipses are
+    aliased, which at icon sizes turns thin parallel strokes into one
+    stair-stepped blob."""
+    x0, y0 = int(round(x0)), int(round(y0))
+    mask = Image.new("L", (w * scale, h * scale), 0)
+    draw_fn(ImageDraw.Draw(mask), scale)
+    mask = mask.resize((w, h), Image.LANCZOS)
+    d._image.paste(color, (x0, y0, x0 + w, y0 + h), mask)
+
+
 def _icon_wifi_signal(d, cx, cy, r, color):
-    d.ellipse([cx - 2, cy + r * 0.55 - 2, cx + 2, cy + r * 0.55 + 2], fill=color)
-    for frac in (0.45, 0.72, 1.0):
-        rr = r * frac
-        bbox = [cx - rr, cy - rr * 0.4, cx + rr, cy + rr * 1.6]
-        d.arc(bbox, start=222, end=318, fill=color, width=3)
+    """Dot plus three arcs, all concentric on the dot. The old version
+    gave each arc its own bbox-derived centre and only ~2px between 3px
+    strokes, so the arcs drifted into each other and read as one smear."""
+    px, py = cx, cy + r * 0.62          # the dot; every arc is centred here
+    stroke = max(2.6, r * 0.15)
+    radii = (r * 0.42, r * 0.71, r * 1.0)
+    a0, a1 = 225, 315                    # 90-degree fan, pointing up
+    pad = stroke
+    x0, y0 = px - r - pad, py - r - pad
+    w, h = int(2 * (r + pad)) + 2, int(r + pad + stroke * 1.5) + 2
+
+    def paint(m, s):
+        ox, oy = (px - int(round(x0))) * s, (py - int(round(y0))) * s
+        dot = stroke * 1.05 * s
+        m.ellipse([ox - dot, oy - dot, ox + dot, oy + dot], fill=255)
+        half = stroke * s / 2
+        for rr in radii:
+            R = rr * s
+            m.arc([ox - R - half, oy - R - half, ox + R + half, oy + R + half],
+                  start=a0, end=a1, fill=255, width=int(round(stroke * s)))
+            for a in (a0, a1):          # round caps
+                ex = ox + R * math.cos(math.radians(a))
+                ey = oy + R * math.sin(math.radians(a))
+                m.ellipse([ex - half, ey - half, ex + half, ey + half], fill=255)
+
+    _draw_aa(d, x0, y0, w, h, color, paint)
 
 
 def _icon_settings_gear(d, cx, cy, r, color):
@@ -2023,7 +2457,9 @@ def run_with_spinner(base_img, label, fn, accent=None, min_visible=0.4, fps=30):
     pulls were -- the user is waiting on the result -- so instead of
     freezing on a still frame they now get a live spinner over the screen
     they tapped from. min_visible stops a fast action from flashing the
-    overlay for two frames."""
+    overlay for two frames. `label` may be a zero-arg callable, re-read
+    every frame, for actions whose caption should change as they go
+    (e.g. "Applying…" -> "Verifying… 12s")."""
     box = {}
 
     def worker():
@@ -2040,7 +2476,8 @@ def run_with_spinner(base_img, label, fn, accent=None, min_visible=0.4, fps=30):
         elapsed = time.time() - t0
         if not th.is_alive() and elapsed >= min_visible:
             break
-        write_frame(draw_loading_overlay(base_img, label, elapsed * SPINNER_SPEED_DPS, accent))
+        text = label() if callable(label) else label
+        write_frame(draw_loading_overlay(base_img, text, elapsed * SPINNER_SPEED_DPS, accent))
         time.sleep(interval)
     # Anything tapped while the overlay was up was aimed at the busy
     # screen, not at whatever comes next -- drop it rather than letting it
@@ -2090,30 +2527,90 @@ def draw_signal_bars(d, x0, y_base, bars, color, dim_color, bar_w=3, gap=2, max_
         d.rectangle([bx0, y_base - bh, bx0 + bar_w, y_base], fill=fill)
 
 
+def _draw_battery_icon(d, x1, y0, pct, color, low_color):
+    """Phone-style battery, 20x10 body + nub, right edge at x1, filled
+    in proportion to pct."""
+    bx0, bx1, by1 = x1 - 22, x1 - 2, y0 + 10
+    d.rectangle([bx0, y0, bx1, by1], outline=color, width=1)
+    d.rectangle([bx1 + 1, y0 + 3, x1, by1 - 3], fill=color)
+    inner_w = (bx1 - 2) - (bx0 + 2)
+    fill_w = round(inner_w * pct / 100)
+    if fill_w > 0:
+        d.rectangle([bx0 + 2, y0 + 2, bx0 + 2 + fill_w, by1 - 2],
+                    fill=low_color if pct <= 15 else color)
+
+
+def _draw_bolt(d, x0, y0, color):
+    d.polygon([(x0 + 3.5, y0), (x0, y0 + 6.2), (x0 + 2.8, y0 + 6.2), (x0 + 2, y0 + 11),
+               (x0 + 6, y0 + 4.6), (x0 + 3.2, y0 + 4.6)], fill=color)
+
+
 def draw_header(d, label, accent, conn_type=None, cell_signal=None):
     d.rectangle([0, 0, W, 34], fill=accent)
-    d.text((14, 8), label, font=font("default_bold", 18), fill=BG)
+    f_title = font("default_bold", 18)
+    d.text((14, 8), label, font=f_title, fill=BG)
+
+    # Status items, right to left: battery | WAN type | cellular tech +
+    # bars. Measured up front against the room the title leaves, and the
+    # least important dropped first until they fit -- the % text, then
+    # the tech label beside the bars, then the bars. "OPENCLASH" +
+    # "Repeater" + "5G" + bars + battery genuinely does not fit in 240px.
+    f_pct = font("default_medium", 12)
+    f_conn = font("default_medium", 12)
+    f_rat = font("default_medium", 11)
+    bars_w = 4 * 3 + 3 * 2
+    battery = get_battery()
+    pct_txt = f"{battery[0]}%" if battery else None
+    rat = cell_signal[1] if cell_signal and cell_signal[1] != conn_type else None
+    show = {"pct": bool(battery), "rat": bool(rat), "bars": bool(cell_signal)}
+
+    def needed():
+        parts = []                       # (width, gap to the next item left)
+        if battery:
+            w = 22 + (9 if battery[1] else 0)
+            if show["pct"]:
+                w += 3 + d.textlength(pct_txt, font=f_pct)
+            parts.append((w, 9))
+        if conn_type:
+            parts.append((d.textlength(conn_type, font=f_conn), 8))
+        if show["rat"]:
+            parts.append((d.textlength(rat, font=f_rat), 4))
+        if show["bars"]:
+            parts.append((bars_w, 0))
+        return sum(w + g for w, g in parts) - (parts[-1][1] if parts else 0)
+
+    room = (W - 14) - (14 + d.textlength(label, font=f_title) + 8)
+    for item in ("pct", "rat", "bars"):
+        if needed() <= room:
+            break
+        show[item] = False
 
     right_x = W - 14
+    if battery:
+        pct, plugged = battery
+        _draw_battery_icon(d, right_x, 12, pct, BG, (190, 30, 30))
+        right_x -= 22 + 3
+        if plugged:
+            _draw_bolt(d, right_x - 6, 11.5, BG)
+            right_x -= 9
+        if show["pct"]:
+            tw = d.textlength(pct_txt, font=f_pct)
+            d.text((right_x - tw, 10), pct_txt, font=f_pct, fill=BG)
+            right_x -= tw + 4
+        right_x -= 6
+
     if conn_type:
-        f = font("default_medium", 12)
-        bbox = d.textbbox((0, 0), conn_type, font=f)
-        tw = bbox[2] - bbox[0]
-        d.text((right_x - tw, 10), conn_type, font=f, fill=BG)
+        tw = d.textlength(conn_type, font=f_conn)
+        d.text((right_x - tw, 10), conn_type, font=f_conn, fill=BG)
         right_x -= tw + 8
 
-    if cell_signal:
-        bars, rat = cell_signal
-        if conn_type != rat:
-            f2 = font("default_medium", 11)
-            bbox2 = d.textbbox((0, 0), rat, font=f2)
-            tw2 = bbox2[2] - bbox2[0]
-            d.text((right_x - tw2, 11), rat, font=f2, fill=BG)
-            right_x -= tw2 + 4
-        bars_w = 4 * 3 + 3 * 2
+    if show["rat"]:
+        tw2 = d.textlength(rat, font=f_rat)
+        d.text((right_x - tw2, 11), rat, font=f_rat, fill=BG)
+        right_x -= tw2 + 4
+    if show["bars"]:
         dim = _mix(BG, accent, 0.55)
-        draw_signal_bars(d, right_x - bars_w, 23, bars, BG, dim)
-        right_x -= bars_w + 6
+        draw_signal_bars(d, right_x - bars_w, 23, cell_signal[0], BG, dim)
 
 
 def draw_back_header(d, label, accent):
@@ -2177,16 +2674,23 @@ def truncate_to_width(d, text, f, max_w):
 
 
 def wrap_text_to_lines(d, text, f, max_w):
-    """Character-by-character wrap (not word-split) so it works for both
-    space-separated scripts and CJK, which has no spaces between words."""
+    """Character-by-character wrap so it works for CJK, which has no
+    spaces between words -- but when the line being broken does contain a
+    space, the break moves back to it, so English text wraps between
+    words instead of mid-word ("rou / ter")."""
     lines = []
     for paragraph in text.split("\n"):
         line = ""
         for ch in paragraph:
             candidate = line + ch
             if line and d.textbbox((0, 0), candidate, font=f)[2] > max_w:
-                lines.append(line)
-                line = ch
+                cut = line.rfind(" ")
+                if ch != " " and cut > 0:
+                    lines.append(line[:cut])
+                    line = line[cut + 1:] + ch
+                else:
+                    lines.append(line.rstrip())
+                    line = "" if ch == " " else ch
             else:
                 line = candidate
         lines.append(line)
@@ -2255,13 +2759,20 @@ FX_STATUS_Y = 252
 FX_BUTTON = (50, 268, 190, 288)
 
 SIM_CHOICE_RECT = (16, 86, 156, 110)
-SIM_ROAM_TOGGLE_RECT = (172, 86, 216, 110)
-# Network (attach) and Data toggles sit side by side to the right of the
-# country name, shifted toward center rather than hugging the panel edge,
-# and sized to match Roam (44x24) so all three toggles feel equally easy
-# to tap.
+# Network (attach) toggle sits to the right of the country name.
 SIM_ATTACH_TOGGLE_RECT = (108, 57, 152, 81)
-SIM_DATA_TOGGLE_RECT = (158, 57, 202, 81)
+# Live cellular status card (network type, signal, carrier) in the top
+# right corner, and the band / carrier-aggregation row under the SIM
+# switch.
+SIM_SIGNAL_CARD = (158, 40, W - 8, 112)
+SIM_BANDS_Y = 115
+SIM_BAND_CHIP_H = 18
+# Data session and roaming toggles, to the right of the "Data used"
+# figure -- both are about how this SIM's data behaves, so they sit with
+# the usage readout rather than up with network registration.
+SIM_DATA_TOGGLE_RECT = (136, 178, 176, 200)
+SIM_ROAM_TOGGLE_RECT = (184, 178, 224, 200)
+SIM_TOGGLE_LABEL_Y = 164
 
 OC_TOGGLE_RECT = (172, 38, 218, 60)
 OC_MODE_SEG_RECT = (16, 100, 224, 128)
@@ -2386,37 +2897,145 @@ SIM_CHOICE_KEYS = ["sim1", "esim"]
 SIM_WIREGUARD_TILE = (16, 248, W - 16, 286)
 
 
-def panel_sim(cfg, sim, conn_type=None, cell_signal=None, wg_peers=None, wg_active=None):
+_NR_CHIP = ACCENT["clock"]
+
+
+def _draw_signal_card(d, cell, carrier):
+    """Top-right status card: network type (4G / 4G+ / 5G NSA), signal
+    bars + primary-carrier RSRP, and the serving carrier's name."""
+    x0, y0, x1, y1 = SIM_SIGNAL_CARD
+    d.rounded_rectangle([x0, y0, x1, y1], radius=10, fill=(22, 28, 40), outline=(42, 48, 60), width=1)
+    ix0, ix1 = x0 + 7, x1 - 7
+    label = cell_network_label(cell)
+    if not label:
+        centered_text(d, (x0 + x1) / 2, y0 + 20, "No", font("default_bold", 14), DIM)
+        centered_text(d, (x0 + x1) / 2, y0 + 38, "service", font("default_bold", 14), DIM)
+        return
+    head, detail = label
+    f_head = font("default_bold", 20)
+    d.text((ix0, y0 + 3), head, font=f_head, fill=FG)
+    if head == "5G":
+        hw = d.textlength(head, font=f_head)
+        d.text((ix0 + hw + 3, y0 + 11), detail, font=font("default_bold", 10), fill=_NR_CHIP)
+
+    sig = get_cell_signal(cell)
+    bars = sig[0] if sig else 0
+    draw_signal_bars(d, ix0, y0 + 46, bars, ACCENT["sim"], (60, 65, 80), bar_w=4, gap=2, max_h=14)
+    rsrp = cell.get("rsrp")
+    if isinstance(rsrp, int):
+        f_rsrp = font("default_medium", 10)
+        txt = f"{rsrp}dBm"
+        d.text((ix1 - d.textlength(txt, font=f_rsrp), y0 + 35), txt, font=f_rsrp, fill=DIM)
+
+    name = carrier or "—"
+    f_car = font("default_bold", 13)
+    if d.textlength(name, font=f_car) > ix1 - ix0:
+        f_car = font("default_bold", 10)
+    name = truncate_to_width(d, name, f_car, ix1 - ix0)
+    d.text((ix0, y0 + 52), name, font=f_car, fill=FG if carrier else DIM)
+
+
+def _draw_band_row(d, cell):
+    """Chips for every aggregated carrier (primary filled, secondaries
+    outlined, NR in blue) plus a one-line CA summary under them."""
+    y = SIM_BANDS_Y
+    carriers = (cell or {}).get("carriers") or []
+    f_cap = font("default_medium", 11)
+    if not carriers:
+        d.text((16, y + 2), "No band info", font=font("default_medium", 13), fill=DIM)
+        return
+    f_chip = font("default_bold", 11)
+    x, x_max, h, gap = 16, W - 16, SIM_BAND_CHIP_H, 4
+    widths = [d.textlength(c["band"], font=f_chip) + 12 for c in carriers]
+
+    def more_w(n_hidden):
+        return d.textlength(f"+{n_hidden}", font=f_chip) + 12
+
+    # As many chips as fit, keeping room for a "+N" chip for the rest.
+    shown = len(carriers)
+    while shown > 1:
+        need = sum(widths[:shown]) + gap * (shown - 1)
+        if shown < len(carriers):
+            need += gap + more_w(len(carriers) - shown)
+        if x + need <= x_max:
+            break
+        shown -= 1
+
+    for i, c in enumerate(carriers[:shown]):
+        w = widths[i]
+        color = _NR_CHIP if c["nr"] else ACCENT["sim"]
+        if i == 0:
+            d.rounded_rectangle([x, y, x + w, y + h], radius=h / 2, fill=color)
+            centered_text_box(d, x, y, x + w, y + h, c["band"], f_chip, BG)
+        else:
+            d.rounded_rectangle([x, y, x + w, y + h], radius=h / 2, outline=color, width=1)
+            centered_text_box(d, x, y, x + w, y + h, c["band"], f_chip, color)
+        x += w + gap
+    if shown < len(carriers):
+        w = more_w(len(carriers) - shown)
+        d.rounded_rectangle([x, y, x + w, y + h], radius=h / 2, outline=DIM, width=1)
+        centered_text_box(d, x, y, x + w, y + h, f"+{len(carriers) - shown}", f_chip, DIM)
+
+    total = sum(c["mhz"] for c in carriers if c["mhz"])
+    mhz = f" · {total:g} MHz" if total else ""
+    if len(carriers) > 1:
+        cap = f"Carrier aggregation · {len(carriers)} bands{mhz}"
+    else:
+        cap = f"No carrier aggregation{mhz}"
+    d.text((16, y + h + 3), truncate_to_width(d, cap, f_cap, W - 32), font=f_cap, fill=DIM)
+
+
+def format_data_used(mb):
+    if mb is None:
+        return "n/a"
+    if mb >= 1024:
+        return f"{mb / 1024:.2f} GB"
+    return f"{mb:.1f} MB"
+
+
+def panel_sim(cfg, sim, conn_type=None, cell_signal=None, wg_peers=None, wg_active=None, cell=None):
     img, d = new_canvas()
     draw_header(d, "ACTIVE SIM", ACCENT["sim"], conn_type, cell_signal)
     country = sim["country"] or "unknown"
-    d.text((16, 44), f"Slot {sim['slot']}", font=font("default_medium", 14), fill=DIM)
-    draw_flag(d, 16, 60, 26, 18, country)
-    d.text((50, 57), country, font=font("default_bold", 20), fill=FG)
-
     ax0, ay0, ax1, ay1 = SIM_ATTACH_TOGGLE_RECT
+
+    # Phone number (or the slot, for an eSIM with no number) on the top
+    # line -- the SIM1/eSIM switch below already says which slot is live.
+    top_line = sim["phone"] or f"Slot {sim['slot']}"
+    top_w = ax0 - 4 - 16
+    f_phone = font("default_mono_medium", 12)
+    if d.textlength(top_line, font=f_phone) > top_w:
+        f_phone = font("default_mono_medium", 10)
+    d.text((16, 44), truncate_to_width(d, top_line, f_phone, top_w), font=f_phone, fill=DIM)
+    draw_flag(d, 16, 60, 26, 18, country)
+    f_country = font("default_bold", 20)
+    if d.textlength(country, font=f_country) > ax0 - 54:
+        f_country = font("default_bold", 15)
+    d.text((50, 57 if f_country.size == 20 else 60),
+           truncate_to_width(d, country, f_country, ax0 - 54), font=f_country, fill=FG)
+
     centered_text(d, (ax0 + ax1) / 2, 44, "Net", font("default_medium", 10), DIM)
     draw_toggle(d, ax0, ay0, sim["attached"], ACCENT["sim"], w=ax1 - ax0, h=ay1 - ay0)
-
-    dx0, dy0, dx1, dy1 = SIM_DATA_TOGGLE_RECT
-    centered_text(d, (dx0 + dx1) / 2, 44, "Data", font("default_medium", 10), DIM)
-    draw_toggle(d, dx0, dy0, sim["data_up"], ACCENT["sim"], w=dx1 - dx0, h=dy1 - dy0)
 
     cx0, cy0, cx1, cy1 = SIM_CHOICE_RECT
     sel_idx = SIM_CHOICE_KEYS.index(sim["sim_choice"])
     draw_segmented(d, cx0, cy0, cx1 - cx0, cy1 - cy0, SIM_CHOICE_LABELS, sel_idx, ACCENT["sim"], fsize=11)
 
-    tx0, ty0, tx1, ty1 = SIM_ROAM_TOGGLE_RECT
-    draw_toggle(d, tx0, ty0, sim["roaming"], ACCENT["sim"], w=tx1 - tx0, h=ty1 - ty0)
-    centered_text(d, 194, 114, "Roam", font("default_medium", 10), DIM)
-
-    d.text((16, 126), sim["phone"] or "—", font=font("default_mono_medium", 16), fill=DIM)
+    _draw_signal_card(d, cell or {}, sim.get("carrier"))
+    _draw_band_row(d, cell)
 
     d.line([16, 152, W - 16, 152], fill=DIM)
 
     d.text((16, 164), "Data used  ›", font=font("default_medium", 14), fill=DIM)
     used, cap = sim["traffic_mb"], sim["cap_mb"]
-    d.text((16, 180), f"{used:.1f} MB" if used is not None else "n/a", font=font("default_mono_medium", 20), fill=FG)
+    d.text((16, 180), format_data_used(used), font=font("default_mono_medium", 20), fill=FG)
+
+    f_lbl = font("default_medium", 10)
+    for rect, label, on in ((SIM_DATA_TOGGLE_RECT, "Data", sim["data_up"]),
+                            (SIM_ROAM_TOGGLE_RECT, "Roam", sim["roaming"])):
+        tx0, ty0, tx1, ty1 = rect
+        centered_text(d, (tx0 + tx1) / 2, SIM_TOGGLE_LABEL_Y, label, f_lbl, DIM)
+        draw_toggle(d, tx0, ty0, on, ACCENT["sim"], w=tx1 - tx0, h=ty1 - ty0)
 
     bx0, by0, bx1, by1 = 16, 206, W - 16, 222
     d.rounded_rectangle([bx0, by0, bx1, by1], radius=8, outline=DIM, width=1)
@@ -2518,11 +3137,13 @@ def panel_monitor(net_down, net_up, net_iface, cpu_pct, ram_pct, ram_used_gb, ra
     bw_label = f"Bandwidth · {net_iface}" if net_iface else "Bandwidth"
     d.text((16, 44), bw_label, font=font("default_medium", 13), fill=DIM)
     d.text((16, 62), "Down", font=font("default_medium", 12), fill=DIM)
+    # 17pt, not 19: at 19 a three-digit "↓ 212.6 Mbps" ran into the Up column.
+    f_bw = font("default_bold", 17)
     down_txt = f"↓ {net_down:.1f} Mbps" if net_down is not None else "—"
-    d.text((16, 78), down_txt, font=font("default_bold", 19), fill=FG)
+    d.text((16, 79), truncate_to_width(d, down_txt, f_bw, W / 2 - 12), font=f_bw, fill=FG)
     d.text((W / 2 + 8, 62), "Up", font=font("default_medium", 12), fill=DIM)
     up_txt = f"↑ {net_up:.1f} Mbps" if net_up is not None else "—"
-    d.text((W / 2 + 8, 78), up_txt, font=font("default_bold", 19), fill=FG)
+    d.text((W / 2 + 8, 79), truncate_to_width(d, up_txt, f_bw, W / 2 - 22), font=f_bw, fill=FG)
 
     d.line([16, 116, W - 16, 116], fill=(40, 44, 54))
 
@@ -2556,13 +3177,240 @@ def panel_monitor(net_down, net_up, net_iface, cpu_pct, ram_pct, ram_used_gb, ra
 
     d.line([16, 230, W - 16, 230], fill=(40, 44, 54))
 
+    f_row = font("default_medium", 15)
     temp_txt = f"{temp_c:.0f}°C" if temp_c is not None else "—"
-    d.text((16, 240), f"Temp     {temp_txt}", font=font("default_medium", 15), fill=FG)
+    d.text((16, 240), "Temp", font=f_row, fill=FG)
+    d.text((76, 240), temp_txt, font=f_row, fill=FG)
     up_h, up_m = divmod(uptime_min, 60)
-    d.text((16, 264), f"Uptime   {up_h}h {up_m}m", font=font("default_medium", 15), fill=FG)
+    up_txt = f"{up_h // 24}d {up_h % 24}h" if up_h >= 48 else f"{up_h}h {up_m}m"
+    d.text((16, 264), "Uptime", font=f_row, fill=FG)
+    d.text((76, 264), up_txt, font=f_row, fill=FG)
+
+    x0, y0, x1, y1 = MONITOR_SPEEDTEST_BTN
+    d.rounded_rectangle([x0, y0, x1, y1], radius=10, fill=(22, 28, 40), outline=(42, 48, 60), width=1)
+    _icon_speedometer(d, (x0 + x1) / 2, y0 + 17, 11, ACCENT["monitor"])
+    centered_text(d, (x0 + x1) / 2, y0 + 27, "Speed test", font("default_bold", 12), FG)
 
     draw_page_dots(d, 2)
     return img
+
+
+MONITOR_SPEEDTEST_BTN = (140, 238, W - 16, 284)
+
+
+def hit_main_monitor(x, y):
+    x0, y0, x1, y1 = MONITOR_SPEEDTEST_BTN
+    if x0 - 4 <= x <= x1 + 4 and y0 - 4 <= y <= y1 + 4:
+        return "speedtest"
+    return None
+
+
+def _icon_speedometer(d, cx, cy, r, color):
+    """Half-dial with a needle, anti-aliased."""
+    stroke = max(2.0, r * 0.2)
+    pad = stroke + 1
+    x0, y0 = cx - r - pad, cy - r - pad
+    w, h = int(2 * (r + pad)) + 2, int(r + 2 * pad) + 2
+
+    def paint(m, s):
+        ox, oy = (cx - int(round(x0))) * s, (cy - int(round(y0))) * s
+        R, half = r * s, stroke * s / 2
+        m.arc([ox - R - half, oy - R - half, ox + R + half, oy + R + half],
+              start=180, end=360, fill=255, width=int(round(stroke * s)))
+        for a in (180, 360):
+            ex, ey = ox + R * math.cos(math.radians(a)), oy + R * math.sin(math.radians(a))
+            m.ellipse([ex - half, ey - half, ex + half, ey + half], fill=255)
+        na = math.radians(305)
+        m.line([ox, oy, ox + R * 0.8 * math.cos(na), oy + R * 0.8 * math.sin(na)],
+               fill=255, width=int(round(stroke * s)))
+        hub = stroke * 0.9 * s
+        m.ellipse([ox - hub, oy - hub, ox + hub, oy + hub], fill=255)
+
+    _draw_aa(d, x0, y0, w, h, color, paint)
+
+
+# ---------- speed test screen ----------
+
+SPEEDTEST_GAUGE_C = (W // 2, 128)
+SPEEDTEST_GAUGE_R = 70
+SPEEDTEST_GAUGE_STROKE = 10
+SPEEDTEST_GAUGE_START = 150          # PIL degrees (clockwise from 3 o'clock)
+SPEEDTEST_GAUGE_SWEEP = 240
+# Gauge scale: evenly spaced stops rather than linear, so 5 Mbps and
+# 500 Mbps are both readable on the same dial.
+SPEEDTEST_SCALE = [0, 5, 10, 25, 50, 100, 250, 500, 1000]
+SPEEDTEST_SCALE_LABELS = [0, 10, 50, 250, 1000]
+SPEEDTEST_DOWN_COLOR = ACCENT["clock"]
+SPEEDTEST_UP_COLOR = ACCENT["sim"]
+SPEEDTEST_DOWN_CARD = (16, 196, 116, 244)
+SPEEDTEST_UP_CARD = (124, 196, W - 16, 244)
+SPEEDTEST_BUTTON = (40, 256, W - 40, 288)
+
+
+def _speed_frac(mbps):
+    """0..1 along the gauge for a speed, piecewise-linear between stops."""
+    if mbps is None or mbps <= 0:
+        return 0.0
+    stops = SPEEDTEST_SCALE
+    if mbps >= stops[-1]:
+        return 1.0
+    for i in range(1, len(stops)):
+        if mbps <= stops[i]:
+            seg = (mbps - stops[i - 1]) / (stops[i] - stops[i - 1])
+            return (i - 1 + seg) / (len(stops) - 1)
+    return 1.0
+
+
+def format_mbps(mbps):
+    if mbps is None:
+        return "—"
+    return f"{mbps:.1f}" if mbps < 100 else f"{mbps:.0f}"
+
+
+def _draw_speed_gauge(d, frac, color):
+    cx, cy = SPEEDTEST_GAUGE_C
+    r, stroke = SPEEDTEST_GAUGE_R, SPEEDTEST_GAUGE_STROKE
+    a0, sweep = SPEEDTEST_GAUGE_START, SPEEDTEST_GAUGE_SWEEP
+    pad = stroke
+    x0, y0 = cx - r - pad, cy - r - pad
+    size = int(2 * (r + pad)) + 2
+
+    def arc_mask(start, end):
+        def paint(m, s):
+            ox, oy = (cx - int(round(x0))) * s, (cy - int(round(y0))) * s
+            R, half = r * s, stroke * s / 2
+            m.arc([ox - R - half, oy - R - half, ox + R + half, oy + R + half],
+                  start=start, end=end, fill=255, width=int(round(stroke * s)))
+            for a in (start, end):      # round caps
+                ex, ey = ox + R * math.cos(math.radians(a)), oy + R * math.sin(math.radians(a))
+                m.ellipse([ex - half, ey - half, ex + half, ey + half], fill=255)
+        return paint
+
+    _draw_aa(d, x0, y0, size, size, (34, 40, 54), arc_mask(a0, a0 + sweep))
+    if frac > 0.004:
+        _draw_aa(d, x0, y0, size, size, color, arc_mask(a0, a0 + sweep * frac))
+
+    f_tick = font("default_medium", 9)
+    n = len(SPEEDTEST_SCALE) - 1
+    for val in SPEEDTEST_SCALE_LABELS:
+        i = SPEEDTEST_SCALE.index(val)
+        a = math.radians(a0 + sweep * i / n)
+        tr = r - stroke - 9
+        tx, ty = cx + tr * math.cos(a), cy + tr * math.sin(a)
+        txt = "1G" if val == 1000 else str(val)
+        tw = d.textlength(txt, font=f_tick)
+        d.text((tx - tw / 2, ty - 6), txt, font=f_tick, fill=DIM)
+
+
+def _draw_pill(d, x0, y0, x1, y1, fill):
+    """Fully-rounded bar of any length. Not rounded_rectangle: Pillow 9.5
+    (what this firmware ships) raises "x1 must be greater than or equal
+    to x0" when a rounded rectangle is about as short as its corner
+    diameter -- which a progress bar always is right as it starts. That
+    exception took the whole dashboard down the moment a speed test
+    began."""
+    h = y1 - y0
+    if x1 - x0 <= h:
+        d.ellipse([x0, y0, x0 + max(x1 - x0, 1), y1], fill=fill)
+        return
+    d.ellipse([x0, y0, x0 + h, y1], fill=fill)
+    d.ellipse([x1 - h, y0, x1, y1], fill=fill)
+    d.rectangle([x0 + h / 2, y0, x1 - h / 2, y1], fill=fill)
+
+
+def _draw_arrow(d, cx, cy, up, color, size=6):
+    """Solid up/down arrow -- drawn, not a glyph, so it lines up exactly."""
+    s = size
+    if up:
+        d.polygon([(cx, cy - s), (cx - s, cy), (cx - s / 2.6, cy), (cx - s / 2.6, cy + s),
+                   (cx + s / 2.6, cy + s), (cx + s / 2.6, cy), (cx + s, cy)], fill=color)
+    else:
+        d.polygon([(cx, cy + s), (cx - s, cy), (cx - s / 2.6, cy), (cx - s / 2.6, cy - s),
+                   (cx + s / 2.6, cy - s), (cx + s / 2.6, cy), (cx + s, cy)], fill=color)
+
+
+def panel_speedtest(snap, spin_phase=0.0):
+    img, d = new_canvas()
+    draw_back_header(d, "Speed test", ACCENT["monitor"])
+    phase = snap["phase"]
+    running = phase in ("download", "upload")
+    cx, cy = SPEEDTEST_GAUGE_C
+
+    if running:
+        color = SPEEDTEST_DOWN_COLOR if phase == "download" else SPEEDTEST_UP_COLOR
+        value = snap["live"]
+        caption = "Download" if phase == "download" else "Upload"
+    elif phase == "done":
+        color, value, caption = SPEEDTEST_DOWN_COLOR, snap["down"], "Download"
+    else:
+        color, value, caption = SPEEDTEST_DOWN_COLOR, None, "Ready"
+    _draw_speed_gauge(d, _speed_frac(value), color)
+
+    f_cap = font("default_medium", 12)
+    if running:
+        tw = d.textlength(caption, font=f_cap)
+        _draw_arrow(d, cx - tw / 2 - 8, cy - 22, phase == "upload", color, size=5)
+        d.text((cx - tw / 2 + 2, cy - 29), caption, font=f_cap, fill=color)
+    else:
+        centered_text(d, cx, cy - 29, caption, f_cap, DIM)
+    centered_text(d, cx, cy - 12, format_mbps(value) if value is not None else "—",
+                  font("default_bold", 30), FG)
+    centered_text(d, cx, cy + 22, "Mbps", f_cap, DIM)
+    if running:
+        # thin progress bar for the current phase, under the dial opening
+        bw = 80
+        bx0 = cx - bw / 2
+        _draw_pill(d, bx0, cy + 44, bx0 + bw, cy + 48, (34, 40, 54))
+        pw = bw * snap["progress"]
+        if pw > 0:
+            _draw_pill(d, bx0, cy + 44, bx0 + pw, cy + 48, color)
+
+    for rect, label, key, up, col in ((SPEEDTEST_DOWN_CARD, "Download", "down", False, SPEEDTEST_DOWN_COLOR),
+                                      (SPEEDTEST_UP_CARD, "Upload", "up", True, SPEEDTEST_UP_COLOR)):
+        x0, y0, x1, y1 = rect
+        active = running and phase == ("upload" if up else "download")
+        d.rounded_rectangle([x0, y0, x1, y1], radius=10, fill=(22, 28, 40),
+                            outline=col if active else (42, 48, 60), width=1)
+        _draw_arrow(d, x0 + 14, y0 + 13, up, col, size=5)
+        d.text((x0 + 24, y0 + 6), label, font=font("default_medium", 11), fill=DIM)
+        val = snap[key]
+        if val is not None:
+            txt = format_mbps(val)
+            f_val = font("default_bold", 18)
+            d.text((x0 + 10, y0 + 22), txt, font=f_val, fill=FG)
+            d.text((x0 + 14 + d.textlength(txt, font=f_val), y0 + 28), "Mbps",
+                   font=font("default_medium", 10), fill=DIM)
+        elif active:
+            draw_ring_spinner(d, x0 + 20, y0 + 33, 7, spin_phase, col, width=2)
+        else:
+            d.text((x0 + 10, y0 + 22), "—", font=font("default_bold", 18), fill=DIM)
+
+    bx0, by0, bx1, by1 = SPEEDTEST_BUTTON
+    if running:
+        d.rounded_rectangle([bx0, by0, bx1, by1], radius=8, outline=DIM, width=2)
+        centered_text_box(d, bx0, by0, bx1, by1, "Cancel", font("default_medium", 14), DIM)
+    else:
+        d.rounded_rectangle([bx0, by0, bx1, by1], radius=8, fill=ACCENT["monitor"])
+        centered_text_box(d, bx0, by0, bx1, by1, "Start" if phase == "idle" else "Run again",
+                          font("default_bold", 14), BG)
+
+    f_foot = font("default_medium", 10)
+    if phase == "error":
+        foot, fcol = snap["error"] or "Test failed", (255, 150, 150)
+    elif phase == "cancelled":
+        foot, fcol = "Cancelled", DIM
+    elif phase == "idle":
+        foot, fcol = "~12s · Cloudflare · uses up to ~330 MB", DIM
+    else:
+        via = f"via {snap['via']} · " if snap.get("via") else ""
+        foot, fcol = f"{via}{snap['bytes'] / 1e6:.0f} MB used", DIM
+    centered_text(d, W / 2, 298, truncate_to_width(d, foot, f_foot, W - 24), f_foot, fcol)
+    return img
+
+
+def hit_speedtest_button(x, y):
+    x0, y0, x1, y1 = SPEEDTEST_BUTTON
+    return x0 - 6 <= x <= x1 + 6 and y0 - 6 <= y <= y1 + 6
 
 
 def weather_day_labels(days):
@@ -4025,23 +4873,23 @@ def hit_main_fx(x, y):
 
 def hit_main_sim(x, y):
     ax0, ay0, ax1, ay1 = SIM_ATTACH_TOGGLE_RECT
-    dx0, dy0, dx1, dy1 = SIM_DATA_TOGGLE_RECT
-    # Network and Data toggles sit side by side with their labels above
-    # (y=44) -- treated as one combined tap region split at the midpoint
-    # of the gap between them, same reasoning as the earlier fix: a label
-    # separated from its toggle by a real gap needs the tap zone extended
-    # up to cover it, not just tight padding around the toggle itself.
-    if min(ax0, dx0) - 8 <= x <= max(ax1, dx1) + 8 and 39 <= y <= max(ay1, dy1) + 8:
-        mid = (ax1 + dx0) / 2
-        return "attach_toggle" if x < mid else "data_toggle"
+    # The Net label sits above its toggle (y=44) -- a label separated from
+    # its toggle by a real gap needs the tap zone extended up to cover it,
+    # not just tight padding around the toggle itself.
+    if ax0 - 8 <= x <= ax1 + 4 and 39 <= y <= ay1 + 4:
+        return "attach_toggle"
     cx0, cy0, cx1, cy1 = SIM_CHOICE_RECT
-    if cx0 - 6 <= x <= cx1 + 6 and cy0 - 6 <= y <= cy1 + 6:
+    if cx0 - 6 <= x <= cx1 and cy0 - 4 <= y <= cy1 + 4:
         seg_w = (cx1 - cx0) / len(SIM_CHOICE_KEYS)
         idx = min(len(SIM_CHOICE_KEYS) - 1, max(0, int((x - cx0) / seg_w)))
         return f"choice:{SIM_CHOICE_KEYS[idx]}"
-    tx0, ty0, tx1, ty1 = SIM_ROAM_TOGGLE_RECT
-    if tx0 - 8 <= x <= tx1 + 8 and ty0 - 8 <= y <= ty1 + 8:
-        return "roam_toggle"
+    # Data and Roam: same label-above layout, side by side -- one region
+    # split at the midpoint of the gap between them. Checked before the
+    # data-cap zone they sit inside.
+    dx0, dy0, dx1, dy1 = SIM_DATA_TOGGLE_RECT
+    rx0, ry0, rx1, ry1 = SIM_ROAM_TOGGLE_RECT
+    if dx0 - 8 <= x <= rx1 + 12 and SIM_TOGGLE_LABEL_Y - 4 <= y <= dy1 + 4:
+        return "data_toggle" if x < (dx1 + rx0) / 2 else "roam_toggle"
     wx0, wy0, wx1, wy1 = SIM_WIREGUARD_TILE
     if wx0 <= x <= wx1 and wy0 <= y <= wy1:
         return "wireguard"
@@ -4166,9 +5014,16 @@ def mode_preview(outdir):
     screens = [
         ("clock", panel_clock(cfg, rep, conn_type, cell_signal, sms_messages)),
         ("clock_digital", panel_clock(cfg_digital, rep, conn_type, cell_signal, sms_messages)),
-        ("sim", panel_sim(cfg, sim, conn_type, cell_signal, wg_peers, wg_active)),
+        ("sim", panel_sim(cfg, sim, conn_type, cell_signal, wg_peers, wg_active, _cell_info)),
+        ("sim_confirm", panel_confirm("Mobile data", "Turn mobile data off? SMS and calls still work. Internet runs over cellular right now, so the router will go offline.", ACCENT["sim"], yes_label="Turn off", danger=True)),
+        ("sim_verifying", draw_loading_overlay(panel_sim(cfg, sim, conn_type, cell_signal, wg_peers, wg_active, _cell_info), "Registering… 7s", 120, ACCENT["sim"])),
         ("weather", panel_weather(cfg, wx, conn_type, cell_signal)),
         ("monitor", panel_monitor(net_down, net_up, net_iface, cpu_pct, ram_pct, ram_used_gb, ram_total_gb, temp_c, sysinfo["uptime_min"], conn_type, cell_signal)),
+        ("speedtest", panel_speedtest(SpeedTest().snapshot())),
+        ("speedtest_running", panel_speedtest({"phase": "upload", "live": 38.4, "progress": 0.45, "down": 212.6,
+                                               "up": None, "bytes": 171e6, "error": None, "via": conn_type}, 90)),
+        ("speedtest_done", panel_speedtest({"phase": "done", "live": 0.0, "progress": 1.0, "down": 212.6,
+                                            "up": 41.3, "bytes": 205e6, "error": None, "via": conn_type})),
         ("fx", panel_fx(cfg, fx, "month", conn_type, cell_signal)),
         ("openclash", panel_openclash(oc, traf, conn_type, cell_signal)),
         ("city_top", panel_city_picker("top", cfg)),
@@ -4448,7 +5303,9 @@ def mode_live():
     # returns the right answer the moment it's called), but 30s reads as
     # broken for a status a user checks right after acting on it elsewhere.
     refresher.add("wg_active", get_wireguard_active, 5)
-    refresher.add("cell", _get_active_cell_info, 20)
+    # 5s, not 20s: signal, network type and aggregated bands are now shown
+    # live on the SIM page, and one pass is two ubus calls (~0.1s total).
+    refresher.add("cell", _get_active_cell_info, 5)
     refresher.start()
 
     # Seeded from cache/defaults so the first frame draws immediately
@@ -4456,7 +5313,7 @@ def mode_live():
     fx = fetch_fx()
     sim = {"slot": "1", "country": None, "phone": "", "traffic_mb": None,
            "cap_mb": cfg.get("data_cap_mb"), "sim_choice": "sim1", "data_up": False,
-           "iccid": None, "attached": False, "roaming": False}
+           "iccid": None, "attached": False, "roaming": False, "carrier": None}
     oc = {"installed": openclash_installed(), "enabled": False, "mode": "rule"}
     traf = openclash_traffic_empty()
     wx, aq = [], []
@@ -4471,9 +5328,19 @@ def mode_live():
     temp_c = get_temp_c()
     mon_uptime_min = get_system_info()["uptime_min"]
     last_mon_check = time.time()
-    _cell_info = _get_active_cell_info()
-    conn_type = get_wan_conn_type(_cell_info)
-    cell_signal = get_cell_signal(_cell_info)
+    cell_info = _get_active_cell_info()
+    conn_type = get_wan_conn_type(cell_info)
+    cell_signal = get_cell_signal(cell_info)
+
+    # A short-lived result message over the bottom of the main panels --
+    # used when a verified action didn't take, so the toggle snapping back
+    # to its real state comes with a reason instead of looking ignored.
+    notice = {"text": None, "until": 0.0}
+    NOTICE_SECONDS = 5.0
+
+    def show_notice(text):
+        notice["text"] = text
+        notice["until"] = time.time() + NOTICE_SECONDS
 
     def render_main(idx):
         img = _render_panel(idx)
@@ -4483,6 +5350,11 @@ def mode_live():
             d = ImageDraw.Draw(img)
             d.rectangle([0, H - 20, W, H], fill=(90, 26, 34))
             centered_text(d, W / 2, H - 17, err, font("default_medium", 11), (255, 220, 220))
+        elif notice["text"] and time.time() < notice["until"]:
+            d = ImageDraw.Draw(img)
+            f = font("default_medium", 11)
+            d.rectangle([0, H - 22, W, H], fill=(84, 62, 18))
+            centered_text(d, W / 2, H - 18, truncate_to_width(d, notice["text"], f, W - 12), f, (255, 230, 180))
         return img
 
     def _render_panel(idx):
@@ -4492,8 +5364,7 @@ def mode_live():
         elif name == "fx":
             return panel_fx(cfg, fx, fx_range, conn_type, cell_signal)
         elif name == "sim":
-            display_sim = sim if sim_connect_override is None else dict(sim, data_up=sim_connect_override)
-            return panel_sim(cfg, display_sim, conn_type, cell_signal, wg_peers, wg_active)
+            return panel_sim(cfg, sim, conn_type, cell_signal, wg_peers, wg_active, cell_info)
         elif name == "openclash":
             return panel_openclash(oc, traf, conn_type, cell_signal)
         elif name == "weather":
@@ -4601,6 +5472,49 @@ def mode_live():
                 game_state = tick_2048(game_state, game_scores, tap, swipe, sdx, sdy)
                 write_frame(draw_2048(game_state, game_scores))
                 sub_dirty = False
+
+    speedtest = SpeedTest()
+    speedtest_frame = {"t": 0.0, "last": None}
+    SPEEDTEST_FPS = 12
+
+    def handle_speedtest(now):
+        """Owns touch while the speed test screen is up. The test itself
+        runs on SpeedTest's thread; this only redraws (at SPEEDTEST_FPS
+        while running, on change otherwise) and handles Start/Cancel/back.
+        Leaving the screen cancels a running test -- nothing should keep
+        burning mobile data behind a screen that's no longer shown."""
+        nonlocal view, cur_img, last_draw, sub_dirty
+        with touch_state.lock:
+            released = touch_state.release_pending
+            down_x, down_y = touch_state.down_x, touch_state.down_y
+            have_pos = touch_state.have_pos
+            release_dx, release_dy = touch_state.release_dx, touch_state.release_dy
+            touch_state.release_pending = False
+
+        if released:
+            is_tap = have_pos and abs(release_dx) <= TAP_JITTER_PX and abs(release_dy) <= TAP_JITTER_PX
+            if (is_tap and hit_back(down_y)) or (not is_tap and release_dx > W * 0.3):
+                speedtest.cancel()
+                view = "main"
+                cur_img = render_main(panel_idx)
+                write_frame(cur_img)
+                last_draw = now
+                return
+            if is_tap and hit_speedtest_button(down_x, down_y):
+                if speedtest.running:
+                    speedtest.cancel()
+                else:
+                    speedtest.start()
+                sub_dirty = True
+
+        snap = speedtest.snapshot()
+        running = snap["phase"] in ("download", "upload")
+        due = running and now - speedtest_frame["t"] >= 1.0 / SPEEDTEST_FPS
+        if sub_dirty or due or (snap != speedtest_frame["last"] and not running):
+            write_frame(panel_speedtest(snap, now * SPINNER_SPEED_DPS))
+            speedtest_frame["t"] = now
+            speedtest_frame["last"] = snap
+            sub_dirty = False
 
     def start_repeater_scan():
         if scan_state["running"]:
@@ -4868,26 +5782,117 @@ def mode_live():
 
     confirm_title = confirm_message = confirm_yes_label = confirm_action = confirm_return_view = ""
     confirm_danger = False
+    SIM_TOGGLE_ZONES = ("attach_toggle", "data_toggle", "roam_toggle")
+
+    def is_sim_toggle_action(action):
+        return action.partition(":")[0] in SIM_TOGGLE_ZONES
+
     kb_text = ""
     kb_layer = "letters"
     kb_caps = False
     kb_target_ssid = kb_target_bssid = None
     picker_scroll_base = 0.0
     fx_edit_side = "from"
-    # Optimistic display state for the cellular connect toggle: this
-    # router's own backhaul manager can silently revert a manual ifup
-    # when a healthier WAN (the repeater WiFi) is already up, sometimes
-    # within a couple of seconds -- from the user's side a tap that WAS
-    # received looked identical to a tap that wasn't, since the toggle
-    # never visibly moved. Show the tapped-for state immediately, then
-    # after CONNECT_OPTIMISTIC_SECONDS re-check the real interface state
-    # and snap back if it didn't actually take. This is purely cosmetic
-    # confirmation that the tap registered -- it doesn't change whether
-    # the connection itself succeeds.
-    sim_connect_override = None
-    sim_connect_override_until = 0.0
-    CONNECT_OPTIMISTIC_SECONDS = 2.0
     last_switch_req_check = 0.0
+
+    def sim_toggle_confirm(zone):
+        """Every SIM toggle asks first -- each one can cut this router's
+        internet (Net, Data) or run up a bill (Roam), and a stray tap
+        while swiping past the page shouldn't be able to do either. Sets
+        up the confirm dialog, or returns a notice when the tap can't do
+        anything useful. The actual change + verification runs in
+        run_sim_toggle once the user says yes."""
+        nonlocal confirm_title, confirm_message, confirm_yes_label, confirm_action
+        nonlocal confirm_return_view, confirm_danger
+        cellular_is_wan = not has_competing_wan() and bool(get_wan_iface())
+        offline_note = (" Internet runs over cellular right now, so the router will go offline."
+                        if cellular_is_wan else "")
+        if zone == "attach_toggle":
+            want = not sim["attached"]
+            title = "Cellular network"
+            if want:
+                msg, yes = "Turn the cellular network on? The modem leaves airplane mode.", "Turn on"
+            else:
+                msg = "Turn the cellular network off? No SMS, calls or data." + offline_note
+                yes = "Turn off"
+        elif zone == "data_toggle":
+            want = not sim["data_up"]
+            if want and not sim["attached"]:
+                return "Turn Net on first -- no network to start data on"
+            title = "Mobile data"
+            if want:
+                msg, yes = "Turn mobile data on for this SIM?", "Turn on"
+            else:
+                msg = "Turn mobile data off? SMS and calls still work." + offline_note
+                yes = "Turn off"
+        else:
+            if not sim.get("iccid"):
+                return "No active SIM to change roaming for"
+            want = not sim["roaming"]
+            title = "Data roaming"
+            if want:
+                msg, yes = "Allow mobile data while roaming? Roaming data can be expensive.", "Allow"
+            else:
+                msg, yes = "Turn data roaming off? Data stops while this SIM is roaming.", "Turn off"
+        confirm_title, confirm_message, confirm_yes_label = title, msg, yes
+        confirm_action = f"{zone}:{'on' if want else 'off'}"
+        confirm_return_view = "main"
+        confirm_danger = not want
+        return None
+
+    def run_sim_toggle(action):
+        """Apply a confirmed SIM toggle under a spinner over the SIM page,
+        wait until the modem/interface actually reports the new state,
+        then publish the freshly-read SIM state. Returns a notice string
+        when the change didn't take (or None)."""
+        nonlocal sim
+        zone, _, state = action.partition(":")
+        want = state == "on"
+        started = time.time()
+        stage = {"text": "Applying…"}
+        iccid = sim.get("iccid")
+
+        def work():
+            if zone == "attach_toggle":
+                set_network_attach_enabled(want)
+                stage["text"] = "Registering" if want else "Detaching"
+                ok = _wait_until(lambda: is_cell_attached() == want,
+                                 SIM_ATTACH_TIMEOUT if want else SIM_DETACH_TIMEOUT)
+            elif zone == "data_toggle":
+                set_cellular_data_enabled(want)
+                stage["text"] = "Connecting" if want else "Disconnecting"
+                ok = _wait_until(lambda: is_cell_data_up() == want, SIM_DATA_TIMEOUT)
+                if ok:
+                    stage["text"] = "Verifying"
+                    time.sleep(SIM_DATA_SETTLE)
+                    ok = is_cell_data_up() == want
+            else:
+                ok = apply_roaming(iccid, want)
+            return ok, get_sim_status(cfg)
+
+        def label():
+            if stage["text"].endswith("…"):
+                return stage["text"]
+            return f"{stage['text']}… {int(time.time() - started)}s"
+
+        base = render_main(PANEL_NAMES.index("sim"))
+        got = run_with_spinner(base, label, work, ACCENT["sim"], min_visible=0.8)
+        if not got:
+            return "Couldn't read the SIM state back"
+        ok, fresh = got
+        sim = fresh
+        refresher.put("sim", fresh)
+        refresher.request("cell")
+        if ok:
+            return None
+        if zone == "attach_toggle":
+            return ("Not registered yet -- still searching for a network" if want
+                    else "Still registered -- airplane mode didn't take")
+        if zone == "data_toggle":
+            if want:
+                return "Data didn't come up" + (" (WAN manager reverted it)" if has_competing_wan() else "")
+            return "Data is still up -- the change didn't take"
+        return "Roaming setting didn't save"
 
     while not _stop:
         now = time.time()
@@ -4930,6 +5935,7 @@ def mode_live():
                 wg_active = refresher.get("wg_active", wg_active)
                 _cell = refresher.get("cell")
                 if _cell is not None:
+                    cell_info = _cell
                     conn_type = get_wan_conn_type(_cell)
                     cell_signal = get_cell_signal(_cell)
                 if now - last_mon_check > 2:
@@ -4939,17 +5945,6 @@ def mode_live():
                     temp_c = get_temp_c()
                     mon_uptime_min = get_system_info()["uptime_min"]
                     last_mon_check = now
-                # The override MUST always expire. It used to be skipped
-                # entirely whenever sim_connect_override_until was None --
-                # which is exactly what the "turning off" and "turning on
-                # with no competing WAN" branches set it to -- so the Data
-                # toggle then displayed the tapped-for value forever,
-                # masking the real interface state for the rest of the
-                # process's life. That inverted the whole point of the
-                # feature, which is honest feedback.
-                if sim_connect_override is not None and now >= sim_connect_override_until:
-                    refresher.request("sim")
-                    sim_connect_override = None
                 if now - last_draw >= 1:
                     cur_img = render_main(panel_idx)
                     write_frame(cur_img)
@@ -5016,6 +6011,8 @@ def mode_live():
                             zone = hit_main_weather(down_x, down_y)
                         elif name == "games":
                             zone = hit_main_games(down_x, down_y)
+                        elif name == "monitor":
+                            zone = hit_main_monitor(down_x, down_y)
 
                         new_view = None
                         if name == "clock" and zone == "city_left":
@@ -5068,40 +6065,12 @@ def mode_live():
 
                                 sim = run_with_spinner(cur_img, "Switching SIM…",
                                                        _switch_sim, ACCENT["sim"]) or sim
-                        elif name == "sim" and zone == "attach_toggle":
-                            # Network registration only (SMS/calls) --
-                            # doesn't compete with a WiFi/ethernet WAN the
-                            # way the data toggle below can, so no
-                            # optimistic/snap-back dance needed here.
-                            def _set_attach(want=not sim["attached"]):
-                                set_network_attach_enabled(want)
-                                return get_sim_status(cfg)
-
-                            sim = run_with_spinner(cur_img, "Applying…", _set_attach,
-                                                   ACCENT["sim"]) or sim
-                        elif name == "sim" and zone == "data_toggle":
-                            new_state = not sim["data_up"]
-                            set_cellular_data_enabled(new_state)
-                            sim_connect_override = new_state
-                            if new_state and has_competing_wan():
-                                # Turning on while repeater/ethernet is
-                                # already active: that WAN's manager may
-                                # revert this, so verify and snap back.
-                                sim_connect_override_until = now + CONNECT_OPTIMISTIC_SECONDS
+                        elif name == "sim" and zone in SIM_TOGGLE_ZONES:
+                            blocked = sim_toggle_confirm(zone)
+                            if blocked:
+                                show_notice(blocked)
                             else:
-                                # Turning off always "works" from the UI's
-                                # perspective, and turning on with nothing
-                                # competing has nothing to revert it --
-                                # trust the tap, let it search/connect in
-                                # the background without second-guessing.
-                                sim_connect_override_until = None
-                        elif name == "sim" and zone == "roam_toggle":
-                            def _set_roam(iccid=sim["iccid"], want=not sim["roaming"]):
-                                set_roaming_enabled(iccid, want)
-                                return get_sim_status(cfg)
-
-                            sim = run_with_spinner(cur_img, "Applying…", _set_roam,
-                                                   ACCENT["sim"]) or sim
+                                new_view = "confirm"
                         elif name == "sim" and zone == "wireguard":
                             # Wrapped in the spinner like the other slow
                             # actions: get_wireguard_peers is now a single
@@ -5177,6 +6146,8 @@ def mode_live():
                             if day_i < len(wx):
                                 weather_day_idx = day_i
                                 new_view = "weather_detail"
+                        elif name == "monitor" and zone == "speedtest":
+                            new_view = "speedtest"
                         elif name == "games" and zone and zone.startswith("play:"):
                             active_game = zone.split(":", 1)[1]
                             game_state = new_game_state(active_game)
@@ -5333,11 +6304,17 @@ def mode_live():
                 time.sleep(0.01)
                 continue
 
+            if view == "speedtest":
+                handle_speedtest(now)
+                time.sleep(0.012)
+                continue
+
             if sub_dirty:
                 if view == "more":
                     img = panel_more(wifi24, wifi_band, cfg["clock_style"], get_wifi56_conflict_idx(rep))
                 elif view == "confirm":
-                    img = panel_confirm(confirm_title, confirm_message, ACCENT["clock"],
+                    accent = ACCENT["sim"] if is_sim_toggle_action(confirm_action) else ACCENT["clock"]
+                    img = panel_confirm(confirm_title, confirm_message, accent,
                                         yes_label=confirm_yes_label, danger=confirm_danger)
                 elif view == "keyboard_wifi":
                     img = panel_keyboard("Wi-Fi Password", kb_text, kb_layer, kb_caps,
@@ -5371,8 +6348,20 @@ def mode_live():
                 if view == "confirm" and (is_tap and (hit_back(down_y) or hit_confirm(down_x, down_y) == "no")):
                     view = confirm_return_view
                     sub_dirty = True
+                    if view == "main":
+                        cur_img = render_main(panel_idx)
+                        write_frame(cur_img)
+                        last_draw = now
                 elif view == "confirm" and is_tap and hit_confirm(down_x, down_y) == "yes":
-                    if confirm_action == "reboot":
+                    if is_sim_toggle_action(confirm_action):
+                        failed = run_sim_toggle(confirm_action)
+                        if failed:
+                            show_notice(failed)
+                        view = "main"
+                        cur_img = render_main(panel_idx)
+                        write_frame(cur_img)
+                        last_draw = time.time()
+                    elif confirm_action == "reboot":
                         reboot_router()
                         view = "more"
                     elif confirm_action == "shutdown":
