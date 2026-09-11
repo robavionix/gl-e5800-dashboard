@@ -195,7 +195,9 @@ pop-up keyboard. Two layers (letters/symbols), persistent caps toggle.
   state, signal — is fetched on a background thread and never blocks
   drawing or touch at all.
 - **Quick-tap the power button** to sleep/wake the screen — real backlight
-  control, not a fake black frame. Classified by press *duration* on
+  control, not a fake black frame. This is the dashboard's own gesture: on
+  the stock UI a tap is left entirely to `gl_screen`, which does its own
+  thing with it (back / sleep). Classified by press *duration* on
   release (tap vs. hold), not by counting presses — an earlier tap-counting
   design (single tap = sleep, triple tap = switch UI) turned out to be
   fragile against contact bounce, where one physical tap could register as
@@ -366,6 +368,28 @@ There's no settings UI for these — edit directly:
   rectangles** ("x1 must be greater than or equal to x0") -- anything
   that starts at zero length, like a progress bar, must be drawn another
   way (`_draw_pill`), or the exception takes the whole dashboard down.
+- **The stock UI handles power-key taps itself.** `button_watch.py` runs
+  whichever UI is on screen (the hold-to-switch gesture has to work from
+  the stock UI too), and it used to toggle the backlight on *every* short
+  tap. But `gl_screen` also acts on a tap -- back on a sub-page,
+  sleep/wake on its home page -- so on the stock UI one tap did both: a
+  sub-page jumped home *and* went dark, and waking from dark lit the
+  screen then immediately blanked it again, needing a second tap. Taps
+  now only toggle the backlight while the dashboard is running; on the
+  stock UI they're left to `gl_screen`.
+- **An "optimistic" Data toggle crashed the dashboard.** The old toggle
+  flipped instantly and re-checked later, with the re-check time set to
+  `None` for "trust it" -- and the main loop then compared `time >= None`,
+  a `TypeError` that killed the process on every data-off tap (three of
+  those in five minutes and `run.sh` hands the screen back to stock). The
+  toggles now confirm first and verify under a spinner instead, with no
+  deferred state left to go wrong. Roaming is also parsed tolerantly now
+  -- a string `"0"` would have read as *on* under a plain `bool()`.
+- **PIL's `arc()` is aliased, and arcs need a shared centre.** The
+  Repeater Wi-Fi icon's three arcs each derived their centre from their
+  own bounding box and had ~2px gaps between 3px strokes, so they drifted
+  together into one smear. Icons with thin parallel strokes are now drawn
+  concentric on a 4x supersampled mask and downscaled (`_draw_aa`).
 - **Open-Meteo's air-quality API has no daily-aggregate parameter** (a
   `daily=us_aqi_max` request errors out — confirmed live) — only hourly
   data is available, so `fetch_air_quality()` aggregates the daily max
