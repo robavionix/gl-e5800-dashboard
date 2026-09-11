@@ -1,7 +1,7 @@
 # GL-E5800 Touch Dashboard
 
 A custom, fully interactive replacement for the stock `gl_screen` UI on the
-GL.iNet GL-E5800's built-in 240x320 touchscreen. Swipe between six panels,
+GL.iNet GL-E5800's built-in 240x320 touchscreen. Swipe between seven panels,
 tap into any of them for detail or control, and manage the router without
 ever opening the web UI.
 
@@ -20,6 +20,10 @@ RGB565). Pure Python, one file.
 | Weather | Currency | OpenClash |
 |---|---|---|
 | ![Weather](screenshots/panel_weather.png) | ![Currency](screenshots/panel_fx.png) | ![OpenClash](screenshots/panel_openclash.png) |
+
+| Games |
+|---|
+| ![Games](screenshots/panel_games.png) |
 
 **Home** — two small clocks (independently pickable cities/timezones,
 digital by default, switchable to analog from More), today's date, and
@@ -47,45 +51,69 @@ header), not UTF-8 text, confirmed against a real received message.
 
 *(Numbers and message content above are synthetic/demo data.)*
 
-**Active SIM** — country flag, full number, and three same-sized toggles:
-**Net** (network registration/attach — SMS and calls work even without a
-cellular data session), **Data** (the actual cellular data session), and
-**Roam** (data roaming permission for this SIM). A SIM1 / eSIM switch
-(SIM2 was removed: it and eSIM share the same physical slot on this
-hardware and behaved identically, so it wasn't a real third option), a
-data-usage bar against a cap you set (now a scrollable list, 500MB up to
-1000GB), and a **WireGuard** button.
+**Active SIM** — country flag, number, and a live cellular status card:
+network type in phone terms (**4G / 4G+ / 5G NSA / 5G SA**), signal bars
+and primary-carrier RSRP, and the serving carrier's name. Under the SIM1 /
+eSIM switch, a row of chips shows **every band the modem is connected on
+right now** — primary carrier filled, secondaries outlined, 5G NR bands
+in blue — with a carrier-aggregation summary (e.g. *5 bands · 160 MHz*).
+Three toggles: **Net** (network registration — off is airplane mode),
+**Data** (the cellular data session) and **Roam** (data roaming for this
+SIM), plus a data-usage bar against a cap you set (500 MB up to 1000 GB)
+and a **WireGuard** button. (SIM2 was removed from the switch: it and eSIM
+share the same physical slot on this hardware and behaved identically.)
 
-The Data toggle shows optimistic feedback (flips immediately on tap) and
-only re-confirms after 2s and snaps back if it didn't take **when a
-repeater/ethernet WAN is already active** — this router's own multi-WAN
-manager can silently revert a manual cellular connect in that case. With
-no competing WAN, the tap is trusted outright and left to connect in the
-background, since there's nothing to revert it.
+| Active SIM | Toggle confirmation |
+|---|---|
+| ![SIM](screenshots/panel_sim.png) | ![Confirm](screenshots/panel_sim_confirm.png) |
 
-**WireGuard** — lists every peer config already added on the router
-(GL.iNet stores each as its own `wireguard.peer_NNNN` UCI section) with a
-toggle to bring it up or down. Turning one on points the router's single
-`wgclient` network interface at that peer's config and brings it up
-(`ifup`); turning it off tears it down (`ifdown`) — the same mechanism
-the router's own firmware uses (confirmed by reading the actual netifd
-proto script and hotplug handlers, not guessed), so no separate/parallel
-VPN config path is created.
+Every toggle **asks for confirmation first** (each one can cut the
+router's internet or run up a roaming bill), then applies under a spinner
+that polls the *real* state — registration, the `modem_cpu` interface,
+the stored roaming setting — until it matches, with a live caption
+("Registering… 12s"). If the change doesn't take (e.g. the router's own
+multi-WAN manager reverts a manual cellular change), the toggle shows the
+real state and a short notice says why, instead of pretending it worked.
+
+**WireGuard** — lists every peer config on the router (GL.iNet stores each
+as its own `wireguard.peer_NNNN` UCI section — hundreds of them if you've
+imported a provider's server list), with country quick-filter chips and a
+toggle per peer. Connecting goes through GL.iNet's own AutoVPN
+route-policy rule + `vpn-client` service — the same path the stock app
+uses, confirmed by diffing the config before and after connecting from the
+app. The spinner waits until the tunnel is actually up.
 
 ![WireGuard](screenshots/panel_wireguard.png)
 
-*(Peer name above is synthetic/demo data.)*
+*(Peer names above are synthetic/demo data.)*
 
 Every panel's colored header also shows, phone-status-bar style: cellular
-signal bars + radio tech (4G/5G) when the modem has signal, and the
-active WAN connection type (Repeater/Ethernet/4G/5G) — each shown
-independently, hidden entirely when not applicable, refreshed
-periodically.
+signal bars + radio tech (4G/4G+/5G), the active WAN connection type
+(Repeater/Ethernet/4G/5G), and **battery level with a charging bolt**
+(read from the fuel gauge in `/sys/class/power_supply`). When a long
+panel title leaves too little room, the least important items drop out
+first (the %, then the tech label, then the bars).
 
 **Monitor** — bandwidth (down/up Mbps on whichever interface currently holds
 the default route, so it keeps tracking the right link through a WAN
-failover), CPU%, RAM used/total, SoC temperature, and uptime. Read-only,
-refreshes every 2 seconds.
+failover), CPU%, RAM used/total, SoC temperature, and uptime, refreshed
+every 2 seconds — plus a **Speed test** button.
+
+**Speed test** (from Monitor) — a short download + upload test against
+Cloudflare's speed-test servers: 4 parallel streams, ~6s each way, the
+first second of each excluded (TCP ramp-up), with a live gauge in Mbps.
+Throughput is counted from the test's own streams, not the WAN
+interface's counters — those include every LAN client's traffic too.
+Capped at 250 MB down / 80 MB up so a fast 5G link can't burn unlimited
+mobile data, and the screen shows how much it used. Leaving the screen
+cancels a running test.
+
+| Monitor | Speed test |
+|---|---|
+| ![Monitor](screenshots/panel_monitor.png) | ![Speed test](screenshots/panel_speedtest.png) |
+
+**Games** — Snake, Flappy, Breakout and 2048, with best scores kept
+across restarts.
 
 **Weather** — 3-day forecast (hand-drawn icons: sun/cloud/rain/snow/fog/storm)
 for a city you pick from an alphabetically-sorted, scrollable list of 40+
@@ -149,7 +177,7 @@ pop-up keyboard. Two layers (letters/symbols), persistent caps toggle.
 
 ## Interaction
 
-- **Swipe** left/right between the 6 main panels — real finger-tracking,
+- **Swipe** left/right between the 7 main panels — real finger-tracking,
   then a velocity-aware snap: a page commits on either enough travel (30%
   of the width) *or* enough release speed, so a quick flick pages instead
   of springing back. The settle animation takes its duration from the
@@ -189,7 +217,8 @@ pop-up keyboard. Two layers (letters/symbols), persistent caps toggle.
 ## Requirements
 
 Built and tested specifically on a **GL.iNet GL-E5800**, OpenWrt 23.05.4,
-GL firmware 4.8.x. It depends on hardware/paths specific to this model:
+GL firmware 4.8.x and 4.10.0. It depends on hardware/paths specific to
+this model:
 
 - 240x320 RGB565 framebuffer at `/dev/fb0`
 - Capacitive touchscreen at `/dev/input/event0` (Multitouch protocol B)
@@ -318,14 +347,25 @@ There's no settings UI for these — edit directly:
   (an initial UTF-8-decode-everything approach produced mojibake).
   `_parse_sms_file()` decodes based on that header field rather than
   assuming one encoding for the whole file.
-- **WireGuard peers and the actual network interface are separate
-  layers.** GL.iNet stores each added peer as its own
-  `wireguard.peer_NNNN` UCI section (keys, endpoint, allowed_ips), but
-  that's just configuration -- nothing carries traffic until a
-  `network.wgclient` interface (`proto=wgclient`, `config=<peer
-  section>`) exists and is `ifup`'d. Confirmed by reading
-  `/lib/netifd/proto/wgclient.sh` and the wireguard hotplug scripts
-  rather than guessing at an undocumented RPC.
+- **WireGuard: `wgclient` + `ifup` looks right but isn't.** Reading
+  `/lib/netifd/proto/wgclient.sh` alone, pointing a `network.wgclient`
+  interface at a `wireguard.peer_NNNN` section and `ifup`-ing it looks
+  complete -- and works for a peer added by hand. Peers imported from a
+  provider's server list (e.g. NordVPN) carry no keys or endpoint at
+  all, so that interface sits at `pending` forever. The real path is
+  GL.iNet's AutoVPN `route_policy` rule + the `vpn-client` service, which
+  fetches the key material itself; found by diffing the config before and
+  after connecting from the stock app. (Versions before that fix left a
+  `network.wgclient` interface behind that netifd retries every few
+  seconds; `uci delete network.wgclient && uci commit network` removes it.)
+- **Firmware 4.10.0 moved the modem's signal info.** `cellular.network
+  info` no longer carries `cell_info`; it's now its own `cellular.network
+  cell_info` method, with one entry per aggregated carrier. The new
+  location is read first and the 4.8.x one kept as a fallback.
+- **Pillow 9.5 (what this firmware ships) raises on very short rounded
+  rectangles** ("x1 must be greater than or equal to x0") -- anything
+  that starts at zero length, like a progress bar, must be drawn another
+  way (`_draw_pill`), or the exception takes the whole dashboard down.
 - **Open-Meteo's air-quality API has no daily-aggregate parameter** (a
   `daily=us_aqi_max` request errors out — confirmed live) — only hourly
   data is available, so `fetch_air_quality()` aggregates the daily max
