@@ -1,11 +1,13 @@
 #!/usr/bin/env python3
 """Watches the power/home button (pmic_pwrkey, KEY_POWER):
   - quick tap            -> toggle the screen's backlight on/off (sleep/wake)
+                            -- only while the dashboard is the active UI;
+                            the stock gl_screen UI handles taps itself
   - press-and-hold ~1-2s -> switch between the custom dashboard and the
                             stock GL.iNet screen
 
 Runs as its own always-on service, independent of which screen UI is
-currently active. Passively reads /dev/input/event1 (does not grab it
+currently active (the hold has to work from the stock UI too). Passively reads /dev/input/event1 (does not grab it
 exclusively), so it never interferes with any other consumer of the power
 key. A genuine long hold well past HOLD_MAX is handled entirely
 separately, at the kernel/procd level, by /etc/rc.button/power ->
@@ -176,7 +178,17 @@ def main():
                 if acted:
                     acted = False           # already handled mid-hold
                 elif held < HOLD_MIN:
-                    do_sleep_toggle()
+                    # Taps are only ours while the dashboard is on screen.
+                    # The stock gl_screen UI handles the power-key tap
+                    # itself (back on a sub-page, sleep/wake on its home
+                    # page); toggling the backlight here as well made one
+                    # tap do both -- back AND blank, or wake then
+                    # immediately blank again -- so on the stock UI a tap
+                    # is left entirely to gl_screen.
+                    if dashboard_running():
+                        do_sleep_toggle()
+                    else:
+                        log("tap -> stock UI active, left to gl_screen")
                 elif held <= HOLD_MAX:
                     do_ui_toggle()
                 # held > HOLD_MAX: leave it to the hardware's own long-press
